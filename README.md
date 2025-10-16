@@ -1,4 +1,8 @@
+# Automated Quality Detection
 
+
+# Help
+- backend structure nach [ArjanCodes](https://www.youtube.com/watch?v=Af6Zr0tNNdE)
 # Uage
 
 ## Locally (without docker)
