@@ -35,15 +35,12 @@ services:
       - ./server1_camera:/app
       # Temporary storage
       - server1_temp:/tmp/camera_captures
-      -
 
     devices:
       - "/dev/video0:/dev/video0"
 
     networks:
       - pcb-network
-
-    # depends_on entfernt, weil server2 auf diesem Host nicht existiert
 
     restart: unless-stopped
 
