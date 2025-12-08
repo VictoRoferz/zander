@@ -204,3 +204,19 @@ async def test_upload() -> Dict[str, Any]:
             status_code=500,
             detail=f"Upload test failed: {str(e)}"
         )
+
+@router.get("/button", response_model=Dict[str, Any])
+async def test_button(pin: int = 23) -> Dict[str, Any]:
+    """
+    Test the hardware button (GPIO).
+    Default: GPIO 23 (BCM) = physischer Pin 16.
+    """
+    logger.info(f"Button test requested on pin {pin}")
+
+    pressed = camera_service.test_button(pin)
+
+    return {
+        "status": "success",
+        "pin": pin,
+        "button_pressed": pressed
+    }
