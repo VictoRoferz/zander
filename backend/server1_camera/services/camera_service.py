@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 from config.settings import settings
 from utils.logger import setup_logger
 
+
 logger = setup_logger(__name__, level=settings.log_level)
 
 
@@ -213,6 +214,29 @@ class CameraService:
             cap.release()
 
         return status
+    
+ 
+    def test_button(self, pin: int = 16) -> bool:
+        """
+        Test the physical button on Raspberry Pi GPIO.
+        Returns True if button is pressed, False otherwise.
+        
+        Requires: RPi.GPIO (pre-installed on Raspberry Pi OS)
+        """
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+            # Button pressed if pin reads LOW
+            pressed = GPIO.input(pin) == GPIO.LOW
+
+            GPIO.cleanup(pin)
+            return pressed
+
+        except Exception as e:
+            logger.error(f"Failed to read button on GPIO {pin}: {e}")
+            return False
 
 
 # Global camera service instance
