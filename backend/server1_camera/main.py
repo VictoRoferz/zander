@@ -50,6 +50,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Shutting down {settings.service_name}")
     # Optional: hier könnte man später einen button_capture_service.stop() o.ä. aufrufen
 
+    button_capture_service.stop()
+
 
 # Create FastAPI application
 app = FastAPI(
@@ -101,6 +103,6 @@ if __name__ == "__main__":
         "main:app",
         host=settings.host,
         port=settings.port,
-        reload=True,  # Development mode
+        reload=False,  # Development mode
         log_level=settings.log_level.lower()
     )

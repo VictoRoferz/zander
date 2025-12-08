@@ -58,6 +58,25 @@ class ButtonCaptureService:
             )
         except Exception as e:
             logger.error(f"Failed to start ButtonCaptureService on GPIO {self.pin}: {e}", exc_info=True)
+    
+    def stop(self) -> None:
+        """
+        Clean up GPIO resources on shutdown.
+        """
+        if not self._started:
+            return
+
+        try:
+            import RPi.GPIO as GPIO
+            # Remove the specific event detection first
+            GPIO.remove_event_detect(self.pin)
+            # Clean up the specific pin
+            GPIO.cleanup(self.pin)
+            self._started = False
+            logger.info(f"ButtonCaptureService stopped. GPIO {self.pin} cleaned up.")
+        except Exception as e:
+            logger.error(f"Failed to cleanup GPIO {self.pin}: {e}")
+
 
     def _handle_press(self, channel: int) -> None:
         """
