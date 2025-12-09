@@ -2,6 +2,7 @@
 API Routes for Server 1 (Camera Service - Raspberry Pi 3)
 Provides endpoints for camera control and image capture
 """
+import requests
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import Dict, Any
@@ -206,18 +207,66 @@ async def test_upload() -> Dict[str, Any]:
             detail=f"Upload test failed: {str(e)}"
         )
 
+
 @router.get("/button", response_model=Dict[str, Any])
 async def test_button(pin: int = 23) -> Dict[str, Any]:
     """
     Test the hardware button (GPIO).
     Default: GPIO 23 (BCM) = physischer Pin 16.
+
+    Wenn der Button GEDRÜCKT ist, wird intern äquivalent zu
+    `curl -X POST http://localhost:8001/api/v1/capture`
+    ein HTTP-Request ausgelöst.
     """
     logger.info(f"Button test requested on pin {pin}")
 
-    pressed = camera_service.test_button(pin)
+    # 1) Button-Zustand über GPIO lesen
+    try:
+        import RPi.GPIO as GPIO
+
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        # Button pressed = LOW (wegen Pull-Up)
+        pressed = GPIO.input(pin) == GPIO.LOW
+
+        GPIO.cleanup(pin)
+
+    except Exception as e:
+        logger.error(f"Failed to read button on GPIO {pin}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read button on GPIO {pin}: {e}"
+        )
+
+    # 2) Wenn NICHT gedrückt → nur Status zurückgeben
+    if not pressed:
+        logger.info("Button not pressed - no capture triggered")
+        return {
+            "status": "success",
+            "pin": pin,
+            "button_pressed": False,
+            "capture_triggered": False
+        }
+
+    # 3) Wenn gedrückt → äquivalent zu curl -X POST http://localhost:8001/api/v1/capture
+    logger.info("Button pressed - triggering /api/v1/capture via HTTP")
+
+    try:
+        resp = requests.post("http://localhost:8001/api/v1/capture", timeout=60)
+        resp.raise_for_status()
+        capture_result = resp.json()
+    except Exception as e:
+        logger.error(f"Button-triggered capture failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Button-triggered capture failed: {e}"
+        )
 
     return {
         "status": "success",
         "pin": pin,
-        "button_pressed": pressed
+        "button_pressed": True,
+        "capture_triggered": True,
+        "capture_response": capture_result,
     }
