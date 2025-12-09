@@ -30,7 +30,7 @@ def main():
                     print("[Button Listener] ➡ Button GEDRÜCKT – sende POST...")
 
                     try:
-                        resp = requests.get(CAPTURE_ENDPOINT, timeout=5)
+                        resp = requests.post(CAPTURE_ENDPOINT, timeout=5)
                         print(f"[Button Listener] Antwort: "
                               f"{resp.status_code} | {resp.text}")
                     except Exception as e:
