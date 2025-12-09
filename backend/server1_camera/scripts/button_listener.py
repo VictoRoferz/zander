@@ -8,7 +8,7 @@ import RPi.GPIO as GPIO
 BUTTON_PIN = 23  # BCM 23 = physischer Pin 16
 
 SERVER1_URL = os.getenv("SERVER1_URL", "http://pcb-server1-camera:8001")
-BUTTON_ENDPOINT = f"{SERVER1_URL}/api/v1/button-capture"
+BUTTON_ENDPOINT = f"{SERVER1_URL}/api/v1/button"
 
 
 def main():
