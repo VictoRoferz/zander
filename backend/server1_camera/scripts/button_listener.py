@@ -8,12 +8,12 @@ import RPi.GPIO as GPIO
 BUTTON_PIN = 23  # BCM 23 = physischer Pin 16
 
 SERVER1_URL = os.getenv("SERVER1_URL", "http://pcb-server1-camera:8001")
-BUTTON_ENDPOINT = f"{SERVER1_URL}/api/v1/button"
+CAPTURE_ENDPOINT = f"{SERVER1_URL}/api/v1/capture"
 
 
 def main():
     print(f"[Button Listener] Starte GPIO Listener auf BCM {BUTTON_PIN}")
-    print(f"[Button Listener] Trigger-URL: {BUTTON_ENDPOINT}")
+    print(f"[Button Listener] Trigger-URL: {CAPTURE_ENDPOINT}")
 
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -30,7 +30,7 @@ def main():
                     print("[Button Listener] ➡ Button GEDRÜCKT – sende POST...")
 
                     try:
-                        resp = requests.get(BUTTON_ENDPOINT, timeout=5)
+                        resp = requests.get(CAPTURE_ENDPOINT, timeout=5)
                         print(f"[Button Listener] Antwort: "
                               f"{resp.status_code} | {resp.text}")
                     except Exception as e:
