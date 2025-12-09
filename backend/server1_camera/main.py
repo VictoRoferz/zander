@@ -5,27 +5,14 @@ FastAPI application for PCB image capture and upload
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+
 from api.routes import router
 from config.settings import settings
 from utils.logger import setup_logger
-from services.button_capture_service import button_capture_service
 
 logger = setup_logger(__name__, level=settings.log_level)
 
 
-"""@asynccontextmanager
-async def lifespan(app: FastAPI):
-   
-    # Startup
-    logger.info(f"Starting {settings.service_name} v{settings.service_version}")
-    logger.info(f"Server 2 URL: {settings.server2_url}")
-    logger.info(f"Camera enabled: {settings.use_camera}")
-
-    yield
-
-    # Shutdown
-    logger.info(f"Shutting down {settings.service_name}")
-"""
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -37,20 +24,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Server 2 URL: {settings.server2_url}")
     logger.info(f"Camera enabled: {settings.use_camera}")
 
-    
-    try:
-        button_capture_service.start()
-    except Exception as e:
-        logger.error(f"Failed to start ButtonCaptureService: {e}", exc_info=True)
-    
-
+    # Keine GPIO-Initialisierung mehr hier – wird vom Button-Listener übernommen
     yield
 
     # Shutdown
     logger.info(f"Shutting down {settings.service_name}")
-    # Optional: hier könnte man später einen button_capture_service.stop() o.ä. aufrufen
-
-    button_capture_service.stop()
+    # Nichts zu cleanen bzgl. GPIO, da das im Button-Listener passiert
 
 
 # Create FastAPI application
@@ -85,10 +64,12 @@ async def root():
         "description": "PCB Camera Service - Raspberry Pi 3 Simulator",
         "endpoints": {
             "capture": "POST /api/v1/capture - Capture and upload image",
+            "button_capture": "POST /api/v1/button-capture - Trigger capture via button/HTTP",
             "status": "GET /api/v1/status - Get service status",
             "health": "GET /api/v1/health - Health check",
             "test_camera": "POST /api/v1/test-camera - Test camera only",
             "test_upload": "POST /api/v1/test-upload - Test Server 2 connection",
+            "button": "GET /api/v1/button - Test hardware button (GPIO)",
             "docs": "GET /docs - Interactive API documentation"
         }
     }

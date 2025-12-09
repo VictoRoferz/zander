@@ -1,7 +1,7 @@
 # services/button_capture_service.py
 
 import threading
-from typing import Optional
+from typing import Dict, Any
 
 from utils.logger import setup_logger
 from config.settings import settings
@@ -13,106 +13,52 @@ logger = setup_logger(__name__, level=settings.log_level)
 
 class ButtonCaptureService:
     """
-    Listens to a GPIO button and triggers camera capture + upload
-    whenever the button is pressed.
-
-    Uses RPi.GPIO event detection with debouncing.
+    Triggers camera capture + upload.
+    Wird von einer HTTP-Route oder extern (z.B. Button-Listener-Skript) genutzt.
     """
 
-    def __init__(self, pin: int = 23):
-        # Default: BCM 23 = physischer Pin 16
-        self.pin = pin
+    def __init__(self):
         self._lock = threading.Lock()
-        self._started = False
 
-    def start(self) -> None:
+    def trigger_capture(self, source: str = "button") -> Dict[str, Any]:
         """
-        Set up GPIO and start listening for button press events.
-        Can be called safely multiple times (only first call takes effect).
+        Capture + Upload auslösen.
+        source: nur fürs Logging ("button", "api", etc.)
         """
-        if self._started:
-            logger.info("ButtonCaptureService already started, skipping init")
-            return
-
-        try:
-            import RPi.GPIO as GPIO
-
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self.pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-            # FALLING edge: HIGH -> LOW (bei Pull-Up + Taster nach GND)
-            GPIO.add_event_detect(
-                self.pin,
-                GPIO.FALLING,
-                callback=self._handle_press,
-                bouncetime=300,  # ms debounce
-            )
-
-            self._started = True
-            logger.info(f"ButtonCaptureService started on GPIO {self.pin} (BCM)")
-
-        except ImportError:
-            logger.error(
-                "RPi.GPIO not available. ButtonCaptureService will not run. "
-                "Are you on a Raspberry Pi?"
-            )
-        except Exception as e:
-            logger.error(f"Failed to start ButtonCaptureService on GPIO {self.pin}: {e}", exc_info=True)
-    
-    def stop(self) -> None:
-        """
-        Clean up GPIO resources on shutdown.
-        """
-        if not self._started:
-            return
-
-        try:
-            import RPi.GPIO as GPIO
-            # Remove the specific event detection first
-            GPIO.remove_event_detect(self.pin)
-            # Clean up the specific pin
-            GPIO.cleanup(self.pin)
-            self._started = False
-            logger.info(f"ButtonCaptureService stopped. GPIO {self.pin} cleaned up.")
-        except Exception as e:
-            logger.error(f"Failed to cleanup GPIO {self.pin}: {e}")
-
-
-    def _handle_press(self, channel: int) -> None:
-        """
-        Callback executed in a separate thread when the button is pressed.
-        """
-        logger.info(f"Button press detected on GPIO {channel}")
-
-        # Ensure only one capture/upload at a time
+        # Nur ein Capture gleichzeitig
         if not self._lock.acquire(blocking=False):
-            logger.warning("Capture already running, ignoring button press")
-            return
+            logger.warning("Capture already running, ignoring new trigger")
+            return {"status": "busy", "reason": "capture_already_running"}
 
         try:
-            # 1) Capture image
-            logger.info("Capturing image (button trigger)...")
+            logger.info(f"[{source}] Starting capture...")
+
+            # 1) Bild aufnehmen
             image_path = camera_service.capture()
 
             if not image_path:
-                logger.error("Button trigger: capture returned no image_path")
-                return
+                logger.error(f"[{source}] capture returned no image_path")
+                return {"status": "error", "reason": "no_image_path"}
 
-            # 2) Upload to Server 2
-            logger.info(f"Uploading {image_path.name} to Server 2 (button trigger)...")
+            # 2) Upload zu Server 2
+            logger.info(f"[{source}] Uploading {image_path.name} to Server 2...")
             upload_response = upload_service.upload_and_cleanup(image_path)
 
-            logger.info(
-                f"Button trigger upload finished: "
-                f"status={upload_response.get('status', 'unknown')}"
-            )
+            status = upload_response.get("status", "unknown")
+            logger.info(f"[{source}] Upload finished with status={status}")
+
+            return {
+                "status": "ok",
+                "upload_status": status,
+                "upload_response": upload_response,
+            }
 
         except Exception as e:
-            logger.error(f"Button-triggered capture/upload failed: {e}", exc_info=True)
+            logger.error(f"[{source}] capture/upload failed: {e}", exc_info=True)
+            return {"status": "error", "reason": str(e)}
         finally:
-            # VERY IMPORTANT: release lock so the next press works again
             self._lock.release()
 
 
-# Global instance
-button_capture_service = ButtonCaptureService(pin=23)  # BCM 23 = physischer Pin 16
+# Globale Instanz
+button_capture_service = ButtonCaptureService()
