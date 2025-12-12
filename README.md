@@ -1,93 +1,260 @@
-# Zander
+# Zander – Kurz-Dokumentation zum Neu-Setup (2× Raspberry Pi)
 
+---
 
+## Allgemeine Hinweise
+- **Pi3**: Kamera + Button → Bild aufnehmen → Upload zu Pi5  
+- **Pi5**: Server + Storage (Docker Volume) → Label Studio Tasks → Training & Inferenz  
+- Zugriff & Wartung über **SSH / remote.it**  
+- Alle Services laufen in Docker-Containern
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Setup-Ablauf
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+### 1) Basisinstallation (beide Pis)
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y git curl
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker $USER
 ```
-cd existing_repo
-git remote add origin https://git-ce.rwth-aachen.de/wzl-iqs3/quality-insights/research-projects/edih/zander.git
-git branch -M main
-git push -uf origin main
+### neu einloggen oder reboot
+```bash
+docker ps
+docker compose version
 ```
 
-## Integrate with your tools
+---
 
-- [ ] [Set up project integrations](https://git-ce.rwth-aachen.de/wzl-iqs3/quality-insights/research-projects/edih/zander/-/settings/integrations)
+### 2) Repository klonen & Git konfigurieren
+```bash
+cd ~
+git clone <REPO_URL> zander
+cd zander
+git config --global user.name "USERNAME"
+git config --global user.email "EMAIL"
+```
 
-## Collaborate with your team
+- **GitLab Personal Access Token** erstellen (mit obiger Mail)
+- Token wird für **HTTPS-Zugriff** benötigt (empfohlen auf Raspberry Pis)
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+---
 
-## Test and Deploy
+### 3) Setup-Script ausführen (beide Pis)
+```bash
+cd ~/zander
+chmod +x setup.sh
+./setup.sh
+```
 
-Use the built-in continuous integration in GitLab.
+---
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### 4) Services starten
 
-***
+**Pi3 (Camera Service)**
+```bash
+cd ~/zander/backend
+docker compose -f docker-compose.pi3.yml up -d --build
+```
 
-# Editing this README
+**Pi5 (Server + Label Studio)**
+```bash
+cd ~/zander/backend
+docker compose -f docker-compose.pi5.yml up -d --build
+```
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+**Stoppen**
+```bash
+docker compose -f docker-compose.pi3.yml down
+docker compose -f docker-compose.pi5.yml down
+```
 
-## Suggestions for a good README
+---
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## Repository von SSH auf HTTPS umstellen
 
-## Name
-Choose a self-explaining name for your project.
+Falls das Repository **initial per SSH** geklont oder gepusht wurde, aber nun
+**HTTPS mit Personal Access Token** genutzt werden soll:
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+### 1) Aktuelle Remote-URL prüfen
+```bash
+git remote -v
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Beispiel (SSH):
+```text
+origin  git@git-ce.rwth-aachen.de:wzl-iqs3/quality-insights/research-projects/edih/zander.git (fetch)
+origin  git@git-ce.rwth-aachen.de:wzl-iqs3/quality-insights/research-projects/edih/zander.git (push)
+```
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+---
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+### 2) Remote auf HTTPS umstellen
+HTTPS-URL aus der Gitlab Website kopieren und einfügen
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+Beispiel:
+```bash
+git remote set-url origin https://git-ce.rwth-aachen.de/wzl-iqs3/quality-insights/research-projects/edih/zander.git
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+---
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### 3) Test (Pull oder Push)
+```bash
+git pull
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+- **Username**: GitLab Benutzername  
+- **Password**: **Personal Access Token** (nicht das GitLab-Passwort)
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+---
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## Wichtige Konfigurationen (ENV)
 
-## License
-For open source projects, say how it is licensed.
+- `SERVER2_URL`: IP des **Pi5**
+```bash
+hostname -I
+```
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- **Label Studio API Key**: *Legacy Token* des Accounts  
+- **Kamera (Pi3)**:
+  - `CAMERA_WIDTH`, `CAMERA_HEIGHT` (nur unterstützte Auflösungen)
+  - `CAMERA_INDEX` (meist `0`)
+
+---
+
+## Label Studio: Legacy API Token finden & aktivieren (Pi5)
+
+1. Label Studio UI öffnen:
+```text
+http://<PI5_IP>:8080
+```
+2. Anmelden
+```text
+labelling@zander-aachen.de
+zander123
+```
+3. Dropdown Menü öffnen → Organization → API Token Settings → Legacy Token aktivieren
+
+4. Profil-Icon → **Account & Settings** → Legacy Token
+
+5. **Legacy Token anzeigen oder erstellen**
+
+6. Token in `.env` oder Docker-Compose eintragen:
+```text
+LABEL_STUDIO_API_KEY=<TOKEN>
+```
+
+> Für Webhooks und Server-zu-Server-Kommunikation **nur Legacy Token verwenden**, da dieser nicht rotiert.
+
+---
+
+## Arbeiten im Docker-Container (Bash öffnen)
+
+### Laufende Container anzeigen
+```bash
+docker ps
+```
+
+---
+
+### Bash im Container starten
+```bash
+docker exec -it <container_name> bash
+```
+
+Beispiel:
+```bash
+docker exec -it pcb-server1-camera bash
+```
+
+Beenden:
+```bash
+exit
+```
+
+---
+
+## Kamera-Debug (Pi3)
+
+### Kamera-Gerät prüfen (im Container)
+```bash
+ls /dev/video*
+```
+
+---
+
+### OpenCV-Capture-Test (im `server1`-Container)
+```bash
+python - << 'EOF'
+import cv2
+idx = 0
+cap = cv2.VideoCapture(idx)
+ok, frame = cap.read()
+print("Index:", idx, "opened:", cap.isOpened(), "frame:", ok, "shape:", getattr(frame, "shape", None))
+cap.release()
+EOF
+```
+
+**Erwartet:**  
+- `opened: True`  
+- `frame: True`  
+
+---
+
+## Button-Setup & Pin-Verdrahtung (Pi3)
+
+### Verdrahtung
+- Button-Kontakt 1 → **GND**
+- Button-Kontakt 2 → **physikalischer Pin 16**
+- Physikalischer Pin 16 entspricht **GPIO23**
+- Referenz: https://digitalewelt.at/raspberry-pi-taster-abfragen/
+
+## Label Studio Webhook (Pi5)
+
+Project-Settings → Webhooks → Add Webhook
+
+Webhook **in der Label-Studio-UI** konfigurieren:
+```text
+http://<PI5_IP>:8002/api/v1/webhook/annotation-created
+```
+
+---
+
+## Daten & Volumes prüfen (Pi5)
+
+
+```bash
+docker exec -it pcb-server2-labelstudio ls -l /data/unlabeled/
+docker exec -it pcb-server2-labelstudio ls -l /data/labeled/
+```
+
+---
+
+## Sammlung von Debug-Befehlen
+
+```bash
+docker compose -f docker-compose.pi3.yml logs -f
+docker compose -f docker-compose.pi5.yml logs -f
+docker ps
+docker exec -it <container_name> bash
+ls /dev/video*
+pinctrl get 23
+Sudo nmtui
+Sudo iwlist wlan0 scan 
+```
+
+---
+
+## Remote-Zugriff (SSH / remote.it)
+
+- SSH-Keys des Client-Geräts in:
+```bash
+~/.ssh/authorized_keys
+```
+```bash
+ssh pi@<Pi-IP>
+```
