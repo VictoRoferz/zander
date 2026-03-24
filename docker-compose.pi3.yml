@@ -6,7 +6,7 @@ services:
   # ============================================================
   server1:
     build:
-      context: ./server1_camera
+      context: camerapi
       dockerfile: Dockerfile
     container_name: pcb-server1-camera
     ports:
@@ -59,7 +59,7 @@ services:
   # ============================================================
   button-listener:
     build:
-      context: ./server1_camera
+      context: camerapi
       dockerfile: Dockerfile
     container_name: pcb-button-listener
     privileged: true

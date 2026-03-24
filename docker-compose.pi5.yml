@@ -6,7 +6,7 @@ services:
   # ============================================================
   server2:
     build:
-      context: ./server2_labelstudio
+      context: labelstudio
       dockerfile: Dockerfile
     container_name: pcb-server2-labelstudio
     ports:
