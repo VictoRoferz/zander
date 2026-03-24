@@ -1,6 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from pathlib import Path
-import uvicorn
 import shutil
 import os
 import uuid
