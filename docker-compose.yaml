@@ -1,9 +1,0 @@
-version: '3.8'
-services:
-  backend:
-    build:
-      context: ./backend
-    volumes:
-      - shared_volume:/app/shared_volume
-    ports:
-      - "8000:8000"
