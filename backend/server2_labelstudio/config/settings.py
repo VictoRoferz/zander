@@ -23,9 +23,9 @@ class Settings(BaseSettings):
     port: int = 8002
 
     # Storage configuration
-    data_root: Path = Path("/data")
-    unlabeled_dir: Path = Path("/data/unlabeled")
-    labeled_dir: Path = Path("/data/labeled")
+    data_root: Path = Path("./data")
+    unlabeled_dir: Path = Path("./data/unlabeled")
+    labeled_dir: Path = Path("./data/labeled")
 
     # Content-addressed storage (from main branch)
     use_content_addressing: bool = True  # SHA256-based deduplication

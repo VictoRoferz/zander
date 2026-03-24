@@ -11,6 +11,7 @@ from config.settings import settings
 from utils.logger import setup_logger
 from services.button_capture_service import button_capture_service
 
+
 logger = setup_logger(__name__, level=settings.log_level)
 
 router = APIRouter(prefix="/api/v1", tags=["camera"])

@@ -1,23 +1,34 @@
 """
 Camera Service for Server 1 (Raspberry Pi 3)
-Handles image capture from camera or fallback image
-Optimized for low-power embedded systems
+Handles image capture from Basler camera via pylon or fallback image.
+Falls back to OpenCV VideoCapture if pypylon is not available.
 """
 import cv2
+import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional
 from config.settings import settings
 from utils.logger import setup_logger
 
 
 logger = setup_logger(__name__, level=settings.log_level)
 
+# Try to import pypylon for Basler camera support
+try:
+    from pypylon import pylon
+    PYPYLON_AVAILABLE = True
+    logger.info("pypylon available - Basler camera support enabled")
+except ImportError:
+    PYPYLON_AVAILABLE = False
+    logger.warning("pypylon not available - falling back to OpenCV VideoCapture")
+
 
 class CameraService:
     """
-    Service for capturing images from camera or fallback source.
-    Designed to be memory-efficient for Raspberry Pi 3.
+    Service for capturing images from Basler camera or fallback source.
+    Uses pypylon with lazy initialization — camera stays open between captures.
+    Falls back to cv2.VideoCapture if pypylon is not available.
     """
 
     def __init__(self):
@@ -26,21 +37,18 @@ class CameraService:
         self.fallback_path = Path(settings.fallback_image_path)
         self.temp_dir = settings.temp_dir
 
+        # Pylon objects — lazy initialized
+        self._tl_factory = None
+        self._camera = None
+        self._converter = None
+
         logger.info(
             f"CameraService initialized: use_camera={self.use_camera}, "
-            f"index={self.camera_index}"
+            f"pypylon={PYPYLON_AVAILABLE}"
         )
 
     def capture(self) -> Optional[Path]:
-        """
-        Capture image from camera or use fallback.
-
-        Returns:
-            Path to captured image, or None if capture failed
-
-        Raises:
-            RuntimeError: If capture fails and no fallback available
-        """
+        """Capture image from camera or use fallback."""
         if self.use_camera:
             image_path = self._capture_from_camera()
             if image_path:
@@ -54,80 +62,171 @@ class CameraService:
             return self._use_fallback()
 
     def _capture_from_camera(self) -> Optional[Path]:
-        """
-        Capture image from camera using OpenCV.
+        """Capture image. Uses pypylon for Basler, falls back to OpenCV."""
+        if PYPYLON_AVAILABLE:
+            return self._capture_basler()
+        return self._capture_opencv()
 
-        Returns:
-            Path to captured image, or None if failed
+    # ----- Basler / pypylon -----
+
+    def _init_pylon(self) -> None:
         """
+        Lazy initialization of pylon factory, camera, and format converter.
+        Sets resolution, FPS, and throughput limit. Camera stays open.
+        """
+        if self._camera is not None:
+            return
+
+        self._tl_factory = pylon.TlFactory.GetInstance()
+        devices = self._tl_factory.EnumerateDevices()
+
+        if not devices:
+            raise RuntimeError("No Basler camera found")
+
+        device = devices[0]
+        logger.info(
+            f"Using Basler camera: model={device.GetModelName()}, "
+            f"serial={device.GetSerialNumber()}"
+        )
+
+        self._camera = pylon.InstantCamera(self._tl_factory.CreateDevice(device))
+
+        # Format converter: BGR8 for OpenCV compatibility
+        self._converter = pylon.ImageFormatConverter()
+        self._converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+        self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+        self._camera.Open()
+
+        target_width = settings.camera_width
+        target_height = settings.camera_height
+        target_fps = 2.0
+        target_throughput_bps = 50_000_000
+
+        try:
+            # 1) Resolution
+            if hasattr(self._camera, "Width") and hasattr(self._camera, "Height"):
+                max_w = self._camera.Width.GetMax()
+                max_h = self._camera.Height.GetMax()
+                w = min(max_w, target_width)
+                h = min(max_h, target_height)
+                self._camera.Width.SetValue(w)
+                self._camera.Height.SetValue(h)
+                logger.info(f"Set camera ROI to {w}x{h} (max {max_w}x{max_h})")
+
+            # 2) FPS limit
+            if hasattr(self._camera, "AcquisitionFrameRateEnable"):
+                self._camera.AcquisitionFrameRateEnable.SetValue(True)
+            if hasattr(self._camera, "AcquisitionFrameRate"):
+                self._camera.AcquisitionFrameRate.SetValue(float(target_fps))
+            logger.info(f"Set camera FPS to {target_fps}")
+
+            # 3) Throughput limit
+            if hasattr(self._camera, "DeviceLinkThroughputLimit"):
+                try:
+                    max_limit = self._camera.DeviceLinkThroughputLimit.GetMax()
+                except Exception:
+                    max_limit = None
+                limit = min(max_limit, target_throughput_bps) if max_limit else target_throughput_bps
+                self._camera.DeviceLinkThroughputLimit.SetValue(limit)
+                logger.info(f"Set DeviceLinkThroughputLimit to {limit/1_000_000:.1f} Mbit/s")
+
+        except Exception as e:
+            logger.warning(f"Error configuring camera parameters: {e}")
+
+        # Start continuous grabbing
+        self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        logger.info("Started grabbing with throughput-limited settings")
+
+    def _capture_basler(self) -> Optional[Path]:
+        """Capture image from Basler camera using pypylon."""
+        try:
+            self._init_pylon()
+
+            if not self._camera.IsGrabbing():
+                self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+            grab_result = self._camera.RetrieveResult(
+                5000, pylon.TimeoutHandling_ThrowException
+            )
+
+            try:
+                if not grab_result.GrabSucceeded():
+                    logger.error(f"Basler grab failed: {grab_result.ErrorDescription}")
+                    return None
+
+                image = self._converter.Convert(grab_result)
+                frame = image.GetArray()
+            finally:
+                grab_result.Release()
+
+            return self._save_frame(frame)
+
+        except Exception as e:
+            logger.error(f"Basler capture exception: {e}", exc_info=True)
+            return None
+
+    # ----- OpenCV fallback -----
+
+    def _capture_opencv(self) -> Optional[Path]:
+        """Capture image using OpenCV (fallback for non-Basler cameras)."""
         cap = None
         try:
-            # Open camera
             cap = cv2.VideoCapture(self.camera_index)
 
             if not cap.isOpened():
                 logger.error(f"Failed to open camera at index {self.camera_index}")
                 return None
 
-            # Set resolution (if supported by camera)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.camera_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.camera_height)
             cap.set(cv2.CAP_PROP_FPS, settings.camera_fps)
 
-            # Capture frame
             ret, frame = cap.read()
 
             if not ret or frame is None:
                 logger.error("Failed to capture frame from camera")
                 return None
 
-            # Generate filename with timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = f"capture_{timestamp}.jpg"
-            image_path = self.temp_dir / filename
-
-            # Save image as JPEG (space-efficient for PCB images)
-            success = cv2.imwrite(
-                str(image_path),
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 95]  # High quality for defect detection
-            )
-
-            if not success:
-                logger.error(f"Failed to save image to {image_path}")
-                return None
-
-            # Get actual dimensions
-            height, width = frame.shape[:2]
-            logger.debug(
-                f"Captured {width}x{height} image, size: "
-                f"{image_path.stat().st_size / 1024:.1f} KB"
-            )
-
-            return image_path
+            return self._save_frame(frame)
 
         except Exception as e:
-            logger.error(f"Camera capture exception: {e}", exc_info=True)
+            logger.error(f"OpenCV capture exception: {e}", exc_info=True)
             return None
 
         finally:
-            # Always release camera resource
             if cap is not None:
                 cap.release()
-                logger.debug("Camera released")
+
+    # ----- Common helpers -----
+
+    def _save_frame(self, frame: np.ndarray) -> Optional[Path]:
+        """Save a numpy frame as JPEG and return the path."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"capture_{timestamp}.jpg"
+        image_path = self.temp_dir / filename
+
+        success = cv2.imwrite(
+            str(image_path),
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 95]
+        )
+
+        if not success:
+            logger.error(f"Failed to save image to {image_path}")
+            return None
+
+        height, width = frame.shape[:2]
+        logger.debug(
+            f"Captured {width}x{height} image, size: "
+            f"{image_path.stat().st_size / 1024:.1f} KB"
+        )
+
+        return image_path
 
     def _use_fallback(self) -> Path:
-        """
-        Use fallback image for testing without camera.
-
-        Returns:
-            Path to fallback image
-
-        Raises:
-            RuntimeError: If fallback image doesn't exist and can't be created
-        """
+        """Use fallback image for testing without camera."""
         if not self.fallback_path.exists():
-            # Create a minimal test image if fallback doesn't exist
             logger.warning(
                 f"Fallback image not found at {self.fallback_path}, "
                 "creating test image"
@@ -143,35 +242,16 @@ class CameraService:
         return self.fallback_path
 
     def _create_test_image(self) -> None:
-        """
-        Create a minimal test image for development/testing.
-        Creates a simple colored rectangle with text.
-        """
+        """Create a minimal test image for development/testing."""
         try:
-            import numpy as np
-
-            # Create 1920x1080 test image (typical PCB inspection resolution)
             width, height = 1920, 1080
             image = np.zeros((height, width, 3), dtype=np.uint8)
+            image[:] = (20, 40, 20)
 
-            # Dark background (simulating PCB)
-            image[:] = (20, 40, 20)  # BGR: dark greenish
-
-            # Add text
             text = f"TEST IMAGE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(
-                image,
-                text,
-                (50, height // 2),
-                font,
-                2,
-                (255, 255, 255),
-                3,
-                cv2.LINE_AA
-            )
+            cv2.putText(image, text, (50, height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3, cv2.LINE_AA)
 
-            # Save
             cv2.imwrite(str(self.fallback_path), image)
             logger.info(f"Created test image at {self.fallback_path}")
 
@@ -179,12 +259,7 @@ class CameraService:
             logger.error(f"Failed to create test image: {e}", exc_info=True)
 
     def cleanup(self, image_path: Path) -> None:
-        """
-        Clean up temporary captured image.
-
-        Args:
-            image_path: Path to image file to delete
-        """
+        """Clean up temporary captured image."""
         try:
             if image_path.exists() and image_path.parent == self.temp_dir:
                 image_path.unlink()
@@ -193,28 +268,33 @@ class CameraService:
             logger.warning(f"Failed to cleanup {image_path}: {e}")
 
     def get_status(self) -> dict:
-        """
-        Get camera service status.
-
-        Returns:
-            Dictionary with camera status information
-        """
+        """Get camera service status."""
         status = {
             "use_camera": self.use_camera,
+            "camera_backend": "pypylon" if PYPYLON_AVAILABLE else "opencv",
             "camera_index": self.camera_index,
             "fallback_available": self.fallback_path.exists(),
             "temp_dir": str(self.temp_dir),
             "temp_dir_exists": self.temp_dir.exists(),
         }
 
-        # Test camera availability if enabled
-        if self.use_camera:
+        if self.use_camera and PYPYLON_AVAILABLE:
+            try:
+                tl_factory = pylon.TlFactory.GetInstance()
+                devices = tl_factory.EnumerateDevices()
+                status["camera_available"] = len(devices) > 0
+                if devices:
+                    status["camera_name"] = devices[0].GetFriendlyName()
+                    status["camera_serial"] = devices[0].GetSerialNumber()
+            except Exception:
+                status["camera_available"] = False
+        elif self.use_camera:
             cap = cv2.VideoCapture(self.camera_index)
             status["camera_available"] = cap.isOpened()
             cap.release()
 
         return status
-    
+
 
 # Global camera service instance
 camera_service = CameraService()
