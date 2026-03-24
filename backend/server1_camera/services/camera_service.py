@@ -69,10 +69,25 @@ class CameraService:
 
     # ----- Basler / pypylon -----
 
+    def _align_node(node, target: int) -> int:
+        try:
+            inc = node.GetInc()
+            mn = node.GetMin()
+            mx = node.GetMax()
+            val = max(mn, min(target, mx))
+            aligned = val - (val % inc)
+            return max(mn, min(aligned, mx))
+        except Exception:
+            # Fallback: clamp only
+            try:
+                return max(node.GetMin(), min(target, node.GetMax()))
+            except Exception:
+                return target
+
     def _init_pylon(self) -> None:
         """
         Lazy initialization of pylon factory, camera, and format converter.
-        Sets resolution, FPS, and throughput limit. Camera stays open.
+        Sets resolution, FPS, throughput limit, packet size, and buffers.
         """
         if self._camera is not None:
             return
@@ -98,30 +113,58 @@ class CameraService:
 
         self._camera.Open()
 
+        # Conservative starting values
         target_width = settings.camera_width
         target_height = settings.camera_height
-        target_fps = 2.0
-        target_throughput_bps = 50_000_000
+        target_fps = 3.0
+        target_throughput_bps = 30_000_000  # 30 Mbit/s to start safely
+        safe_packet_size = 1500  # match standard MTU path first
+        frame_retention_us = 50_000  # 50 ms in microseconds, typical unit
 
         try:
-            # 1) Resolution
+            # 0) Increase host-side buffers to reduce underruns
+            if hasattr(self._camera, "MaxNumBuffer"):
+                try:
+                    self._camera.MaxNumBuffer = 64
+                    logger.info(f"Set MaxNumBuffer to {self._camera.MaxNumBuffer}")
+                except Exception as e:
+                    logger.warning(f"Could not set MaxNumBuffer: {e}")
+
+            # 1) Resolution (aligned to required increments)
             if hasattr(self._camera, "Width") and hasattr(self._camera, "Height"):
-                max_w = self._camera.Width.GetMax()
-                max_h = self._camera.Height.GetMax()
-                w = min(max_w, target_width)
-                h = min(max_h, target_height)
+                w = _align_node(self._camera.Width, target_width)
+                h = _align_node(self._camera.Height, target_height)
                 self._camera.Width.SetValue(w)
                 self._camera.Height.SetValue(h)
-                logger.info(f"Set camera ROI to {w}x{h} (max {max_w}x{max_h})")
+                logger.info(
+                    f"Set camera ROI to {w}x{h} "
+                    f"(range {self._camera.Width.GetMin()}-{self._camera.Width.GetMax()} x "
+                    f"{self._camera.Height.GetMin()}-{self._camera.Height.GetMax()})"
+                )
 
-            # 2) FPS limit
+            # 2) Safe packet size (match NIC MTU=1500 first; raise later if using jumbo)
+            if hasattr(self._camera, "GevSCPSPacketSize"):
+                try:
+                    self._camera.GevSCPSPacketSize.SetValue(int(safe_packet_size))
+                    logger.info(f"Set GevSCPSPacketSize to {self._camera.GevSCPSPacketSize.GetValue()}")
+                except Exception as e:
+                    logger.warning(f"Could not set GevSCPSPacketSize: {e}")
+
+            # 3) Frame retention (allow more time before buffers are considered lost)
+            if hasattr(self._camera, "FrameRetention"):
+                try:
+                    self._camera.FrameRetention.SetValue(int(frame_retention_us))
+                    logger.info(f"Set FrameRetention to {self._camera.FrameRetention.GetValue()} µs")
+                except Exception as e:
+                    logger.warning(f"Could not set FrameRetention: {e}")
+
+            # 4) FPS limit and throughput cap
             if hasattr(self._camera, "AcquisitionFrameRateEnable"):
                 self._camera.AcquisitionFrameRateEnable.SetValue(True)
             if hasattr(self._camera, "AcquisitionFrameRate"):
                 self._camera.AcquisitionFrameRate.SetValue(float(target_fps))
             logger.info(f"Set camera FPS to {target_fps}")
 
-            # 3) Throughput limit
             if hasattr(self._camera, "DeviceLinkThroughputLimit"):
                 try:
                     max_limit = self._camera.DeviceLinkThroughputLimit.GetMax()
@@ -129,14 +172,30 @@ class CameraService:
                     max_limit = None
                 limit = min(max_limit, target_throughput_bps) if max_limit else target_throughput_bps
                 self._camera.DeviceLinkThroughputLimit.SetValue(limit)
-                logger.info(f"Set DeviceLinkThroughputLimit to {limit/1_000_000:.1f} Mbit/s")
+                logger.info(f"Set DeviceLinkThroughputLimit to {limit / 1_000_000:.1f} Mbit/s")
 
         except Exception as e:
             logger.warning(f"Error configuring camera parameters: {e}")
 
         # Start continuous grabbing
         self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-        logger.info("Started grabbing with throughput-limited settings")
+        logger.info("Started grabbing with conservative settings")
+
+        # Optional: perform a warmup grab and discard it to avoid initial incomplete buffer
+        try:
+            warmup = self._camera.RetrieveResult(2000, pylon.TimeoutHandling_ThrowException)
+            if warmup and warmup.GrabSucceeded():
+                logger.debug("Warmup frame grabbed and discarded")
+            elif warmup:
+                logger.debug(f"Warmup grab failed: {getattr(warmup, 'ErrorDescription', 'unknown')}")
+        except Exception:
+            logger.debug("Warmup grab encountered an exception; continuing")
+        finally:
+            try:
+                if warmup:
+                    warmup.Release()
+            except Exception:
+                pass
 
     def _capture_basler(self) -> Optional[Path]:
         """Capture image from Basler camera using pypylon."""
