@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     fallback_image_path: str = "sample.jpg"
 
     # Server 2 (Raspberry Pi 5) connection
-    server2_url: str = "http://192.168.0.138:8002"
+    server2_url: str = "http://192.168.0.115:8002"
     server2_upload_endpoint: str = "/api/v1/upload"
     upload_timeout: int = 30  # seconds
     upload_retries: int = 3
