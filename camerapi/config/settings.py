@@ -28,6 +28,20 @@ class Settings(BaseSettings):
     camera_height: int = 1080
     camera_fps: int = 30
 
+    # Resolution mode: "max" = use camera's maximum, "custom" = use camera_width/camera_height
+    camera_resolution_mode: str = "custom"
+
+    # Pixel format: "bayer" = BayerRG8 (1 byte/px, saves 66% bandwidth), "color" = BGR8 (3 bytes/px)
+    camera_pixel_format: str = "bayer"
+
+    # GigE Vision transport tuning (optimized for Pi3's 100 Mbit/s Ethernet)
+    camera_throughput_bps: int = 80_000_000       # 80 Mbit/s — leaves headroom on 100 Mbit link
+    camera_packet_size: int = 1500                # Standard MTU (keep at 1500)
+    camera_inter_packet_delay_ticks: int = 10000  # GevSCPD — prevent NIC burst overload
+    camera_frame_retention_us: int = 200_000      # 200 ms inter-packet timeout
+    camera_max_num_buffer: int = 3                # Low count for single-shot capture
+    camera_grab_timeout_ms: int = 15_000          # 15s timeout for full-res frame transfer
+
     # Fallback image (for testing without camera)
     fallback_image_path: str = "sample.jpg"
 
