@@ -68,7 +68,7 @@ class CameraService:
         return self._capture_opencv()
 
     # ----- Basler / pypylon -----
-
+    @staticmethod
     def _align_node(node, target: int) -> int:
         try:
             inc = node.GetInc()
@@ -113,113 +113,120 @@ class CameraService:
 
         self._camera.Open()
 
-        # Conservative starting values
-        target_width = settings.camera_width
-        target_height = settings.camera_height
-        target_fps = 3.0
-        target_throughput_bps = 30_000_000  # 30 Mbit/s to start safely
-        safe_packet_size = 1500  # match standard MTU path first
-        frame_retention_us = 50_000  # 50 ms in microseconds, typical unit
+        # ── Camera-side settings ──
 
+        # 0) Pixel format: BayerRG8 = 1 byte/pixel (66% less data over WiFi)
+        #    The converter debayers to BGR8 on the host CPU — full quality preserved
         try:
-            # 0) Increase host-side buffers to reduce underruns
-            if hasattr(self._camera, "MaxNumBuffer"):
-                try:
-                    self._camera.MaxNumBuffer = 64
-                    logger.info(f"Set MaxNumBuffer to {self._camera.MaxNumBuffer}")
-                except Exception as e:
-                    logger.warning(f"Could not set MaxNumBuffer: {e}")
-
-            # 1) Resolution (aligned to required increments)
-            if hasattr(self._camera, "Width") and hasattr(self._camera, "Height"):
-                w = _align_node(self._camera.Width, target_width)
-                h = _align_node(self._camera.Height, target_height)
-                self._camera.Width.SetValue(w)
-                self._camera.Height.SetValue(h)
-                logger.info(
-                    f"Set camera ROI to {w}x{h} "
-                    f"(range {self._camera.Width.GetMin()}-{self._camera.Width.GetMax()} x "
-                    f"{self._camera.Height.GetMin()}-{self._camera.Height.GetMax()})"
-                )
-
-            # 2) Safe packet size (match NIC MTU=1500 first; raise later if using jumbo)
-            if hasattr(self._camera, "GevSCPSPacketSize"):
-                try:
-                    self._camera.GevSCPSPacketSize.SetValue(int(safe_packet_size))
-                    logger.info(f"Set GevSCPSPacketSize to {self._camera.GevSCPSPacketSize.GetValue()}")
-                except Exception as e:
-                    logger.warning(f"Could not set GevSCPSPacketSize: {e}")
-
-            # 3) Frame retention (allow more time before buffers are considered lost)
-            if hasattr(self._camera, "FrameRetention"):
-                try:
-                    self._camera.FrameRetention.SetValue(int(frame_retention_us))
-                    logger.info(f"Set FrameRetention to {self._camera.FrameRetention.GetValue()} µs")
-                except Exception as e:
-                    logger.warning(f"Could not set FrameRetention: {e}")
-
-            # 4) FPS limit and throughput cap
-            if hasattr(self._camera, "AcquisitionFrameRateEnable"):
-                self._camera.AcquisitionFrameRateEnable.SetValue(True)
-            if hasattr(self._camera, "AcquisitionFrameRate"):
-                self._camera.AcquisitionFrameRate.SetValue(float(target_fps))
-            logger.info(f"Set camera FPS to {target_fps}")
-
-            if hasattr(self._camera, "DeviceLinkThroughputLimit"):
-                try:
-                    max_limit = self._camera.DeviceLinkThroughputLimit.GetMax()
-                except Exception:
-                    max_limit = None
-                limit = min(max_limit, target_throughput_bps) if max_limit else target_throughput_bps
-                self._camera.DeviceLinkThroughputLimit.SetValue(limit)
-                logger.info(f"Set DeviceLinkThroughputLimit to {limit / 1_000_000:.1f} Mbit/s")
-
+            self._camera.PixelFormat.SetValue("BayerRG8")
+            logger.info("Set PixelFormat to BayerRG8 (1 byte/px, debayer on CPU)")
         except Exception as e:
-            logger.warning(f"Error configuring camera parameters: {e}")
+            logger.warning(f"Could not set BayerRG8: {e}")
 
-        # Start continuous grabbing
-        self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-        logger.info("Started grabbing with conservative settings")
-
-        # Optional: perform a warmup grab and discard it to avoid initial incomplete buffer
+        # 1) Resolution: use camera's maximum for best PCB inspection quality
         try:
-            warmup = self._camera.RetrieveResult(2000, pylon.TimeoutHandling_ThrowException)
-            if warmup and warmup.GrabSucceeded():
-                logger.debug("Warmup frame grabbed and discarded")
-            elif warmup:
-                logger.debug(f"Warmup grab failed: {getattr(warmup, 'ErrorDescription', 'unknown')}")
-        except Exception:
-            logger.debug("Warmup grab encountered an exception; continuing")
-        finally:
+            max_w = self._camera.Width.GetMax()
+            max_h = self._camera.Height.GetMax()
+            self._camera.Width.SetValue(max_w)
+            self._camera.Height.SetValue(max_h)
+            logger.info(f"Set camera to max resolution: {max_w}x{max_h}")
+        except Exception as e:
+            logger.warning(f"Could not set max resolution: {e}")
+
+        # 2) Packet size (slightly below MTU — helps some routers)
+        try:
+            self._camera.GevSCPSPacketSize.SetValue(1400)
+            logger.info(f"Set GevSCPSPacketSize to {self._camera.GevSCPSPacketSize.GetValue()}")
+        except Exception as e:
+            logger.warning(f"Could not set GevSCPSPacketSize: {e}")
+
+        # 3) Inter-packet delay: very high for WiFi reliability
+        try:
+            self._camera.GevSCPD.SetValue(250000)
+            logger.info(f"Set GevSCPD (inter-packet delay) to {self._camera.GevSCPD.GetValue()}")
+        except Exception as e:
+            logger.warning(f"Could not set GevSCPD: {e}")
+
+        # 4) Throughput cap: 2 Mbit/s — very slow but reliable over WiFi
+        try:
+            max_limit = self._camera.DeviceLinkThroughputLimit.GetMax()
+            limit = min(max_limit, 2_000_000)  # 2 Mbit/s
+            self._camera.DeviceLinkThroughputLimit.SetValue(limit)
+            logger.info(f"Set DeviceLinkThroughputLimit to {limit / 1_000_000:.1f} Mbit/s")
+        except Exception as e:
+            logger.warning(f"Could not set DeviceLinkThroughputLimit: {e}")
+
+        # 5) Host-side buffers
+        try:
+            self._camera.MaxNumBuffer = 64
+            logger.info("Set MaxNumBuffer to 64")
+        except Exception as e:
+            logger.warning(f"Could not set MaxNumBuffer: {e}")
+
+        # ── Stream grabber settings (host-side, critical for WiFi) ──
+
+        # Enable packet resend: pylon requests retransmission of lost UDP packets
+        # and waits longer before declaring a frame "lost"
+        try:
+            sn = self._camera.GetStreamGrabberNodeMap()
             try:
-                if warmup:
-                    warmup.Release()
+                pylon.FeaturePersistence.Save("", sn)  # dummy to verify nodemap works
             except Exception:
                 pass
 
+            for name, val, label in [
+                ("EnableResend", True, "EnableResend"),
+                ("PacketTimeout", 100000, "PacketTimeout (100ms)"),
+                ("FrameRetention", 5000000, "FrameRetention (5s)"),
+                ("MaxNumResendsPerBuffer", 500, "MaxNumResendsPerBuffer"),
+            ]:
+                try:
+                    node = sn.GetNode(name)
+                    if node is not None:
+                        if isinstance(val, bool):
+                            node.SetValue(val)
+                        else:
+                            node.SetValue(val)
+                        logger.info(f"Stream grabber: {label} = {val}")
+                    else:
+                        logger.debug(f"Stream grabber node '{name}' not found")
+                except Exception as e:
+                    logger.debug(f"Could not set stream grabber '{name}': {e}")
+        except Exception as e:
+            logger.warning(f"Could not access stream grabber nodemap: {e}")
+
+        logger.info("Camera configured for single-shot capture over WiFi (max resolution, slow transfer)")
+
     def _capture_basler(self) -> Optional[Path]:
-        """Capture image from Basler camera using pypylon."""
+        """Capture a single image from Basler camera using GrabOne().
+        Uses a long timeout (30s) to allow slow WiFi transfer at max resolution.
+        Retries up to 3 times."""
         try:
             self._init_pylon()
 
-            if not self._camera.IsGrabbing():
-                self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                logger.info(f"GrabOne attempt {attempt}/{max_attempts} (30s timeout)...")
+                grab_result = self._camera.GrabOne(
+                    30000, pylon.TimeoutHandling_ThrowException
+                )
 
-            grab_result = self._camera.RetrieveResult(
-                5000, pylon.TimeoutHandling_ThrowException
-            )
+                try:
+                    if grab_result.GrabSucceeded():
+                        image = self._converter.Convert(grab_result)
+                        frame = image.GetArray()
+                        logger.info(f"Grab succeeded on attempt {attempt}")
+                        return self._save_frame(frame)
+                    else:
+                        logger.warning(
+                            f"Grab attempt {attempt}/{max_attempts} failed: "
+                            f"{grab_result.ErrorDescription}"
+                        )
+                finally:
+                    grab_result.Release()
 
-            try:
-                if not grab_result.GrabSucceeded():
-                    logger.error(f"Basler grab failed: {grab_result.ErrorDescription}")
-                    return None
-
-                image = self._converter.Convert(grab_result)
-                frame = image.GetArray()
-            finally:
-                grab_result.Release()
-
-            return self._save_frame(frame)
+            logger.error("Basler grab failed after all attempts")
+            return None
 
         except Exception as e:
             logger.error(f"Basler capture exception: {e}", exc_info=True)
