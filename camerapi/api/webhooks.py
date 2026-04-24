@@ -7,12 +7,15 @@ Configured in the LS UI under Project → Webhooks:
 
 On each event we:
   1. Parse the payload (tolerating unknown fields LS may add over time).
-  2. Recover `capture_id` from task.meta (set by camerapi when it uploaded).
-  3. Fetch the image bytes from LS and save a labeled copy on the Pi.
-  4. Mirror the labeled copy to the laptop (best-effort).
+  2. Recover `capture_id` from task.meta (set by camerapi when it created
+     the task).
+  3. Read the original image from disk (unlabeled_dir/<capture_id>.jpg).
+     No HTTP fetch — LS and camerapi share the same filesystem.
+  4. Save a labeled copy + annotation JSON on the Pi.
+  5. Mirror the labeled copy to the laptop (best-effort).
 
 Handler is idempotent: repeated calls overwrite. LS may retry on timeouts,
-and ANNOTATION_UPDATED lands here too — both should be safe.
+and ANNOTATION_UPDATED lands here too — both are safe.
 """
 from __future__ import annotations
 
@@ -20,7 +23,6 @@ from fastapi import APIRouter, HTTPException
 
 from config.settings import settings
 from models.schemas import AnnotationWebhookPayload, CaptureMetadata
-from services.labelstudio_service import labelstudio_service
 from services.mirror_service import mirror_service
 from services.storage_service import storage_service
 from utils.logger import setup_logger
@@ -32,11 +34,7 @@ router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
 
 @router.post("/annotation-created")
 async def annotation_created(payload: AnnotationWebhookPayload) -> dict:
-    """
-    Handle Label Studio ANNOTATION_CREATED / ANNOTATION_UPDATED.
-
-    Returns quickly (< 5 s) to stay within LS's webhook timeout.
-    """
+    """Handle Label Studio ANNOTATION_CREATED / ANNOTATION_UPDATED."""
     logger.info(
         f"Webhook received: action={payload.action} "
         f"task={payload.task.id} annotation={payload.annotation.id}"
@@ -53,23 +51,22 @@ async def annotation_created(payload: AnnotationWebhookPayload) -> dict:
             detail="task.meta.capture_id missing; nothing to match",
         )
 
-    # Pull image bytes from LS (LS holds the original; we never ask the
-    # annotator's browser for anything).
-    try:
-        image_bytes = labelstudio_service.fetch_task_image_bytes(
-            payload.task.model_dump()
+    # Read image bytes directly from the shared filesystem. LS was pointed
+    # at the same folder via local-files storage, so this is the same file.
+    unlabeled_path = storage_service.unlabeled_image_path(capture_id)
+    if not unlabeled_path.exists():
+        logger.error(f"Unlabeled image missing for {capture_id}: {unlabeled_path}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"unlabeled image not found on disk: {unlabeled_path.name}",
         )
-    except Exception as e:
-        logger.error(f"Failed to fetch image for task {payload.task.id}: {e}")
-        raise HTTPException(status_code=502, detail=f"fetch image failed: {e}")
+    image_bytes = unlabeled_path.read_bytes()
 
-    # Pull the original capture metadata if we still have it, so the merged
-    # JSON can include camera serial, resolution, etc.
+    # Load original capture metadata so labeled JSON preserves camera info.
     original_metadata: CaptureMetadata | None = storage_service.load_unlabeled_metadata(
         capture_id
     )
 
-    # Write labeled artifacts atomically.
     annotation_dict = payload.annotation.model_dump(mode="json")
     image_path, annotation_path = storage_service.save_labeled(
         capture_id=capture_id,
@@ -78,8 +75,6 @@ async def annotation_created(payload: AnnotationWebhookPayload) -> dict:
         capture_metadata=original_metadata,
     )
 
-    # Best-effort mirror to laptop. Log but don't fail the webhook — LS
-    # shouldn't retry on laptop outages.
     mirror_ok, mirror_detail = mirror_service.mirror_labeled(
         image_path=image_path,
         annotation_path=annotation_path,
