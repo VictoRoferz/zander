@@ -1,6 +1,8 @@
 """
-Configuration management for Server 1 (Camera Service - Raspberry Pi 3)
-Uses Pydantic Settings for type-safe environment variable handling
+Configuration management for camerapi (Raspberry Pi 3).
+
+All values can be overridden via environment variables (see .env).
+Settings are validated at startup via Pydantic.
 """
 from pathlib import Path
 from typing import Optional
@@ -8,64 +10,82 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """
-    Server 1 configuration settings.
-    All values can be overridden via environment variables.
-    """
-
-    # Service identification
+    # ---- Service identity ----
     service_name: str = "camera-service"
-    service_version: str = "1.0.0"
+    service_version: str = "2.0.0"
 
-    # Server configuration
+    # ---- Server ----
     host: str = "0.0.0.0"
     port: int = 8001
 
-    # Camera configuration
+    # ---- Camera ----
     use_camera: bool = True
-    camera_index: int = 0  # 0 = default camera, 1+ = external USB cameras
+    camera_index: int = 0  # OpenCV fallback index
     camera_width: int = 1920
     camera_height: int = 1080
     camera_fps: int = 30
-
-    # Fallback image (for testing without camera)
     fallback_image_path: str = "sample.jpg"
 
-    # Server 2 (Raspberry Pi 5) connection
-    server2_url: str = "http://192.168.0.115:8002"
-    server2_upload_endpoint: str = "/api/v1/upload"
-    upload_timeout: int = 30  # seconds
-    upload_retries: int = 3
-    upload_retry_delay: float = 2.0  # seconds (exponential backoff)
+    # ---- Persistent storage (Pi side) ----
+    # Images land here on the Pi and never get auto-deleted.
+    data_root: Path = Path("/home/pi/zander-data")
 
-    # Local storage (temporary)
-    temp_dir: Path = Path("/tmp/camera_captures")
-    cleanup_after_upload: bool = True
+    # ---- Label Studio ----
+    labelstudio_url: str = "http://localhost:8081"
+    labelstudio_api_key: str = ""  # MUST be set via .env
+    labelstudio_project_name: str = "PCB Defect Inspection"
+    labelstudio_enable_webhooks: bool = True
+    # Upload timeouts for the LS SDK (seconds)
+    labelstudio_timeout: int = 30
 
-    # Logging
+    # ---- Laptop mirror (fixed-IP "Option 1") ----
+    # If enabled, each capture is also sent to the laptop receiver.
+    # Failure to reach the laptop does NOT fail the capture flow.
+    laptop_mirror_enabled: bool = True
+    laptop_mirror_url: str = "http://192.168.0.199:8002"
+    laptop_mirror_timeout: int = 10  # seconds per HTTP call
+    laptop_mirror_retries: int = 3
+
+    # ---- Logging ----
     log_level: str = "INFO"
     log_file: Optional[str] = None
 
-    # Health check
+    # ---- Health check ----
     health_check_enabled: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore"
+        extra="ignore",
     )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Ensure temp directory exists
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure persistent folders exist on startup. Cheap and idempotent.
+        self.unlabeled_dir.mkdir(parents=True, exist_ok=True)
+        self.labeled_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Derived paths ----
 
     @property
-    def server2_upload_url(self) -> str:
-        """Full upload URL for Server 2"""
-        return f"{self.server2_url}{self.server2_upload_endpoint}"
+    def unlabeled_dir(self) -> Path:
+        return self.data_root / "unlabeled"
+
+    @property
+    def labeled_dir(self) -> Path:
+        return self.data_root / "labeled"
+
+    # ---- Derived URLs ----
+
+    @property
+    def laptop_unlabeled_url(self) -> str:
+        return f"{self.laptop_mirror_url}/api/v1/mirror/unlabeled"
+
+    @property
+    def laptop_labeled_url(self) -> str:
+        return f"{self.laptop_mirror_url}/api/v1/mirror/labeled"
 
 
-# Global settings instance
+# Global settings instance — imported everywhere else.
 settings = Settings()

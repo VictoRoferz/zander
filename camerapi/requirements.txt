@@ -1,17 +1,19 @@
-# Server 1 (Camera Service - Raspberry Pi 3) Dependencies
-# Optimized for embedded systems
+# camerapi (Raspberry Pi 3) Dependencies
 
 # Web framework
 fastapi
 uvicorn[standard]
 python-multipart
 
-# HTTP client for uploading to Server 2
+# HTTP client (LS fetch + laptop mirror)
 requests
 
+# Label Studio SDK (project lookup/create)
+label-studio-sdk
+
 # Camera and image processing
-opencv-python-headless # Headless version for lower memory footprint
-numpy # Compatible with RPi
+opencv-python-headless
+numpy
 
 # Configuration management
 pydantic
@@ -20,4 +22,5 @@ pydantic-settings
 # Utilities
 python-dotenv
 
+# GPIO button (production trigger)
 RPi.GPIO

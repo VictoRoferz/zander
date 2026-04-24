@@ -1,0 +1,28 @@
+# Secrets / local config
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local data (images, captures, label studio DB)
+zander-data/
+data/
+*.jpg
+*.jpeg
+*.png
+# but keep the sample image used by camerapi fallback
+!camerapi/sample.jpg
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
