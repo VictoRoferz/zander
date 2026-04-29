@@ -37,8 +37,6 @@ LABELING_CONFIG = """
   <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="true"/>
 
   <BrushLabels name="defects" toName="image">
-    <Label value="Good Joint" background="#2ECC40"/>
-    <Label value="Cold Joint" background="#0074D9"/>
     <Label value="Insufficient Solder" background="#FFDC00"/>
     <Label value="Excess Solder" background="#FF851B"/>
     <Label value="Bridging" background="#FF4136"/>

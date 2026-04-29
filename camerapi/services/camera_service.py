@@ -11,6 +11,9 @@ Priority order:
 """
 from __future__ import annotations
 
+import socket
+import struct
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,6 +32,37 @@ try:
 except ImportError:
     PYPYLON_AVAILABLE = False
     logger.warning("pypylon not available - falling back to OpenCV VideoCapture")
+
+
+# Transport profiles: pylon node values tuned per network medium.
+# Ethernet: full throughput, no spacing, small retransmit window.
+# WiFi: throttled, large inter-packet delay, generous resends.
+ETHERNET_PROFILE: dict[str, Any] = {
+    "label": "ethernet",
+    "packet_size": 1500,           # standard MTU; raise to 9000 with jumbo frames
+    "inter_packet_delay": 0,       # GigE link is fast enough
+    "throughput_limit_bps": None,  # None = use camera max
+    "max_num_buffer": 16,
+    "stream_grabber": {
+        "EnableResend": True,
+        "PacketTimeout": 20000,    # 20 ms
+        "FrameRetention": 200000,  # 200 ms
+        "MaxNumResendsPerBuffer": 5,
+    },
+}
+WIFI_PROFILE: dict[str, Any] = {
+    "label": "wifi",
+    "packet_size": 1400,
+    "inter_packet_delay": 250000,
+    "throughput_limit_bps": 2_000_000,  # 2 Mbit/s
+    "max_num_buffer": 64,
+    "stream_grabber": {
+        "EnableResend": True,
+        "PacketTimeout": 100000,    # 100 ms
+        "FrameRetention": 5000000,  # 5 s
+        "MaxNumResendsPerBuffer": 500,
+    },
+}
 
 
 class CameraService:
@@ -115,8 +149,9 @@ class CameraService:
 
     def _init_pylon(self) -> None:
         """
-        Lazy init of pylon factory, camera, format converter, and WiFi-tuned
-        acquisition settings. Called once; camera stays open for subsequent grabs.
+        Lazy init of pylon factory, camera, format converter, and a tuned
+        acquisition profile (Ethernet vs WiFi). Called once; camera stays
+        open for subsequent grabs.
         """
         if self._camera is not None:
             return
@@ -132,6 +167,11 @@ class CameraService:
             f"serial={device.GetSerialNumber()}"
         )
 
+        # Pick transport profile BEFORE opening the camera so we can log it
+        # alongside the rest of the settings.
+        profile = self._select_profile(device)
+        logger.info(f"Transport profile: {profile['label']}")
+
         self._camera = pylon.InstantCamera(self._tl_factory.CreateDevice(device))
 
         self._converter = pylon.ImageFormatConverter()
@@ -141,7 +181,10 @@ class CameraService:
         self._camera.Open()
 
         # BayerRG8: 1 byte/pixel over the wire; debayer to BGR8 on CPU.
-        self._try_set(lambda: self._camera.PixelFormat.SetValue("BayerRG8"), "PixelFormat=BayerRG8")
+        self._try_set(
+            lambda: self._camera.PixelFormat.SetValue("BayerRG8"),
+            "PixelFormat=BayerRG8",
+        )
 
         # Max resolution for PCB inspection.
         try:
@@ -153,32 +196,124 @@ class CameraService:
         except Exception as e:
             logger.warning(f"Could not set max resolution: {e}")
 
-        # WiFi-friendly throughput tuning.
-        self._try_set(lambda: self._camera.GevSCPSPacketSize.SetValue(1400), "GevSCPSPacketSize=1400")
-        self._try_set(lambda: self._camera.GevSCPD.SetValue(250000), "GevSCPD=250000")
+        # Apply the chosen profile.
+        self._apply_profile(profile)
 
+        logger.info(
+            f"Camera configured for single-shot capture ({profile['label']} profile)"
+        )
+
+    def _select_profile(self, device: Any) -> dict[str, Any]:
+        """
+        Resolve which acquisition profile to use.
+
+        Order of precedence:
+          1. settings.camera_transport == "ethernet" / "wifi" → forced.
+          2. "auto" → look up the OS route to the camera's IP and pick
+             ethernet for eth*/en*, wifi for wl*.
+          3. Anything else / detection fails → fall back to wifi (safer).
+        """
+        forced = (settings.camera_transport or "auto").strip().lower()
+        if forced == "ethernet":
+            logger.info("camera_transport=ethernet (forced via .env)")
+            return ETHERNET_PROFILE
+        if forced == "wifi":
+            logger.info("camera_transport=wifi (forced via .env)")
+            return WIFI_PROFILE
+
+        camera_ip = self._camera_ip(device)
+        if not camera_ip:
+            logger.warning("Could not read camera IP — falling back to WiFi profile")
+            return WIFI_PROFILE
+
+        iface = self._interface_for_ip(camera_ip)
+        logger.info(f"Camera IP {camera_ip} reachable via interface '{iface or '?'}'")
+        if iface and (iface.startswith("eth") or iface.startswith("en")):
+            return ETHERNET_PROFILE
+        if iface and iface.startswith("wl"):
+            return WIFI_PROFILE
+        logger.warning(
+            f"Unrecognized interface '{iface}' for camera IP {camera_ip} — "
+            "falling back to WiFi profile"
+        )
+        return WIFI_PROFILE
+
+    @staticmethod
+    def _camera_ip(device: Any) -> Optional[str]:
+        """Best-effort extraction of the camera's IPv4 from pylon DeviceInfo."""
+        getter = getattr(device, "GetIpAddress", None)
+        if getter is None:
+            return None
+        try:
+            value = getter()
+        except Exception as e:
+            logger.debug(f"GetIpAddress failed: {e}")
+            return None
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, int):
+            try:
+                return socket.inet_ntoa(struct.pack("!I", value))
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _interface_for_ip(camera_ip: str) -> Optional[str]:
+        """Run `ip -o route get <ip>` and parse the `dev <iface>` token."""
+        try:
+            result = subprocess.run(
+                ["ip", "-o", "route", "get", camera_ip],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.debug(f"ip route get failed: {e}")
+            return None
+        parts = result.stdout.split()
+        if "dev" in parts:
+            idx = parts.index("dev") + 1
+            if idx < len(parts):
+                return parts[idx]
+        return None
+
+    def _apply_profile(self, profile: dict[str, Any]) -> None:
+        """Push profile values into the camera's GenICam nodes."""
+        # Packet size + inter-packet delay (camera-side).
+        self._try_set(
+            lambda: self._camera.GevSCPSPacketSize.SetValue(profile["packet_size"]),
+            f"GevSCPSPacketSize={profile['packet_size']}",
+        )
+        self._try_set(
+            lambda: self._camera.GevSCPD.SetValue(profile["inter_packet_delay"]),
+            f"GevSCPD={profile['inter_packet_delay']}",
+        )
+
+        # Throughput cap.
         try:
             max_limit = self._camera.DeviceLinkThroughputLimit.GetMax()
-            limit = min(max_limit, 2_000_000)
+            target = profile["throughput_limit_bps"]
+            limit = max_limit if target is None else min(max_limit, target)
             self._camera.DeviceLinkThroughputLimit.SetValue(limit)
-            logger.info(f"Set DeviceLinkThroughputLimit to {limit / 1_000_000:.1f} Mbit/s")
+            logger.info(
+                f"DeviceLinkThroughputLimit = {limit / 1_000_000:.1f} Mbit/s "
+                f"(max {max_limit / 1_000_000:.1f})"
+            )
         except Exception as e:
             logger.warning(f"Could not set DeviceLinkThroughputLimit: {e}")
 
+        # Host-side buffers.
         try:
-            self._camera.MaxNumBuffer = 64
+            self._camera.MaxNumBuffer = profile["max_num_buffer"]
+            logger.info(f"MaxNumBuffer = {profile['max_num_buffer']}")
         except Exception as e:
             logger.warning(f"Could not set MaxNumBuffer: {e}")
 
-        # Stream-grabber tuning (packet resend / long timeouts for WiFi).
+        # Stream-grabber knobs (host-side resend behavior).
         try:
             sn = self._camera.GetStreamGrabberNodeMap()
-            for name, val in [
-                ("EnableResend", True),
-                ("PacketTimeout", 100000),
-                ("FrameRetention", 5000000),
-                ("MaxNumResendsPerBuffer", 500),
-            ]:
+            for name, val in profile["stream_grabber"].items():
                 try:
                     node = sn.GetNode(name)
                     if node is not None:
@@ -187,8 +322,6 @@ class CameraService:
                     pass
         except Exception as e:
             logger.warning(f"Could not access stream grabber nodemap: {e}")
-
-        logger.info("Camera configured for single-shot capture over WiFi")
 
     @staticmethod
     def _try_set(fn, label: str) -> None:

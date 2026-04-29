@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     camera_height: int = 1080
     camera_fps: int = 30
     fallback_image_path: str = "sample.jpg"
+    # "auto" picks ethernet vs wifi by checking the route to the camera's IP.
+    # Override to "ethernet" or "wifi" to force a profile (debugging / odd networks).
+    camera_transport: str = "auto"
 
     # ---- Persistent storage (Pi side) ----
     # Images land here on the Pi and never get auto-deleted.
