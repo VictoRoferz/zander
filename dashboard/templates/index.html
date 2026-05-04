@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Camera Pipeline — Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <strong>Camera Pipeline</strong>
+      <span class="muted"> · {{ user_email }}</span>
+    </div>
+    <div class="topbar-right">
+      <a class="button" href="{{ labelstudio_url }}" target="_blank" rel="noopener">Open Label Studio</a>
+      <button id="capture-btn" class="button primary">Capture</button>
+      <form method="post" action="/logout" class="inline">
+        <button class="button ghost" type="submit">Log out</button>
+      </form>
+    </div>
+  </header>
+
+  <section class="stats">
+    <div class="stat"><span class="num" id="count-unlabeled">–</span><span class="lbl">Unlabeled</span></div>
+    <div class="stat"><span class="num" id="count-labeled">–</span><span class="lbl">Labeled</span></div>
+    <div class="stat"><span class="num" id="count-total">–</span><span class="lbl">Total</span></div>
+    <div class="stat-detail" id="capture-status"></div>
+  </section>
+
+  <section>
+    <h2>Unlabeled</h2>
+    <div class="grid" id="grid-unlabeled"></div>
+  </section>
+
+  <section>
+    <h2>Labeled</h2>
+    <div class="grid" id="grid-labeled"></div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

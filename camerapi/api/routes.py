@@ -10,7 +10,10 @@ Triggers:
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from typing import Optional
+
+import requests
+from fastapi import APIRouter, Header, HTTPException
 
 from config.settings import settings
 from models.schemas import CaptureResult, StepResult
@@ -25,17 +28,45 @@ logger = setup_logger(__name__, level=settings.log_level)
 router = APIRouter(prefix="/api/v1", tags=["camera"])
 
 
+def _ask_dashboard_for_current_user() -> Optional[str]:
+    """
+    Best-effort identity probe used when the request has no X-Triggered-By
+    (e.g. the GPIO button posted from the Pi). Never raises — returns None
+    on any failure so the capture flow stays unblocked.
+    """
+    url = f"{settings.dashboard_url.rstrip('/')}/api/current-user"
+    try:
+        resp = requests.get(url, timeout=settings.dashboard_timeout)
+        if resp.status_code != 200:
+            return None
+        email = resp.json().get("email")
+        if isinstance(email, str) and email:
+            return email
+    except Exception as e:
+        logger.debug(f"dashboard current-user probe failed: {e}")
+    return None
+
+
 @router.post("/capture", response_model=CaptureResult)
-async def capture() -> CaptureResult:
+async def capture(
+    x_triggered_by: Optional[str] = Header(default=None),
+) -> CaptureResult:
     """
     Capture one image, store it, send to Label Studio, mirror to laptop.
 
-    Returns a per-step result. The camera step is the only one that can
-    fail the whole request (HTTP 500); the others are best-effort and
-    reported in the response body.
+    Attribution lookup, in order:
+      1. `X-Triggered-By` request header (the dashboard's "Capture" button
+         and any explicit caller set this).
+      2. The dashboard's `GET /api/current-user` endpoint (used when the
+         GPIO button posts here directly with no header).
+      3. None (button fired with no logged-in user / dashboard unreachable).
     """
     capture_id = new_capture_id()
-    logger.info(f"Capture requested: capture_id={capture_id}")
+    triggered_by = x_triggered_by or _ask_dashboard_for_current_user()
+    logger.info(
+        f"Capture requested: capture_id={capture_id} "
+        f"triggered_by={triggered_by or '<unknown>'}"
+    )
 
     # ---- Step 1: camera (fatal on failure) -----------------------------
     try:
@@ -51,6 +82,7 @@ async def capture() -> CaptureResult:
             source=source_info.get("source", "unknown"),
             camera_serial=source_info.get("camera_serial"),
             camera_model=source_info.get("camera_model"),
+            triggered_by=triggered_by,
         )
     except Exception as e:
         logger.error(f"[{capture_id}] Saving image failed: {e}", exc_info=True)

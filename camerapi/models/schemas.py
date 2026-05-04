@@ -26,6 +26,9 @@ class CaptureMetadata(BaseModel):
     size_bytes: int
     camera_serial: Optional[str] = None
     camera_model: Optional[str] = None
+    # Email of the dashboard user who triggered the capture, if any.
+    # None = button press with no logged-in user, or curl without the header.
+    triggered_by: Optional[str] = None
 
 
 # ----- Per-step capture result (returned by POST /capture) ----------------

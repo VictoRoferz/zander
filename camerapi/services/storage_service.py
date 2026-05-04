@@ -94,6 +94,7 @@ class StorageService:
         source: str,
         camera_serial: Optional[str] = None,
         camera_model: Optional[str] = None,
+        triggered_by: Optional[str] = None,
     ) -> tuple[Path, CaptureMetadata]:
         """
         Encode frame as JPEG, write image + metadata sidecar atomically.
@@ -118,6 +119,7 @@ class StorageService:
             size_bytes=len(data),
             camera_serial=camera_serial,
             camera_model=camera_model,
+            triggered_by=triggered_by,
         )
 
         self._save_metadata(self.unlabeled_metadata_path(capture_id), metadata)

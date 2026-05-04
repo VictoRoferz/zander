@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     laptop_mirror_timeout: int = 10  # seconds per HTTP call
     laptop_mirror_retries: int = 3
 
+    # ---- Dashboard (for GPIO-button user attribution) ----
+    # When the GPIO button fires, camerapi asks the dashboard who's logged
+    # in via GET {dashboard_url}/api/current-user. Best-effort — failure
+    # never blocks the capture (triggered_by just becomes null).
+    dashboard_url: str = "http://192.168.0.199:8003"
+    dashboard_timeout: float = 1.5  # seconds; keep tight so button stays snappy
+
     # ---- Logging ----
     log_level: str = "INFO"
     log_file: Optional[str] = None

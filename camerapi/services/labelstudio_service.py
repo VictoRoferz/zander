@@ -214,6 +214,7 @@ class LabelStudioService:
             "camera_model": metadata.camera_model,
             "width": metadata.width,
             "height": metadata.height,
+            "triggered_by": metadata.triggered_by,
         }
 
         resp = self._ls_request(
