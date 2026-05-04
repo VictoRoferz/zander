@@ -94,7 +94,9 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: Optional[str] = None) -> Any:
-    return TEMPLATES.TemplateResponse("login.html", {"request": request, "error": error})
+    return TEMPLATES.TemplateResponse(
+        request, "login.html", {"error": error}
+    )
 
 
 @app.post("/login")
@@ -105,8 +107,9 @@ async def login_submit(
 ) -> Any:
     if not auth.verify_password(email, password):
         return TEMPLATES.TemplateResponse(
+            request,
             "login.html",
-            {"request": request, "error": "Wrong email or password."},
+            {"error": "Wrong email or password."},
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
     session_id, expires_at = auth.login(email)
@@ -147,9 +150,9 @@ async def home(
     if not email:
         return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
     return TEMPLATES.TemplateResponse(
+        request,
         "index.html",
         {
-            "request": request,
             "user_email": email,
             "labelstudio_url": LABELSTUDIO_URL,
         },

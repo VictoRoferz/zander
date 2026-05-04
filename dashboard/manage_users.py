@@ -13,8 +13,7 @@ import argparse
 import getpass
 import sys
 
-from passlib.hash import bcrypt
-
+import auth
 import db
 
 
@@ -23,7 +22,7 @@ def cmd_add(email: str, full_name: str | None) -> int:
         print(f"ERROR: user {email!r} already exists. Use `reset` to change password.")
         return 1
     pw = _prompt_password_twice()
-    db.add_user(email, bcrypt.hash(pw), full_name)
+    db.add_user(email, auth.hash_password(pw), full_name)
     print(f"Added user {email}.")
     return 0
 
@@ -53,7 +52,7 @@ def cmd_reset(email: str) -> int:
         print(f"No user named {email!r}.")
         return 1
     pw = _prompt_password_twice()
-    db.update_password(email, bcrypt.hash(pw))
+    db.update_password(email, auth.hash_password(pw))
     print(f"Password updated for {email}.")
     return 0
 

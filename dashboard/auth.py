@@ -13,31 +13,43 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 from fastapi import Cookie, HTTPException, status
-from passlib.hash import bcrypt
 
 import db
 
 SESSION_COOKIE = "dashboard_session"
 SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "8"))
 
-# Pre-computed at import time so verify_password() can spend a comparable
-# amount of CPU when the email is unknown — keeps "no such user" from being
+# Bcrypt accepts at most 72 bytes of password input. Truncating before hash
+# matches what the library does internally on hash, so verify still works.
+_BCRYPT_MAX = 72
+
+
+def hash_password(password: str) -> str:
+    """Bcrypt-hash a password. Returns the encoded hash string."""
+    pw = password.encode("utf-8")[:_BCRYPT_MAX]
+    return bcrypt.hashpw(pw, bcrypt.gensalt()).decode("utf-8")
+
+
+# Pre-computed at import time so verify_password() spends a comparable amount
+# of CPU when the email is unknown — keeps "no such user" from being
 # observably faster than "wrong password" via timing.
-_DUMMY_HASH = bcrypt.hash("dummy-password-for-timing-equalization")
+_DUMMY_HASH = hash_password("dummy-password-for-timing-equalization")
 
 
 def verify_password(email: str, password: str) -> bool:
     """Look up user by email and bcrypt-verify the password."""
+    pw = password.encode("utf-8")[:_BCRYPT_MAX]
     row = db.get_user(email)
     if row is None:
         try:
-            bcrypt.verify(password, _DUMMY_HASH)
+            bcrypt.checkpw(pw, _DUMMY_HASH.encode("utf-8"))
         except ValueError:
             pass
         return False
     try:
-        return bcrypt.verify(password, row["password_hash"])
+        return bcrypt.checkpw(pw, row["password_hash"].encode("utf-8"))
     except ValueError:
         return False
 

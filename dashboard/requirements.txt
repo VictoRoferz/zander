@@ -3,5 +3,5 @@ uvicorn[standard]
 python-multipart
 jinja2
 itsdangerous
-passlib[bcrypt]
+bcrypt
 httpx
