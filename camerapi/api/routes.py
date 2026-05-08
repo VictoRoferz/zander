@@ -10,13 +10,14 @@ Triggers:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import requests
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
 
 from config.settings import settings
-from models.schemas import CaptureResult, StepResult
+from models.schemas import CaptureMetadata, CaptureResult, StepResult
 from services.camera_service import camera_service
 from services.labelstudio_service import labelstudio_service
 from services.mirror_service import mirror_service
@@ -47,12 +48,54 @@ def _ask_dashboard_for_current_user() -> Optional[str]:
     return None
 
 
+def _create_ls_task_bg(
+    capture_id: str, image_path: Path, metadata: CaptureMetadata
+) -> None:
+    """
+    Background task: create the Label Studio task for a capture.
+    Failures are logged; never re-raised (response is already sent).
+    """
+    try:
+        result = labelstudio_service.create_task_from_image(image_path, metadata)
+        logger.info(
+            f"[bg][{capture_id}] LS task created: id={result['task_id']} "
+            f"project_id={result['project_id']}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[bg][{capture_id}] LS task creation failed: "
+            f"{type(e).__name__}: {e}",
+            exc_info=True,
+        )
+
+
+def _mirror_unlabeled_bg(
+    capture_id: str, image_path: Path, metadata: CaptureMetadata
+) -> None:
+    """
+    Background task: push the capture to the laptop receiver.
+    Best-effort by design — failures are logged only.
+    """
+    ok, detail = mirror_service.mirror_unlabeled(image_path, metadata)
+    if ok:
+        logger.info(f"[bg][{capture_id}] laptop mirror ok: {detail}")
+    else:
+        logger.warning(f"[bg][{capture_id}] laptop mirror failed: {detail}")
+
+
 @router.post("/capture", response_model=CaptureResult)
 async def capture(
+    background: BackgroundTasks,
     x_triggered_by: Optional[str] = Header(default=None),
 ) -> CaptureResult:
     """
-    Capture one image, store it, send to Label Studio, mirror to laptop.
+    Capture one image, store it on disk, then return immediately.
+
+    The Label Studio task creation and the laptop mirror happen in
+    BackgroundTasks after the response is sent — they no longer block the
+    caller. Their outcomes show up in the camerapi logs (look for
+    "[bg][<capture_id>] ..."). The response always reports them as
+    "queued"; check /api/v1/status or the logs for actual results.
 
     Attribution lookup, in order:
       1. `X-Triggered-By` request header (the dashboard's "Capture" button
@@ -93,26 +136,15 @@ async def capture(
         detail=f"saved {image_path.name} ({metadata.size_bytes // 1024} KB)",
     )
 
-    # ---- Step 2: Label Studio (best-effort) ----------------------------
-    try:
-        ls_result = labelstudio_service.create_task_from_image(image_path, metadata)
-        ls_step = StepResult(
-            ok=True,
-            detail=f"task_id={ls_result['task_id']} project_id={ls_result['project_id']}",
-        )
-    except Exception as e:
-        logger.error(f"[{capture_id}] LS task creation failed: {e}", exc_info=True)
-        ls_step = StepResult(ok=False, detail=f"{type(e).__name__}: {e}")
-
-    # ---- Step 3: laptop mirror (best-effort) ---------------------------
-    mirror_ok, mirror_detail = mirror_service.mirror_unlabeled(image_path, metadata)
-    mirror_step = StepResult(ok=mirror_ok, detail=mirror_detail)
+    # ---- Steps 2 & 3: fire-and-forget after the response is sent -------
+    background.add_task(_create_ls_task_bg, capture_id, image_path, metadata)
+    background.add_task(_mirror_unlabeled_bg, capture_id, image_path, metadata)
 
     return CaptureResult(
         capture_id=capture_id,
         camera=camera_step,
-        label_studio=ls_step,
-        laptop_mirror=mirror_step,
+        label_studio=StepResult(ok=True, detail="queued in background"),
+        laptop_mirror=StepResult(ok=True, detail="queued in background"),
         metadata=metadata,
     )
 
