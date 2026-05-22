@@ -33,27 +33,21 @@ logger = setup_logger(__name__, level=settings.log_level)
 
 LABELING_CONFIG = """
 <View>
-  <Header value="PCB Joint Defect Classification"/>
-  <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="true"/>
-
-  <BrushLabels name="defects" toName="image">
-    <Label value="Insufficient Solder" background="#FFDC00"/>
-    <Label value="Excess Solder" background="#FF851B"/>
-    <Label value="Bridging" background="#FF4136"/>
-    <Label value="Missing Component" background="#B10DC9"/>
-    <Label value="Tombstoning" background="#F012BE"/>
-    <Label value="Lifted Pad" background="#85144b"/>
-    <Label value="Other Defect" background="#AAAAAA"/>
-  </BrushLabels>
-
+  <Header value="PCB Lötstellen-Defektklassifizierung"/>
+  <Image name="image" value="$image"/>
+  <RectangleLabels name="label" toName="image">
+    <Label value="Brücke" background="green"/>
+    <Label value="Nicht ausreichend Lot" background="blue"/>
+    <Label value="Fahne" background="red"/>
+  </RectangleLabels>
   <Choices name="overall_quality" toName="image" choice="single" showInline="true">
-    <Choice value="Pass"/>
-    <Choice value="Fail"/>
-    <Choice value="Needs Review"/>
+    <Choice value="iO"/>
+    <Choice value="NiO"/>
+    <Choice value="Weitere Überprüfung notwendig"/>
   </Choices>
 
   <TextArea name="notes" toName="image"
-            placeholder="Additional notes or observations..."
+            placeholder="Anmerkungen"
             rows="3"
             maxSubmissions="1"/>
 </View>
