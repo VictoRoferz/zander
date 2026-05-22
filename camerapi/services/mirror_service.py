@@ -27,13 +27,13 @@ class MirrorService:
 
     def __init__(self) -> None:
         self.enabled: bool = settings.laptop_mirror_enabled
-        self.unlabeled_url: str = settings.laptop_unlabeled_url
-        self.labeled_url: str = settings.laptop_labeled_url
+        self.unlabeled_urls: list[str] = settings.laptop_unlabeled_urls
+        self.labeled_urls: list[str] = settings.laptop_labeled_urls
         self.timeout: int = settings.laptop_mirror_timeout
         self.retries: int = settings.laptop_mirror_retries
         logger.info(
             f"MirrorService initialized: enabled={self.enabled}, "
-            f"unlabeled={self.unlabeled_url}, labeled={self.labeled_url}"
+            f"targets={settings.laptop_mirror_base_urls}"
         )
 
     # ---- Unlabeled ------------------------------------------------------
@@ -44,20 +44,25 @@ class MirrorService:
         metadata: CaptureMetadata,
     ) -> tuple[bool, Optional[str]]:
         """
-        Upload unlabeled image + metadata to the laptop.
-        Returns (ok, detail).
+        Upload unlabeled image + metadata to every configured receiver.
+        Returns (ok, detail) aggregated across all targets.
         """
         if not self.enabled:
             return True, "mirror disabled"
 
         metadata_json = metadata.model_dump_json()
-        with image_path.open("rb") as f:
-            files = {"file": (image_path.name, f, "image/jpeg")}
+        # Read once; reuse the same bytes for every target (and for retries).
+        image_bytes = image_path.read_bytes()
+
+        def build():
+            files = {"file": (image_path.name, image_bytes, "image/jpeg")}
             data = {
                 "capture_id": metadata.capture_id,
                 "metadata_json": metadata_json,
             }
-            return self._post_with_retry(self.unlabeled_url, files, data)
+            return files, data
+
+        return self._fan_out(self.unlabeled_urls, build)
 
     # ---- Labeled --------------------------------------------------------
 
@@ -74,15 +79,49 @@ class MirrorService:
         if not self.enabled:
             return True, "mirror disabled"
 
-        with image_path.open("rb") as img, annotation_path.open("rb") as ann:
+        image_bytes = image_path.read_bytes()
+        annotation_bytes = annotation_path.read_bytes()
+
+        def build():
             files = {
-                "file": (image_path.name, img, "image/jpeg"),
-                "annotation": (annotation_path.name, ann, "application/json"),
+                "file": (image_path.name, image_bytes, "image/jpeg"),
+                "annotation": (annotation_path.name, annotation_bytes, "application/json"),
             }
             data = {"capture_id": capture_id}
-            return self._post_with_retry(self.labeled_url, files, data)
+            return files, data
+
+        return self._fan_out(self.labeled_urls, build)
 
     # ---- Internals ------------------------------------------------------
+
+    def _fan_out(self, urls, build) -> tuple[bool, Optional[str]]:
+        """
+        POST to every target URL (each with its own retry budget).
+
+        `build` returns a fresh (files, data) pair per target so file payloads
+        aren't consumed across requests. Best-effort: an unreachable target is
+        logged but doesn't sink the others. Overall ok = at least one target
+        succeeded (so a single online receiver still counts as success even
+        when the other machine is offline).
+        """
+        if not urls:
+            return True, "no mirror targets configured"
+
+        successes: list[str] = []
+        failures: list[str] = []
+        for url in urls:
+            files, data = build()
+            ok, detail = self._post_with_retry(url, files, data)
+            if ok:
+                successes.append(f"{url} -> {detail}")
+            else:
+                failures.append(f"{url} -> {detail}")
+
+        summary = f"{len(successes)}/{len(urls)} ok"
+        if failures:
+            summary += f"; failed: {'; '.join(failures)}"
+        # ok if at least one receiver got it.
+        return (len(successes) > 0), summary
 
     def _post_with_retry(
         self,

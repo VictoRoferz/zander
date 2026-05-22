@@ -42,8 +42,11 @@ class Settings(BaseSettings):
     labelstudio_timeout: int = 30
 
     # ---- Laptop mirror (fixed-IP "Option 1") ----
-    # If enabled, each capture is also sent to the laptop receiver.
-    # Failure to reach the laptop does NOT fail the capture flow.
+    # If enabled, each capture is also sent to the laptop receiver(s).
+    # Failure to reach a receiver does NOT fail the capture flow.
+    # Multiple receivers: comma-separate the base URLs. Each capture is
+    # fanned out to all of them (live fan-out — an offline receiver simply
+    # misses that capture; there is no backfill).
     laptop_mirror_enabled: bool = True
     laptop_mirror_url: str = "http://192.168.0.199:8002"
     laptop_mirror_timeout: int = 10  # seconds per HTTP call
@@ -89,12 +92,25 @@ class Settings(BaseSettings):
     # ---- Derived URLs ----
 
     @property
-    def laptop_unlabeled_url(self) -> str:
-        return f"{self.laptop_mirror_url}/api/v1/mirror/unlabeled"
+    def laptop_mirror_base_urls(self) -> list[str]:
+        """Parse laptop_mirror_url into a clean list of base URLs.
+
+        Accepts a single URL or a comma-separated list. Whitespace and any
+        trailing slash are stripped; empty entries are dropped.
+        """
+        return [
+            part.strip().rstrip("/")
+            for part in self.laptop_mirror_url.split(",")
+            if part.strip()
+        ]
 
     @property
-    def laptop_labeled_url(self) -> str:
-        return f"{self.laptop_mirror_url}/api/v1/mirror/labeled"
+    def laptop_unlabeled_urls(self) -> list[str]:
+        return [f"{base}/api/v1/mirror/unlabeled" for base in self.laptop_mirror_base_urls]
+
+    @property
+    def laptop_labeled_urls(self) -> list[str]:
+        return [f"{base}/api/v1/mirror/labeled" for base in self.laptop_mirror_base_urls]
 
 
 # Global settings instance — imported everywhere else.
