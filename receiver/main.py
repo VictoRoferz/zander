@@ -1,139 +1,85 @@
 """
-Laptop receiver — mirrors camerapi artifacts into ~/zander-data/.
+Receiver — the laptop ingestion hub.
 
-Endpoints:
-  POST /api/v1/mirror/unlabeled  — image + metadata_json (multipart)
-  POST /api/v1/mirror/labeled    — image + annotation JSON (multipart)
-  GET  /api/v1/status            — paths + health
+Runs on the laptop next to Label Studio. Responsibilities:
+  POST /api/v1/ingest                     — intake a capture from the Pi:
+                                            store it + create the LS task
+  POST /api/v1/webhook/annotation-created — LS callback: export labeled data
+  GET  /api/v1/status                     — paths, counts, LS health
+  GET  /api/v1/health                     — liveness
 
-Runs alongside whatever else is on the laptop. The camerapi is the source
-of truth; this service is a passive mirror.
+Label Studio reads images straight from data_root via local-files serving, so
+the receiver owns LS project + local-storage setup. The dashboard reads LS
+state through its own read-only client and never touches this service's LS init.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-import tempfile
-from pathlib import Path
-from typing import Optional
+from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-LOG = logging.getLogger("receiver")
+from api.ingest import router as ingest_router
+from api.webhooks import router as webhook_router
+from config.settings import settings
+from services.labelstudio_service import labelstudio_service
+from services.storage_service import storage_service
+
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
+    level=settings.log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+LOG = logging.getLogger("receiver")
 
-DATA_ROOT = Path(os.environ.get("DATA_ROOT", Path.home() / "zander-data")).expanduser()
-UNLABELED_DIR = DATA_ROOT / "unlabeled"
-LABELED_DIR = DATA_ROOT / "labeled"
-UNLABELED_DIR.mkdir(parents=True, exist_ok=True)
-LABELED_DIR.mkdir(parents=True, exist_ok=True)
 
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8002"))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    LOG.info(
+        f"receiver starting: data_root={settings.data_root} ls={settings.labelstudio_url}"
+    )
+    # Bring Label Studio up if we can, but DON'T crash if it isn't ready yet —
+    # /ingest lazily re-initializes and returns 503 until LS is reachable, so
+    # the Pi's spool just retries. This is strictly safer than dropping tasks.
+    try:
+        labelstudio_service.initialize()
+    except Exception as e:
+        LOG.warning(
+            f"Label Studio not ready at startup: {str(e)[:160]}. "
+            "/ingest will retry lazily."
+        )
+    yield
+    LOG.info("receiver shutting down")
 
-app = FastAPI(title="zander-receiver", version="1.0.0")
+
+app = FastAPI(title="zander-receiver", version=settings.service_version, lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-def _atomic_write(target: Path, data: bytes) -> None:
-    """Atomic write: temp file in target dir, fsync, then os.replace."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, target)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
-@app.post("/api/v1/mirror/unlabeled")
-async def mirror_unlabeled(
-    capture_id: str = Form(...),
-    metadata_json: str = Form(...),
-    file: UploadFile = File(...),
-) -> dict:
-    """Store an unlabeled image + its metadata sidecar."""
-    image_bytes = await file.read()
-    image_path = UNLABELED_DIR / f"{capture_id}.jpg"
-    metadata_path = UNLABELED_DIR / f"{capture_id}.json"
-
-    _atomic_write(image_path, image_bytes)
-
-    # Validate the JSON (reject malformed payloads early) then pretty-print it.
-    try:
-        parsed = json.loads(metadata_json)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=422, detail=f"metadata_json invalid: {e}")
-    _atomic_write(metadata_path, json.dumps(parsed, indent=2).encode("utf-8"))
-
-    LOG.info(f"Stored unlabeled {capture_id} ({len(image_bytes)} bytes)")
-    return {
-        "status": "ok",
-        "capture_id": capture_id,
-        "image_path": str(image_path),
-        "metadata_path": str(metadata_path),
-        "size_bytes": len(image_bytes),
-    }
-
-
-@app.post("/api/v1/mirror/labeled")
-async def mirror_labeled(
-    capture_id: str = Form(...),
-    file: UploadFile = File(...),
-    annotation: UploadFile = File(...),
-) -> dict:
-    """Store a labeled image + its annotation JSON. Idempotent — overwrites."""
-    image_bytes = await file.read()
-    annotation_bytes = await annotation.read()
-
-    image_path = LABELED_DIR / f"{capture_id}.jpg"
-    annotation_path = LABELED_DIR / f"{capture_id}.json"
-
-    # Validate the annotation JSON but store the original bytes (preserve exact LS payload).
-    try:
-        json.loads(annotation_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise HTTPException(status_code=422, detail=f"annotation JSON invalid: {e}")
-
-    _atomic_write(image_path, image_bytes)
-    _atomic_write(annotation_path, annotation_bytes)
-
-    LOG.info(f"Stored labeled {capture_id} ({len(image_bytes)} bytes)")
-    return {
-        "status": "ok",
-        "capture_id": capture_id,
-        "image_path": str(image_path),
-        "annotation_path": str(annotation_path),
-    }
+app.include_router(ingest_router)
+app.include_router(webhook_router)
 
 
 @app.get("/api/v1/status")
 async def status() -> dict:
     return {
-        "service": "zander-receiver",
-        "data_root": str(DATA_ROOT),
-        "unlabeled_dir": str(UNLABELED_DIR),
-        "labeled_dir": str(LABELED_DIR),
-        "unlabeled_count": _count_images(UNLABELED_DIR),
-        "labeled_count": _count_images(LABELED_DIR),
+        "service": settings.service_name,
+        "version": settings.service_version,
+        "data_root": str(settings.data_root),
+        "unlabeled_dir": str(settings.unlabeled_dir),
+        "labeled_dir": str(settings.labeled_dir),
+        "unlabeled_count": storage_service.count_unlabeled(),
+        "labeled_count": storage_service.count_labeled(),
+        "label_studio": {
+            "url": settings.labelstudio_url,
+            "ready": labelstudio_service.is_healthy(),
+        },
     }
 
 
@@ -142,20 +88,13 @@ async def health() -> dict:
     return {"status": "healthy"}
 
 
-def _count_images(directory: Path) -> int:
-    try:
-        return sum(1 for p in directory.iterdir() if p.suffix.lower() == ".jpg")
-    except FileNotFoundError:
-        return 0
-
-
 @app.get("/")
 async def root() -> dict:
     return {
-        "service": "zander-receiver",
+        "service": settings.service_name,
         "endpoints": {
-            "mirror_unlabeled": "POST /api/v1/mirror/unlabeled",
-            "mirror_labeled": "POST /api/v1/mirror/labeled",
+            "ingest": "POST /api/v1/ingest",
+            "webhook": "POST /api/v1/webhook/annotation-created",
             "status": "GET /api/v1/status",
             "health": "GET /api/v1/health",
         },
@@ -163,6 +102,12 @@ async def root() -> dict:
 
 
 if __name__ == "__main__":
-    LOG.info(f"Starting zander-receiver on {HOST}:{PORT}")
-    LOG.info(f"Data root: {DATA_ROOT}")
-    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="info")
+    LOG.info(f"Starting {settings.service_name} on {settings.host}:{settings.port}")
+    LOG.info(f"Data root: {settings.data_root}")
+    uvicorn.run(
+        "main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=False,
+        log_level=settings.log_level.lower(),
+    )

@@ -1,22 +1,24 @@
 """
-Label Studio integration for camerapi.
+Label Studio integration for the receiver (laptop).
+
+This is the SOLE owner of LS project creation + local-storage registration.
+(The dashboard only reads LS via its own thin read-only client.)
 
 Uses LS's **local files storage**: LS reads images directly from
-/home/pi/zander-data/unlabeled/ — no HTTP upload, no intermediate copies.
-This matches the approach used in _grave/labelstudio and requires LS to be
-started with:
+data_root/unlabeled/ — no HTTP upload, no intermediate copies. Requires LS to
+be started with:
     LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
-    LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/home/pi/zander-data
+    LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=<data_root>
 
 Responsibilities:
 - Connect to LS, auto-create or look up the project by name.
-- Register a Local Import Storage on the project pointing at
-  settings.unlabeled_dir (idempotent across restarts).
-- Create a task for each capture with data.image pointing at the file
-  and meta carrying the capture_id + SHA256 + camera info.
+- Register a Local Import Storage pointing at unlabeled_dir (idempotent).
+- Create a task per capture with data.image pointing at the file and meta
+  carrying capture_id + SHA256 + camera info + triggered_by.
 """
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -26,9 +28,8 @@ from label_studio_sdk import LabelStudio
 
 from config.settings import settings
 from models.schemas import CaptureMetadata
-from utils.logger import setup_logger
 
-logger = setup_logger(__name__, level=settings.log_level)
+logger = logging.getLogger("receiver.labelstudio")
 
 
 LABELING_CONFIG = """
@@ -55,7 +56,7 @@ LABELING_CONFIG = """
 
 
 class LabelStudioService:
-    """Project + tasks integration against a local LS instance."""
+    """Project + task integration against the laptop's LS instance."""
 
     def __init__(self) -> None:
         self.ls_url: str = settings.labelstudio_url
@@ -75,15 +76,11 @@ class LabelStudioService:
 
     # ---- Initialization ------------------------------------------------
 
-    def initialize(
-        self,
-        max_retries: int = 5,
-        retry_delay: float = 3.0,
-    ) -> None:
-        """Connect, resolve/create project, register local storage."""
+    def initialize(self, max_retries: int = 5, retry_delay: float = 3.0) -> None:
+        """Connect, resolve/create project, register local storage. Raises on failure."""
         if not self.api_key:
             raise RuntimeError(
-                "LABELSTUDIO_API_KEY not set — add it to .env on the Pi."
+                "LABELSTUDIO_API_KEY not set — add it to the receiver's .env."
             )
 
         last_error: Optional[Exception] = None
@@ -106,11 +103,25 @@ class LabelStudioService:
                 if attempt < max_retries:
                     delay = retry_delay * (1.5 ** (attempt - 1))
                     logger.warning(
-                        f"LS init failed: {str(e)[:120]}. "
-                        f"Retrying in {delay:.1f}s..."
+                        f"LS init failed: {str(e)[:120]}. Retrying in {delay:.1f}s..."
                     )
                     time.sleep(delay)
         raise RuntimeError(f"Label Studio initialization failed: {last_error}")
+
+    def ensure_initialized(self) -> bool:
+        """
+        Lazy init used by /ingest. Returns True once the project is ready, else
+        False (so the endpoint can return 503 and the Pi keeps retrying). Never
+        raises. Cheap once initialized — returns immediately.
+        """
+        if self.project is not None:
+            return True
+        try:
+            self.initialize(max_retries=1)
+            return self.project is not None
+        except Exception as e:
+            logger.warning(f"Label Studio still not ready: {str(e)[:120]}")
+            return False
 
     def _get_or_create_project(self) -> Any:
         """Find project by name; create with default labeling config if missing."""
@@ -127,34 +138,27 @@ class LabelStudioService:
         return self.client.projects.create(
             title=self.project_name,
             label_config=LABELING_CONFIG,
-            description="PCB joint defect classification (auto-created by camerapi)",
+            description="PCB joint defect classification (auto-created by the receiver)",
         )
 
     def _setup_local_storage(self) -> None:
         """
-        Register LS local import storage pointing at unlabeled_dir.
-
-        Idempotent: if LS already has a storage with the same path, reuse it.
-        Requires LS to have been started with:
-            LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
-            LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/home/pi/zander-data
+        Register LS local import storage pointing at unlabeled_dir. Idempotent:
+        reuse an existing storage for the same path if present.
         """
         assert self.client is not None
         storage_path = str(self.unlabeled_dir)
 
-        # Reuse existing storage if there is one for this path/project.
         try:
             existing = self.client.import_storage.local.list(project=self.project.id)
             for s in getattr(existing, "results", existing):
                 if getattr(s, "path", None) == storage_path:
                     self._storage_id = int(s.id)
                     logger.info(
-                        f"Local storage already registered (id={s.id}) "
-                        f"at {storage_path}"
+                        f"Local storage already registered (id={s.id}) at {storage_path}"
                     )
                     return
         except Exception as e:
-            # Non-fatal: we'll try to create it below.
             logger.debug(f"Could not list local storages: {e}")
 
         try:
@@ -163,12 +167,10 @@ class LabelStudioService:
                 path=storage_path,
                 use_blob_urls=False,
                 regex_filter=r".*\.(jpg|jpeg|png)$",
-                title="camerapi-unlabeled",
+                title="receiver-unlabeled",
             )
             self._storage_id = int(storage.id)
-            logger.info(
-                f"Local storage registered (id={storage.id}) at {storage_path}"
-            )
+            logger.info(f"Local storage registered (id={storage.id}) at {storage_path}")
         except Exception as e:
             logger.warning(
                 f"Could not register local storage at {storage_path}: {e}. "
@@ -184,10 +186,9 @@ class LabelStudioService:
         metadata: CaptureMetadata,
     ) -> dict[str, Any]:
         """
-        Create a task referencing an already-on-disk image.
-
-        No file is transferred to LS — LS serves the file directly from
-        LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT via /data/local-files/?d=...
+        Create a task referencing an already-on-disk image. No file is
+        transferred — LS serves it directly from the document root via
+        /data/local-files/?d=...
         """
         if not self.project:
             raise RuntimeError("Label Studio service not initialized")
@@ -198,6 +199,8 @@ class LabelStudioService:
             raise RuntimeError(
                 f"Image {image_path} is not inside data_root={self.data_root}"
             ) from e
+        # .as_posix() is the cross-platform pin: the ?d= URL stays POSIX even
+        # when the document root is a Windows path.
         image_url = f"/data/local-files/?d={relative.as_posix()}"
 
         task_meta = {
@@ -222,9 +225,7 @@ class LabelStudioService:
         )
         task = resp.json()
         task_id = int(task.get("id"))
-        logger.info(
-            f"LS task created: id={task_id} capture_id={metadata.capture_id}"
-        )
+        logger.info(f"LS task created: id={task_id} capture_id={metadata.capture_id}")
         return {
             "task_id": task_id,
             "project_id": self.project.id,
@@ -241,14 +242,13 @@ class LabelStudioService:
         *,
         params: Optional[dict[str, Any]] = None,
         json: Optional[dict[str, Any]] = None,
-        files: Optional[dict[str, Any]] = None,
         max_attempts: int = 5,
         backoff_base: float = 0.5,
     ) -> requests.Response:
         """
         HTTP to Label Studio with retries on transient failures (connection
-        errors, 5xx — including SQLite "database is locked" on Pi 3).
-        Does NOT retry on 4xx: those are our bugs.
+        errors, 5xx — including SQLite "database is locked"). Does NOT retry
+        on 4xx: those are our bugs.
         """
         url = f"{self.ls_url.rstrip('/')}{path}"
         headers = {"Authorization": f"Token {self.api_key}"}
@@ -262,7 +262,6 @@ class LabelStudioService:
                     headers=headers,
                     params=params,
                     json=json,
-                    files=files,
                     timeout=settings.labelstudio_timeout,
                 )
                 if resp.status_code < 500:
@@ -271,9 +270,6 @@ class LabelStudioService:
                 last_exc = requests.HTTPError(
                     f"{resp.status_code} {resp.reason}: {resp.text[:200]}"
                 )
-                if files is not None:
-                    # Multipart body cannot be safely replayed; surface failure.
-                    raise last_exc
             except requests.RequestException as e:
                 last_exc = e
 

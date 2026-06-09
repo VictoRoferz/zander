@@ -1,8 +1,9 @@
 """
 HTTP routes for camerapi.
 
-Orchestration pattern: capture → store → LS task → laptop mirror.
-Each step's result is reported independently (fault isolation).
+camerapi is a thin capture node: grab → write to the local spool → return.
+The background spool_uploader ships spooled captures to the laptop ingestion
+hub; their outcome shows up in the camerapi logs (look for "[<capture_id>]").
 
 Triggers:
   - Production: GPIO button → button_listener.py → POST /api/v1/capture
@@ -10,17 +11,14 @@ Triggers:
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 import requests
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from config.settings import settings
-from models.schemas import CaptureMetadata, CaptureResult, StepResult
+from models.schemas import CaptureResult, StepResult
 from services.camera_service import camera_service
-from services.labelstudio_service import labelstudio_service
-from services.mirror_service import mirror_service
 from services.storage_service import new_capture_id, storage_service
 from utils.logger import setup_logger
 
@@ -48,54 +46,17 @@ def _ask_dashboard_for_current_user() -> Optional[str]:
     return None
 
 
-def _create_ls_task_bg(
-    capture_id: str, image_path: Path, metadata: CaptureMetadata
-) -> None:
-    """
-    Background task: create the Label Studio task for a capture.
-    Failures are logged; never re-raised (response is already sent).
-    """
-    try:
-        result = labelstudio_service.create_task_from_image(image_path, metadata)
-        logger.info(
-            f"[bg][{capture_id}] LS task created: id={result['task_id']} "
-            f"project_id={result['project_id']}"
-        )
-    except Exception as e:
-        logger.error(
-            f"[bg][{capture_id}] LS task creation failed: "
-            f"{type(e).__name__}: {e}",
-            exc_info=True,
-        )
-
-
-def _mirror_unlabeled_bg(
-    capture_id: str, image_path: Path, metadata: CaptureMetadata
-) -> None:
-    """
-    Background task: push the capture to the laptop receiver.
-    Best-effort by design — failures are logged only.
-    """
-    ok, detail = mirror_service.mirror_unlabeled(image_path, metadata)
-    if ok:
-        logger.info(f"[bg][{capture_id}] laptop mirror ok: {detail}")
-    else:
-        logger.warning(f"[bg][{capture_id}] laptop mirror failed: {detail}")
-
-
-@router.post("/capture", response_model=CaptureResult)
+@router.post("/capture", response_model=CaptureResult, status_code=202)
 async def capture(
-    background: BackgroundTasks,
     x_triggered_by: Optional[str] = Header(default=None),
 ) -> CaptureResult:
     """
-    Capture one image, store it on disk, then return immediately.
+    Capture one image and write it to the local spool, then return 202.
 
-    The Label Studio task creation and the laptop mirror happen in
-    BackgroundTasks after the response is sent — they no longer block the
-    caller. Their outcomes show up in the camerapi logs (look for
-    "[bg][<capture_id>] ..."). The response always reports them as
-    "queued"; check /api/v1/status or the logs for actual results.
+    The background uploader ships the spooled capture to the laptop ingestion
+    hub and retries until it ACKs — so the response returns immediately and a
+    laptop outage never blocks (or loses) a capture. Watch the logs for
+    "[<capture_id>] ingested ok".
 
     Attribution lookup, in order:
       1. `X-Triggered-By` request header (the dashboard's "Capture" button
@@ -118,8 +79,9 @@ async def capture(
         logger.error(f"[{capture_id}] Camera capture failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"camera capture failed: {e}")
 
+    # ---- Step 2: spool (fatal on failure) ------------------------------
     try:
-        image_path, metadata = storage_service.save_unlabeled(
+        image_path, metadata = storage_service.save_to_spool(
             frame=frame,
             capture_id=capture_id,
             source=source_info.get("source", "unknown"),
@@ -128,45 +90,35 @@ async def capture(
             triggered_by=triggered_by,
         )
     except Exception as e:
-        logger.error(f"[{capture_id}] Saving image failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"save failed: {e}")
-
-    camera_step = StepResult(
-        ok=True,
-        detail=f"saved {image_path.name} ({metadata.size_bytes // 1024} KB)",
-    )
-
-    # ---- Steps 2 & 3: fire-and-forget after the response is sent -------
-    background.add_task(_create_ls_task_bg, capture_id, image_path, metadata)
-    background.add_task(_mirror_unlabeled_bg, capture_id, image_path, metadata)
+        logger.error(f"[{capture_id}] Spooling image failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"spool failed: {e}")
 
     return CaptureResult(
         capture_id=capture_id,
-        camera=camera_step,
-        label_studio=StepResult(ok=True, detail="queued in background"),
-        laptop_mirror=StepResult(ok=True, detail="queued in background"),
+        camera=StepResult(
+            ok=True,
+            detail=f"spooled {image_path.name} ({metadata.size_bytes // 1024} KB)",
+        ),
+        spooled=True,
         metadata=metadata,
     )
 
 
 @router.get("/status")
 async def get_status() -> dict:
-    """Service status — camera, LS, laptop mirror reachability."""
-    camera_status = camera_service.get_status()
-    ls_ok = labelstudio_service.is_healthy()
-
+    """Service status — camera, spool depth, and the ingest target."""
     return {
         "service": settings.service_name,
         "version": settings.service_version,
-        "camera": camera_status,
-        "label_studio": {"url": settings.labelstudio_url, "healthy": ls_ok},
-        "laptop_mirror": {
-            "enabled": settings.laptop_mirror_enabled,
-            "url": settings.laptop_mirror_url,
+        "camera": camera_service.get_status(),
+        "ingest": {
+            "url": settings.ingest_url,
+            "endpoint": settings.ingest_endpoint,
         },
-        "storage": {
-            "unlabeled_dir": str(settings.unlabeled_dir),
-            "labeled_dir": str(settings.labeled_dir),
+        "spool": {
+            "dir": str(settings.spool_dir),
+            "pending": storage_service.pending_count(),
+            "failed": storage_service.failed_count(),
         },
     }
 
@@ -180,28 +132,26 @@ async def health() -> dict:
 @router.post("/test-camera")
 async def test_camera() -> dict:
     """
-    Capture + store on the Pi, but do NOT send to LS or laptop.
-    Use to verify the camera end-to-end without touching downstream.
+    Capture + save into a throwaway `test/` dir on the Pi — NOT the spool, so
+    it is never uploaded. Use to verify the camera end-to-end without touching
+    downstream.
     """
     capture_id = new_capture_id()
     logger.info(f"Camera test: capture_id={capture_id}")
     try:
         frame, source_info = camera_service.capture_frame()
-        image_path, metadata = storage_service.save_unlabeled(
-            frame=frame,
-            capture_id=capture_id,
-            source=source_info.get("source", "unknown"),
-            camera_serial=source_info.get("camera_serial"),
-            camera_model=source_info.get("camera_model"),
+        image_path, size_bytes, width, height = storage_service.save_test(
+            frame, capture_id
         )
         return {
             "status": "ok",
             "capture_id": capture_id,
             "image_path": str(image_path),
-            "size_kb": round(metadata.size_bytes / 1024, 1),
-            "width": metadata.width,
-            "height": metadata.height,
-            "note": "Stored locally on Pi only — LS and laptop mirror skipped.",
+            "size_kb": round(size_bytes / 1024, 1),
+            "width": width,
+            "height": height,
+            "source": source_info.get("source", "unknown"),
+            "note": "Saved to test/ only — not spooled, not uploaded.",
         }
     except Exception as e:
         logger.error(f"Camera test failed: {e}", exc_info=True)

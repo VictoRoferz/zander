@@ -5,3 +5,5 @@ jinja2
 itsdangerous
 bcrypt
 httpx
+requests
+python-dotenv

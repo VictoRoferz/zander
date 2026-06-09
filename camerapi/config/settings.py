@@ -1,6 +1,11 @@
 """
 Configuration management for camerapi (Raspberry Pi 3).
 
+camerapi is now a thin capture node: it grabs a frame, writes it to a local
+spool, and a background uploader ships it to the laptop ingestion hub
+(receiver, /api/v1/ingest). Label Studio and all downstream storage live on
+the laptop now — camerapi no longer talks to Label Studio at all.
+
 All values can be overridden via environment variables (see .env).
 Settings are validated at startup via Pydantic.
 """
@@ -12,7 +17,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "camera-service"
-    service_version: str = "2.0.0"
+    service_version: str = "3.0.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"
@@ -29,42 +34,31 @@ class Settings(BaseSettings):
     # Override to "ethernet" or "wifi" to force a profile (debugging / odd networks).
     camera_transport: str = "auto"
 
-    # ---- Persistent storage (Pi side) ----
-    # Images land here on the Pi and never get auto-deleted.
+    # ---- Local spool (Pi side) ----
+    # Captures land here first; the background uploader ships them to the
+    # laptop and deletes each entry only once the laptop ACKs it. So a brief
+    # laptop outage never loses a capture. Default suits the Pi; override
+    # DATA_ROOT for dev on a laptop.
     data_root: Path = Path("/home/pi/zander-data")
 
-    # ---- Label Studio ----
-    labelstudio_url: str = "http://localhost:8081"
-    labelstudio_api_key: str = ""  # MUST be set via .env
-    labelstudio_project_name: str = "PCB Defect Inspection"
-    labelstudio_enable_webhooks: bool = True
-    # Upload timeouts for the LS SDK (seconds)
-    labelstudio_timeout: int = 30
-
-    # ---- Laptop mirror (fixed-IP "Option 1") ----
-    # If enabled, each capture is also sent to the laptop receiver(s).
-    # Failure to reach a receiver does NOT fail the capture flow.
-    # Multiple receivers: comma-separate the base URLs. Each capture is
-    # fanned out to all of them (live fan-out — an offline receiver simply
-    # misses that capture; there is no backfill).
-    laptop_mirror_enabled: bool = True
-    laptop_mirror_url: str = "http://192.168.0.199:8002"
-    laptop_mirror_timeout: int = 10  # seconds per HTTP call
-    laptop_mirror_retries: int = 3
+    # ---- Laptop ingestion hub (receiver) ----
+    # Single upload target now (was a comma-separated mirror fan-out). Each
+    # capture is POSTed to {ingest_url}/api/v1/ingest with retry until ACK.
+    ingest_url: str = "http://192.168.0.199:8002"
+    upload_timeout: int = 30           # seconds per HTTP attempt
+    upload_poll_interval: float = 2.0  # seconds between spool scans
+    upload_max_backoff: float = 60.0   # cap for per-entry exponential backoff
 
     # ---- Dashboard (for GPIO-button user attribution) ----
-    # When the GPIO button fires, camerapi asks the dashboard who's logged
-    # in via GET {dashboard_url}/api/current-user. Best-effort — failure
-    # never blocks the capture (triggered_by just becomes null).
+    # When the GPIO button fires there is no X-Triggered-By header, so camerapi
+    # asks the dashboard who is logged in via GET {dashboard_url}/api/current-user.
+    # Best-effort — failure never blocks the capture (triggered_by becomes null).
     dashboard_url: str = "http://192.168.0.199:8003"
-    dashboard_timeout: float = 1.5  # seconds; keep tight so button stays snappy
+    dashboard_timeout: float = 1.5  # seconds; keep tight so the button stays snappy
 
     # ---- Logging ----
     log_level: str = "INFO"
     log_file: Optional[str] = None
-
-    # ---- Health check ----
-    health_check_enabled: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -75,42 +69,26 @@ class Settings(BaseSettings):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Ensure persistent folders exist on startup. Cheap and idempotent.
-        self.unlabeled_dir.mkdir(parents=True, exist_ok=True)
-        self.labeled_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure the spool folders exist on startup. Cheap and idempotent.
+        self.spool_dir.mkdir(parents=True, exist_ok=True)
+        self.spool_failed_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Derived paths ----
 
     @property
-    def unlabeled_dir(self) -> Path:
-        return self.data_root / "unlabeled"
+    def spool_dir(self) -> Path:
+        return self.data_root / "spool"
 
     @property
-    def labeled_dir(self) -> Path:
-        return self.data_root / "labeled"
+    def spool_failed_dir(self) -> Path:
+        """Poison entries (rejected by the laptop with a 4xx) are parked here."""
+        return self.spool_dir / "failed"
 
     # ---- Derived URLs ----
 
     @property
-    def laptop_mirror_base_urls(self) -> list[str]:
-        """Parse laptop_mirror_url into a clean list of base URLs.
-
-        Accepts a single URL or a comma-separated list. Whitespace and any
-        trailing slash are stripped; empty entries are dropped.
-        """
-        return [
-            part.strip().rstrip("/")
-            for part in self.laptop_mirror_url.split(",")
-            if part.strip()
-        ]
-
-    @property
-    def laptop_unlabeled_urls(self) -> list[str]:
-        return [f"{base}/api/v1/mirror/unlabeled" for base in self.laptop_mirror_base_urls]
-
-    @property
-    def laptop_labeled_urls(self) -> list[str]:
-        return [f"{base}/api/v1/mirror/labeled" for base in self.laptop_mirror_base_urls]
+    def ingest_endpoint(self) -> str:
+        return f"{self.ingest_url.rstrip('/')}/api/v1/ingest"
 
 
 # Global settings instance — imported everywhere else.

@@ -7,7 +7,12 @@ Standalone read-only UI for the camera pipeline:
   - "Capture" button (proxies to camerapi with X-Triggered-By)
   - "Open Label Studio" button (link)
 
-Cross-platform paths via pathlib. Reads ~/zander-data/ (override with DATA_ROOT).
+The "labeled" view is read LIVE from the Label Studio REST API (LS is the
+single source of truth), so the dashboard always matches LS. "unlabeled" =
+images on disk that LS does not yet report as labeled. Thumbnails are served
+from the local image folder (the same files LS serves via local-files).
+
+Cross-platform paths via pathlib. Reads ~/zander-data/ (override DATA_ROOT).
 Polls every 3s; no SSE in v1.
 """
 from __future__ import annotations
@@ -15,12 +20,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import (
     Cookie,
     Depends,
@@ -41,8 +48,14 @@ from fastapi.templating import Jinja2Templates
 
 import auth
 import db
+from ls_client import LabelStudioUnavailable, LsClient
 
 # ---- Setup ----------------------------------------------------------------
+
+# Load this service's .env so it can be configured like the others. Existing
+# environment variables (e.g. those injected by scripts/launch.py) take
+# precedence over the file.
+load_dotenv()
 
 LOG = logging.getLogger("dashboard")
 logging.basicConfig(
@@ -64,8 +77,20 @@ LABELED_DIR = DATA_ROOT / "labeled"
 UNLABELED_DIR.mkdir(parents=True, exist_ok=True)
 LABELED_DIR.mkdir(parents=True, exist_ok=True)
 
-LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://192.168.0.115:8081")
+LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://localhost:8081")
 CAMERAPI_URL = os.environ.get("CAMERAPI_URL", "http://192.168.0.115:8001")
+
+# Label Studio API access (read-only) for the live labeled view.
+LABELSTUDIO_API_KEY = os.environ.get("LABELSTUDIO_API_KEY", "")
+LABELSTUDIO_PROJECT_NAME = os.environ.get("LABELSTUDIO_PROJECT_NAME", "PCB Defect Inspection")
+LABELSTUDIO_PROJECT_ID = os.environ.get("LABELSTUDIO_PROJECT_ID")  # optional override
+
+ls_client = LsClient(
+    base_url=LABELSTUDIO_URL,
+    api_key=LABELSTUDIO_API_KEY,
+    project_name=LABELSTUDIO_PROJECT_NAME,
+    project_id=int(LABELSTUDIO_PROJECT_ID) if LABELSTUDIO_PROJECT_ID else None,
+)
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8003"))
@@ -73,12 +98,22 @@ PORT = int(os.environ.get("PORT", "8003"))
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
+# Collapse the 3 near-simultaneous poll endpoints (stats/unlabeled/labeled)
+# into a single LS pass per ~2s window.
+_LABELED_TTL = 2.0
+_labeled_cache: dict[str, Any] = {"ts": -1e9, "items": [], "ids": set(), "ok": False}
+
 
 # ---- App ------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.initialize()
+    if not LABELSTUDIO_API_KEY:
+        LOG.warning(
+            "LABELSTUDIO_API_KEY not set — the labeled view will stay empty. "
+            "Add it to the dashboard .env."
+        )
     LOG.info(
         f"dashboard ready: data_root={DATA_ROOT} ls={LABELSTUDIO_URL} "
         f"camerapi={CAMERAPI_URL}"
@@ -86,7 +121,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="zander-dashboard", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="zander-dashboard", version="2.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -94,9 +129,7 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: Optional[str] = None) -> Any:
-    return TEMPLATES.TemplateResponse(
-        request, "login.html", {"error": error}
-    )
+    return TEMPLATES.TemplateResponse(request, "login.html", {"error": error})
 
 
 @app.post("/login")
@@ -129,9 +162,7 @@ async def login_submit(
 
 
 @app.post("/logout")
-async def logout(
-    dashboard_session: Optional[str] = Cookie(default=None),
-) -> Any:
+async def logout(dashboard_session: Optional[str] = Cookie(default=None)) -> Any:
     if dashboard_session:
         auth.logout(dashboard_session)
     redirect = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
@@ -152,10 +183,7 @@ async def home(
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
-        {
-            "user_email": email,
-            "labelstudio_url": LABELSTUDIO_URL,
-        },
+        {"user_email": email, "labelstudio_url": LABELSTUDIO_URL},
     )
 
 
@@ -163,19 +191,21 @@ async def home(
 
 @app.get("/api/stats")
 async def stats(_: str = Depends(auth.current_user_email)) -> dict:
-    u = _count_jpgs(UNLABELED_DIR)
-    l = _count_jpgs(LABELED_DIR)
-    return {"unlabeled": u, "labeled": l, "total": u + l}
+    cache = _get_labeled_cached()
+    labeled = len(cache["items"])
+    unlabeled = len(_unlabeled_from_folder(cache["ids"]))
+    return {"unlabeled": unlabeled, "labeled": labeled, "total": labeled + unlabeled}
 
 
 @app.get("/api/unlabeled")
 async def api_unlabeled(_: str = Depends(auth.current_user_email)) -> list[dict]:
-    return _list_captures(UNLABELED_DIR, kind="unlabeled")
+    cache = _get_labeled_cached()
+    return _unlabeled_from_folder(cache["ids"])
 
 
 @app.get("/api/labeled")
 async def api_labeled(_: str = Depends(auth.current_user_email)) -> list[dict]:
-    return _list_captures(LABELED_DIR, kind="labeled")
+    return _get_labeled_cached()["items"]
 
 
 @app.get("/thumb/{kind}/{filename}")
@@ -184,22 +214,24 @@ async def thumb(
     filename: str,
     _: str = Depends(auth.current_user_email),
 ) -> FileResponse:
-    if kind == "unlabeled":
-        directory = UNLABELED_DIR
-    elif kind == "labeled":
-        directory = LABELED_DIR
-    else:
-        raise HTTPException(status_code=404)
     # Reject anything that would escape the directory or isn't a .jpg.
     if "/" in filename or "\\" in filename or not filename.endswith(".jpg"):
         raise HTTPException(status_code=400)
-    path = directory / filename
-    if not path.exists():
+    if kind == "labeled":
+        # The labeled export may lag the LS annotation; the unlabeled copy is
+        # the same physical file, so fall back to it.
+        candidates = [LABELED_DIR / filename, UNLABELED_DIR / filename]
+    elif kind == "unlabeled":
+        candidates = [UNLABELED_DIR / filename]
+    else:
         raise HTTPException(status_code=404)
-    return FileResponse(path, media_type="image/jpeg")
+    for path in candidates:
+        if path.exists():
+            return FileResponse(path, media_type="image/jpeg")
+    raise HTTPException(status_code=404)
 
 
-# ---- Identity endpoint (used by camerapi in Phase C) --------------------
+# ---- Identity endpoint (used by camerapi for GPIO-button attribution) ----
 
 @app.get("/api/current-user")
 async def current_user_endpoint() -> dict:
@@ -227,78 +259,139 @@ async def capture_proxy(email: str = Depends(auth.current_user_email)) -> Any:
         LOG.warning(f"capture proxy: connection error {e}")
         raise HTTPException(status_code=502, detail=f"camerapi unreachable: {e}")
     if resp.status_code >= 400:
-        return JSONResponse(
-            status_code=resp.status_code,
-            content=_safe_json(resp),
-        )
-    return JSONResponse(content=resp.json())
+        return JSONResponse(status_code=resp.status_code, content=_safe_json(resp))
+    return JSONResponse(content=_safe_json(resp))
 
 
-# ---- Helpers --------------------------------------------------------------
+# ---- Label Studio → dashboard data ---------------------------------------
 
-def _count_jpgs(directory: Path) -> int:
+def _get_labeled_cached() -> dict:
+    """
+    Build (and briefly cache) the labeled list + the set of labeled capture_ids
+    from Label Studio. On LS failure, degrade gracefully: empty labeled list and
+    empty labeled set (so everything on disk shows as unlabeled).
+    """
+    now = time.monotonic()
+    if now - _labeled_cache["ts"] < _LABELED_TTL:
+        return _labeled_cache
     try:
-        return sum(1 for p in directory.iterdir() if p.suffix.lower() == ".jpg")
-    except FileNotFoundError:
-        return 0
+        items, ids = _labeled_from_ls()
+        _labeled_cache.update(ts=now, items=items, ids=ids, ok=True)
+    except LabelStudioUnavailable as e:
+        LOG.warning(f"Label Studio unavailable: {e}")
+        _labeled_cache.update(ts=now, items=[], ids=set(), ok=False)
+    except Exception as e:
+        LOG.error(f"labeled-from-LS failed: {e}", exc_info=True)
+        _labeled_cache.update(ts=now, items=[], ids=set(), ok=False)
+    return _labeled_cache
 
 
-def _list_captures(directory: Path, kind: str) -> list[dict]:
-    """
-    Build a sortable list of captures by reading the JSON sidecars.
-    Newest first. Tolerates files without sidecars.
-    """
+def _labeled_from_ls() -> tuple[list[dict], set[str]]:
+    pid = ls_client.project_id()
+    tasks = ls_client.list_tasks(pid)
+    items: list[dict] = []
+    labeled_ids: set[str] = set()
+
+    for t in tasks:
+        capture_id = _task_capture_id(t)
+        if not capture_id:
+            continue
+        total = t.get("total_annotations") or 0
+        is_labeled = bool(t.get("is_labeled")) or total > 0 or bool(t.get("annotations"))
+        if not is_labeled:
+            continue
+        labeled_ids.add(capture_id)
+
+        full = ls_client.get_task(t["id"], t.get("updated_at"))
+        ann = _first_annotation(full)
+        meta = full.get("meta") or t.get("meta") or {}
+        items.append(
+            {
+                "capture_id": capture_id,
+                "captured_at": meta.get("captured_at"),
+                "triggered_by": meta.get("triggered_by"),
+                "completed_by": _completed_by_email(ann) if ann else None,
+                "overall_quality": _extract_overall_quality(
+                    ann.get("result") if ann else []
+                ),
+            }
+        )
+
+    items.sort(key=lambda i: i.get("captured_at") or "", reverse=True)
+    return items, labeled_ids
+
+
+def _unlabeled_from_folder(labeled_ids: set[str]) -> list[dict]:
+    """Unlabeled = images on disk whose capture_id LS does not report labeled."""
     items: list[dict] = []
     try:
-        entries = list(directory.iterdir())
+        entries = list(UNLABELED_DIR.glob("*.jpg"))
     except FileNotFoundError:
         return []
-
     for jpg in entries:
-        if jpg.suffix.lower() != ".jpg":
-            continue
         capture_id = jpg.stem
-        json_path = directory / f"{capture_id}.json"
-        item: dict = {
-            "capture_id": capture_id,
-            "captured_at": None,
-            "triggered_by": None,
-        }
-        if json_path.exists():
-            try:
-                payload = json.loads(json_path.read_text("utf-8"))
-                if kind == "unlabeled":
-                    item["captured_at"] = payload.get("captured_at")
-                    item["triggered_by"] = payload.get("triggered_by")
-                else:  # labeled
-                    cap = payload.get("capture_metadata") or {}
-                    item["captured_at"] = cap.get("captured_at")
-                    item["triggered_by"] = cap.get("triggered_by")
-                    annotation = payload.get("annotation") or {}
-                    completed = annotation.get("completed_by") or {}
-                    item["completed_by"] = (
-                        completed.get("email") if isinstance(completed, dict) else None
-                    )
-                    item["overall_quality"] = _extract_overall_quality(
-                        annotation.get("result") or []
-                    )
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                LOG.warning(f"bad sidecar {json_path}: {e}")
-        items.append(item)
-
+        if capture_id in labeled_ids:
+            continue
+        meta = _read_sidecar(UNLABELED_DIR / f"{capture_id}.json")
+        items.append(
+            {
+                "capture_id": capture_id,
+                "captured_at": meta.get("captured_at"),
+                "triggered_by": meta.get("triggered_by"),
+            }
+        )
     items.sort(key=lambda i: i.get("captured_at") or "", reverse=True)
     return items
 
 
-def _extract_overall_quality(results: list[dict]) -> Optional[str]:
-    """Pull the Pass/Fail/Needs-Review choice out of a Label Studio annotation."""
-    for r in results:
+# ---- Helpers --------------------------------------------------------------
+
+def _task_capture_id(task: dict) -> Optional[str]:
+    """capture_id from task.meta, else parsed from the local-files image URL."""
+    meta = task.get("meta") or {}
+    cap = meta.get("capture_id")
+    if isinstance(cap, str) and cap:
+        return cap
+    image_url = (task.get("data") or {}).get("image")
+    if isinstance(image_url, str) and image_url:
+        tail = image_url.rsplit("/", 1)[-1]      # ...unlabeled/<id>.jpg
+        stem = tail.split("?", 1)[0]
+        if stem.lower().endswith(".jpg"):
+            return stem[:-4]
+    return None
+
+
+def _first_annotation(full_task: dict) -> Optional[dict]:
+    anns = full_task.get("annotations") or []
+    for a in anns:
+        if isinstance(a, dict) and not a.get("was_cancelled"):
+            return a
+    return anns[0] if anns and isinstance(anns[0], dict) else None
+
+
+def _completed_by_email(ann: dict) -> Optional[str]:
+    cb = ann.get("completed_by")
+    if isinstance(cb, dict):
+        return cb.get("email")
+    return ls_client.user_email(cb)
+
+
+def _extract_overall_quality(results: Any) -> Optional[str]:
+    """Pull the iO/NiO/Weitere-Überprüfung choice out of an LS annotation."""
+    for r in results or []:
         if r.get("from_name") == "overall_quality":
             value = r.get("value") or {}
             choices = value.get("choices") or []
             if choices:
                 return choices[0]
     return None
+
+
+def _read_sidecar(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
 
 
 def _safe_json(resp: httpx.Response) -> Any:

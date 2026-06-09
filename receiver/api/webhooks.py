@@ -1,14 +1,17 @@
 """
-Label Studio webhook handler.
+Label Studio webhook handler (runs on the laptop, next to LS).
 
 Configured in the LS UI under Project → Webhooks:
-    URL:     http://localhost:8001/api/v1/webhook/annotation-created
+    URL:     http://localhost:8002/api/v1/webhook/annotation-created
     Events:  Annotation created, Annotation updated
 
-LS's webhook timeout defaults to 1.0 second — too tight for Pi 3 file I/O
-plus a laptop-mirror HTTP call. We return 200 OK immediately and run the
-heavy work in a FastAPI background task so the response is fast regardless
-of how slow disk + network are.
+Role: this is the durable **labeled-dataset export** sink. It copies the
+labeled image + annotation into data_root/labeled/ for downstream CV training.
+The dashboard does NOT depend on this — it reads label state live from the LS
+API — so a missed webhook only delays the export, never the dashboard view.
+
+We ack in <100 ms and do the file work in a FastAPI background task (LS's
+webhook timeout defaults to ~1s).
 """
 from __future__ import annotations
 
@@ -16,13 +19,12 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
-from config.settings import settings
-from models.schemas import CaptureMetadata
-from services.mirror_service import mirror_service
-from services.storage_service import storage_service
-from utils.logger import setup_logger
+import logging
 
-logger = setup_logger(__name__, level=settings.log_level)
+from models.schemas import CaptureMetadata
+from services.storage_service import storage_service
+
+logger = logging.getLogger("receiver.webhook")
 
 router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
 
@@ -40,7 +42,7 @@ def _dig(obj: Any, *keys: str) -> Any:
 def _extract_capture_id(payload: dict[str, Any]) -> Optional[str]:
     """
     Find capture_id in the webhook payload. Two known locations:
-      - payload["task"]["meta"]["capture_id"] (what we set at upload time)
+      - payload["task"]["meta"]["capture_id"] (what we set at task creation)
       - payload["task"]["data"]["image"] filename (parse from local-files URL)
     """
     cap = _dig(payload, "task", "meta", "capture_id")
@@ -58,9 +60,7 @@ def _extract_capture_id(payload: dict[str, Any]) -> Optional[str]:
 
 
 def _process_annotation(capture_id: str, annotation: dict[str, Any]) -> None:
-    """
-    Heavy work, runs in a background task after the webhook responds.
-    """
+    """Heavy work, runs in a background task after the webhook responds."""
     try:
         unlabeled_path = storage_service.unlabeled_image_path(capture_id)
         if not unlabeled_path.exists():
@@ -73,39 +73,23 @@ def _process_annotation(capture_id: str, annotation: dict[str, Any]) -> None:
         original_metadata: CaptureMetadata | None = (
             storage_service.load_unlabeled_metadata(capture_id)
         )
-        image_path, annotation_path = storage_service.save_labeled(
+        storage_service.save_labeled(
             capture_id=capture_id,
             image_bytes=image_bytes,
             annotation=annotation,
             capture_metadata=original_metadata,
         )
-        logger.info(f"[bg] Saved labeled capture {capture_id}")
-
-        mirror_ok, mirror_detail = mirror_service.mirror_labeled(
-            image_path=image_path,
-            annotation_path=annotation_path,
-            capture_id=capture_id,
-        )
-        if not mirror_ok:
-            logger.warning(
-                f"[bg] Labeled mirror failed for {capture_id}: {mirror_detail} "
-                "(Pi copy is still saved)"
-            )
+        logger.info(f"[bg] Saved labeled export {capture_id}")
     except Exception as e:
         logger.error(
-            f"[bg] Unhandled error processing labeled {capture_id}: {e}",
+            f"[bg] Unhandled error exporting labeled {capture_id}: {e}",
             exc_info=True,
         )
 
 
 @router.post("/annotation-created")
-async def annotation_created(
-    request: Request, background: BackgroundTasks
-) -> dict:
-    """
-    Acknowledge the webhook in <100 ms and queue the file work as a
-    background task. LS's 1-second webhook timeout no longer matters.
-    """
+async def annotation_created(request: Request, background: BackgroundTasks) -> dict:
+    """Acknowledge fast and queue the labeled-export work as a background task."""
     try:
         payload = await request.json()
     except Exception as e:
@@ -116,18 +100,14 @@ async def annotation_created(
     task_id = _dig(payload, "task", "id")
     annotation_id = _dig(payload, "annotation", "id")
     logger.info(
-        f"Webhook received: action={action} task={task_id} "
-        f"annotation={annotation_id}"
+        f"Webhook received: action={action} task={task_id} annotation={annotation_id}"
     )
 
     capture_id = _extract_capture_id(payload)
     if not capture_id:
         logger.warning(
-            f"Webhook task {task_id} has no capture_id (meta or filename). "
-            f"task.meta = {_dig(payload, 'task', 'meta')!r} "
-            f"task.data = {_dig(payload, 'task', 'data')!r}"
+            f"Webhook task {task_id} has no capture_id (meta or filename); ignoring"
         )
-        # Tell LS we got it; we just can't do anything useful with it.
         return {"status": "ignored", "reason": "no capture_id"}
 
     annotation_dict = payload.get("annotation") or {}

@@ -1,3 +1,15 @@
+# receiver (laptop ingestion hub) Dependencies
+
+# Web framework
 fastapi
 uvicorn[standard]
 python-multipart
+
+# HTTP client (Label Studio REST) + Label Studio SDK (project/storage setup)
+requests
+label-studio-sdk
+
+# Configuration management
+pydantic
+pydantic-settings
+python-dotenv

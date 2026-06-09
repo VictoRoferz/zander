@@ -30,7 +30,10 @@ def main():
                     print("[Button Listener] ➡ Button GEDRÜCKT – sende POST...")
 
                     try:
-                        resp = requests.post(CAPTURE_ENDPOINT, timeout=5)
+                        # /capture blocks until the camera grab + save finish.
+                        # A cold Basler init + GrabOne can take well over 5s
+                        # (GrabOne alone allows 30s), so keep this generous.
+                        resp = requests.post(CAPTURE_ENDPOINT, timeout=40)
                         print(f"[Button Listener] Antwort: "
                               f"{resp.status_code} | {resp.text}")
                     except Exception as e:

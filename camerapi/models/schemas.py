@@ -1,15 +1,17 @@
 """
 Typed payload models for camerapi.
 
-Used for:
-- Returning per-step capture results from /capture (fault-isolated)
-- Parsing incoming Label Studio webhook payloads
-- Passing structured metadata between services
+camerapi only captures and spools now, so these models cover:
+- Metadata that travels with every captured image (and into the spool sidecar).
+- The per-step result returned by POST /api/v1/capture.
+
+The Label Studio webhook models moved to the receiver along with the webhook
+handler itself.
 """
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel
 
 
 # ----- Capture metadata ---------------------------------------------------
@@ -41,67 +43,11 @@ class StepResult(BaseModel):
 
 
 class CaptureResult(BaseModel):
-    """
-    Response body for POST /api/v1/capture.
-
-    Each step is reported independently so callers can see partial success.
-    """
+    """Response body for POST /api/v1/capture."""
 
     capture_id: str
     camera: StepResult
-    label_studio: StepResult
-    laptop_mirror: StepResult
+    # True once the capture is written to the spool; the background uploader
+    # ships it to the laptop afterwards (watch the logs for the outcome).
+    spooled: bool = False
     metadata: Optional[CaptureMetadata] = None
-
-
-# ----- Label Studio webhook payload ---------------------------------------
-
-class WebhookUser(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    id: Optional[int] = None
-    email: Optional[str] = None
-
-
-class WebhookAnnotation(BaseModel):
-    """Partial shape of the `annotation` block from Label Studio."""
-
-    model_config = ConfigDict(extra="allow")
-
-    id: int
-    task: int
-    result: list[dict[str, Any]] = Field(default_factory=list)
-    completed_by: Optional[WebhookUser] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class WebhookTask(BaseModel):
-    """Partial shape of the `task` block from Label Studio."""
-
-    model_config = ConfigDict(extra="allow")
-
-    id: int
-    data: dict[str, Any] = Field(default_factory=dict)
-    # `meta` is what we set via create_task_from_image — has capture_id + sha256
-    meta: dict[str, Any] = Field(default_factory=dict)
-
-
-class WebhookProject(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    id: int
-    title: Optional[str] = None
-
-
-class AnnotationWebhookPayload(BaseModel):
-    """
-    Payload Label Studio sends to POST /api/v1/webhook/annotation-created.
-
-    Unknown fields are tolerated (LS evolves). We only require what we use.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    action: str  # e.g. "ANNOTATION_CREATED" / "ANNOTATION_UPDATED"
-    annotation: WebhookAnnotation
-    task: WebhookTask
-    project: Optional[WebhookProject] = None

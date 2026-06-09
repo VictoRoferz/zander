@@ -59,10 +59,13 @@ function renderTile(item, kind) {
       ));
     }
     if (item.overall_quality) {
-      const q = item.overall_quality.toLowerCase();
+      // Label Studio "overall_quality" choices are German: iO / NiO /
+      // Weitere Überprüfung notwendig. Map to the pass/fail/review badges;
+      // show the raw German text.
+      const q = item.overall_quality.trim().toLowerCase();
       const cls =
-        q === "pass" ? "badge badge-pass" :
-        q === "fail" ? "badge badge-fail" :
+        q === "io" ? "badge badge-pass" :
+        q === "nio" ? "badge badge-fail" :
         "badge badge-review";
       meta.appendChild(el("div", { class: "row" },
         el("span", { class: "muted" }, "quality"),
