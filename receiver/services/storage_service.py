@@ -38,6 +38,10 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp creates the file 0600 (owner-only). In Docker the receiver
+        # writes as root but Label Studio reads as a different (non-root) user,
+        # so it must be world-readable or LS fails with "error opening file".
+        os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, target)
     except Exception:
         try:
