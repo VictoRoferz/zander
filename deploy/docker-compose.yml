@@ -1,0 +1,78 @@
+# Laptop hub — Label Studio + receiver + dashboard.
+# Start:  docker compose up -d      (run from this deploy/ folder)
+# Config: edit ./.env (copy from .env.example) — that's the only file to touch.
+#
+# All three services share ONE folder so Label Studio can serve images off disk:
+#   host ${DATA_DIR}  ->  /data  in every container
+#   LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT == DATA_ROOT == /data
+name: zander
+
+services:
+  labelstudio:
+    image: heartexlabs/label-studio:${LS_IMAGE_TAG:-latest}
+    container_name: zander-labelstudio
+    ports:
+      - "8081:8080"            # browser -> http://localhost:8081 ; in-container port 8080
+    environment:
+      LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED: "true"
+      LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT: /data
+      # Enable the legacy "Authorization: Token <key>" scheme headlessly so our
+      # services can authenticate (you still copy the token from the UI once).
+      LABEL_STUDIO_ENABLE_LEGACY_API_TOKEN: "true"
+      # Pre-create the admin on first boot (ignored once the DB exists).
+      LABEL_STUDIO_USERNAME: ${LABEL_STUDIO_USERNAME:-labelling@zander-aachen.de}
+      LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-change-me}
+    volumes:
+      - ls_internal:/label-studio/data       # projects, annotations, LS's own DB
+      - ${DATA_DIR:-./data}:/data            # shared images (unlabeled/ + labeled/)
+    restart: unless-stopped
+
+  receiver:
+    build: ../receiver
+    container_name: zander-receiver
+    ports:
+      - "8002:8002"
+    environment:
+      DATA_ROOT: /data
+      LABELSTUDIO_URL: http://labelstudio:8080      # in-network API endpoint
+      LABELSTUDIO_API_KEY: ${LABELSTUDIO_API_KEY:-}
+      LABELSTUDIO_PROJECT_NAME: ${LABELSTUDIO_PROJECT_NAME:-PCB Defect Inspection}
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    depends_on:
+      - labelstudio
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  dashboard:
+    build: ../dashboard
+    container_name: zander-dashboard
+    ports:
+      - "8003:8003"
+    environment:
+      DATA_ROOT: /data
+      LABELSTUDIO_URL: http://labelstudio:8080                       # API (server->server)
+      LABELSTUDIO_PUBLIC_URL: http://${LAPTOP_HOST:-localhost}:8081  # "Open Label Studio" link (browser)
+      LABELSTUDIO_API_KEY: ${LABELSTUDIO_API_KEY:-}
+      LABELSTUDIO_PROJECT_NAME: ${LABELSTUDIO_PROJECT_NAME:-PCB Defect Inspection}
+      CAMERAPI_URL: http://${PI_IP:-127.0.0.1}:8001                  # Pi (dashboard "Capture" button)
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    depends_on:
+      - labelstudio
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  ls_internal:
+    name: zander_ls_internal

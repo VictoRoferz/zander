@@ -78,6 +78,11 @@ UNLABELED_DIR.mkdir(parents=True, exist_ok=True)
 LABELED_DIR.mkdir(parents=True, exist_ok=True)
 
 LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://localhost:8081")
+# Browser-facing LS URL for the "Open Label Studio" link. Differs from
+# LABELSTUDIO_URL under Docker, where the API is reached at the internal
+# service name (http://labelstudio:8080) but the link must be host-reachable
+# (http://localhost:8081). Defaults to LABELSTUDIO_URL for the native setup.
+LABELSTUDIO_PUBLIC_URL = os.environ.get("LABELSTUDIO_PUBLIC_URL", LABELSTUDIO_URL)
 CAMERAPI_URL = os.environ.get("CAMERAPI_URL", "http://192.168.0.115:8001")
 
 # Label Studio API access (read-only) for the live labeled view.
@@ -183,7 +188,7 @@ async def home(
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
-        {"user_email": email, "labelstudio_url": LABELSTUDIO_URL},
+        {"user_email": email, "labelstudio_url": LABELSTUDIO_PUBLIC_URL},
     )
 
 
