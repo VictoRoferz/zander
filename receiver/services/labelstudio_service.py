@@ -36,11 +36,11 @@ LABELING_CONFIG = """
 <View>
   <Header value="PCB Lötstellen-Defektklassifizierung"/>
   <Image name="image" value="$image"/>
-  <BrushLabels name="label" toName="image">
+  <RectangleLabels name="label" toName="image">
     <Label value="Brücke" background="green"/>
     <Label value="Nicht ausreichend Lot" background="blue"/>
     <Label value="Fahne" background="red"/>
-  </BrushLabels>
+  </RectangleLabels>
   <Choices name="overall_quality" toName="image" choice="single" showInline="true">
     <Choice value="iO"/>
     <Choice value="NiO"/>
