@@ -1,0 +1,2 @@
+date,run_name,model,adapter,bucket,n_photos,n_gt,recall_at_0.5fppi,ci95_lo,ci95_hi,threshold,ap50,ap50_95,fp_at_op,fp_other_defect,mean_ms_per_photo,tiler_version,split_id,snapshot_id,host
+2026-08-06 14:30,smoke_fold0_v2,model.onnx,ultralytics,fold0,73,75,0.0,0.0,0.0,,0.0,0.0,0,0,486.2,v1,split_v1,v1_2026-07-27_yolo,Mac.fritz.box

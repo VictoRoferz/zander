@@ -165,6 +165,10 @@ def score_photos(photos, iou_op=IOU_OPERATING, seed=0) -> dict:
     op_recall, op_t = recall_at_fppi(points, FPPI_OPERATING)
 
     # ---- operating-point diagnostics ----
+    # op_t is None when NO threshold meets the FPPI budget (degenerate model):
+    # the operating point is then "predict nothing" — every GT is a miss and
+    # zero predictions count as operating-point FPs.
+    op_eff = op_t if op_t is not None else float("inf")
     fn_photos, fp_total, fp_other = [], 0, 0
     bucket_tot = {b: 0 for b in SIZE_BUCKETS}
     bucket_hit = {b: 0 for b in SIZE_BUCKETS}
@@ -175,16 +179,15 @@ def score_photos(photos, iou_op=IOU_OPERATING, seed=0) -> dict:
             for b in SIZE_BUCKETS:
                 if b[0] <= side < b[1]:
                     bucket_tot[b] += 1
-                    if ms is not None and (op_t is None or ms >= op_t):
+                    if ms is not None and ms >= op_eff:
                         bucket_hit[b] += 1
         missed = [
-            g for g, ms in zip(p["gt"], gm)
-            if ms is None or (op_t is not None and ms < op_t)
+            g for g, ms in zip(p["gt"], gm) if ms is None or ms < op_eff
         ]
         if missed:
             fn_photos.append({"capture_id": p["capture_id"], "missed": missed})
         for box, s, m in zip(p["boxes"], p["scores"], pm):
-            if m or (op_t is not None and s < op_t):
+            if m or s < op_eff:
                 continue
             fp_total += 1
             if any(iou(box, og) >= 0.1 for og in p.get("other_gt", [])):
