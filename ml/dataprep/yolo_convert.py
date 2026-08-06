@@ -123,16 +123,20 @@ def run() -> Path:
 
 
 def export_zip() -> Path:
-    """Dereferenced zip of the YOLO view + provenance, for Drive/Colab."""
-    out_dir = settings.yolo_dir / DATASET_ID
+    """
+    Zip of the TILES dataset (images + COCO GT + provenance) for Drive/Colab.
+
+    Deliberately NOT the YOLO view: dereferencing its oversampling symlinks
+    would duplicate every positive tile K× and every tile once per subset
+    (measured 4.3 GB vs ~1 GB). Colab rebuilds the symlinked YOLO view in
+    seconds with `python cli.py tile --no-images` after unzipping.
+    """
     ds_dir = settings.tiles_dir / DATASET_ID
-    zip_path = settings.ml_data_root / f"{DATASET_ID}_yolo.zip"
+    zip_path = settings.ml_data_root / f"{DATASET_ID}_tiles.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-        zf.write(ds_dir / "provenance.json", f"{DATASET_ID}/provenance.json")
-        for path in sorted(out_dir.rglob("*")):
-            if path.is_file() or path.is_symlink():
-                arc = f"{DATASET_ID}/{path.relative_to(out_dir)}"
-                zf.write(path.resolve(), arc)  # dereferences symlinks
+        for path in sorted(ds_dir.rglob("*")):
+            if path.is_file():
+                zf.write(path, f"{DATASET_ID}/{path.relative_to(ds_dir)}")
     size_gb = zip_path.stat().st_size / 1e9
     logger.info(f"dataset zip: {zip_path} ({size_gb:.2f} GB)")
     return zip_path
