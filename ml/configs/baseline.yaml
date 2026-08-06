@@ -1,0 +1,11 @@
+# M1 baseline: the de-risking run — proves Colab -> bundle -> eval end-to-end.
+name: yolo11s_fold0_baseline
+model: yolo11s.pt
+adapter: ultralytics
+dataset_id: ds_v1
+fold: fold0          # fold0 | fold1 | fold2 | dev_all
+epochs: 120
+imgsz: 640
+batch: 16
+seed: 20260806
+# augment: {}        # locked policy defaults live in train/ultralytics_run.py

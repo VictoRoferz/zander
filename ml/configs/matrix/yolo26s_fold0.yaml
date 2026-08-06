@@ -1,0 +1,10 @@
+# M2 matrix run — same frozen data, same scorer for every candidate.
+name: yolo26s_fold0
+model: yolo26s.pt
+adapter: ultralytics
+dataset_id: ds_v1
+fold: fold0
+epochs: 120
+imgsz: 640
+batch: 16
+seed: 20260806

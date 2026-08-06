@@ -1,0 +1,16 @@
+# End-to-end smoke: 1 CPU epoch on 5% of fold0 — validates train -> bundle ->
+# import-run -> eval plumbing, NOT model quality.
+name: yolo11n_smoke
+model: yolo11n.pt
+adapter: ultralytics
+dataset_id: ds_v1
+fold: fold0
+epochs: 1
+imgsz: 640
+batch: 8
+seed: 20260806
+extra:
+  fraction: 0.05
+  val: false
+  plots: false
+  workers: 2

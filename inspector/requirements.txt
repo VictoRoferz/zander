@@ -1,0 +1,12 @@
+# Service deps follow the sibling convention (unpinned)...
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+python-dotenv
+# ...but the inference stack is PINNED (model compatibility is load-bearing).
+# Deliberately NO torch / NO ultralytics — the exported ONNX is the contract.
+numpy==1.26.4
+onnxruntime==1.20.1
+Pillow==10.4.0
