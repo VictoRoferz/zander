@@ -8,15 +8,27 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.ipynb_checkpoints/
 
 # Local data (images, captures, label studio DB)
 zander-data/
-data/
+/deploy/data/
 *.jpg
 *.jpeg
 *.png
 # but keep the sample image used by camerapi fallback
 !camerapi/sample.jpg
+
+# Raw photo/label dumps and ML working data (manifests/split files/configs under ml/ ARE committed)
+/data_fotos/
+/ml_data/
+mlruns/
+runs/
+*.zip
+*.pt
+*.pth
+*.onnx
+*.engine
 
 # OS / editor junk
 .DS_Store

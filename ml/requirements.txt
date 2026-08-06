@@ -1,0 +1,32 @@
+# ML toolchain — pinned for reproducibility (deliberate deviation from the
+# unpinned sibling services: benchmark results must be re-creatable).
+#
+# torch / torchvision are DELIBERATELY ABSENT: Colab preinstalls a
+# CUDA-matched torch and forcing a pin there means a multi-GB reinstall plus
+# CUDA-mismatch risk. For local CPU-only smoke runs use requirements-cpu.txt,
+# which pins a torch-cpu pair and then includes this file.
+#
+# DEIM's dependencies are installed from the pinned DEIM repo inside Colab
+# only (see train/deim_run.py) — they never enter this file.
+
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+imagehash==4.3.1
+pycocotools==2.0.8
+PyYAML==6.0.2
+tqdm==4.66.5
+
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+# Training (Ultralytics uses whatever torch is already present)
+ultralytics==8.4.115
+
+# Export / CPU inference / eval
+onnx==1.17.0
+onnxruntime==1.20.1
+
+# Experiment tracking (local file store only; used as a viewer over run_dir bundles)
+mlflow==3.1.1

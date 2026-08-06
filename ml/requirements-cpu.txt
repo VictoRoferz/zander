@@ -1,0 +1,6 @@
+# Local CPU-only environment (macOS/Windows dev smoke runs).
+# Install with:  pip install -r requirements-cpu.txt
+# Pins a CPU torch pair explicitly, then everything else from requirements.txt.
+torch==2.5.1
+torchvision==0.20.1
+-r requirements.txt
