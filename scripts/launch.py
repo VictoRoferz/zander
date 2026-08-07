@@ -91,7 +91,15 @@ def _pump(name: str, proc: subprocess.Popen) -> None:
     proc.stdout.close()
 
 
+# Set by --ignore-ctrl-c: children start in their own process group so a
+# console Ctrl+C (e.g. a keypad programmed to ctrl+c!) cannot stop them.
+SHIELD_CHILDREN = False
+
+
 def start(name: str, args: list[str], cwd: Path, env: dict) -> subprocess.Popen:
+    kwargs = {}
+    if SHIELD_CHILDREN and sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(
         args,
         cwd=str(cwd),
@@ -100,6 +108,11 @@ def start(name: str, args: list[str], cwd: Path, env: dict) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        # Children run with PYTHONUTF8=1, so decode their output as UTF-8
+        # regardless of the console's locale (else â€”-style mojibake).
+        encoding="utf-8",
+        errors="replace",
+        **kwargs,
     )
     PROCS.append((name, proc))
     threading.Thread(target=_pump, args=(name, proc), daemon=True).start()
@@ -133,6 +146,10 @@ def parse_args() -> argparse.Namespace:
                     help="write this launcher's PID here (deleted on exit)")
     ap.add_argument("--log-file", type=Path, default=None,
                     help="also append all child output to this file")
+    ap.add_argument("--ignore-ctrl-c", action="store_true",
+                    help="production mode (Windows): ignore console Ctrl+C so a "
+                         "keypad bound to ctrl+c cannot stop the stack; stop via "
+                         "stop-zander.bat (taskkill) instead")
     return ap.parse_args()
 
 
@@ -141,7 +158,7 @@ def _raise_keyboard_interrupt(signum, frame):
 
 
 def main() -> int:
-    global LOG_FH
+    global LOG_FH, SHIELD_CHILDREN
     args = parse_args()
     hub = not args.camera_only
     camera = args.with_camera or args.camera_only
@@ -150,6 +167,15 @@ def main() -> int:
     # handling skips `finally`, which would orphan them). Windows production
     # uses `taskkill /T` (whole tree), so this is for POSIX/dev.
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
+    if args.ignore_ctrl_c and sys.platform == "win32":
+        # A USB keypad bound to ctrl+c types a REAL Ctrl+C: if this console has
+        # focus, that would shut the whole camera stack down mid-capture. In
+        # production the stack is stopped by stop-zander.bat (taskkill /T), so
+        # console interrupts can be ignored entirely — here and, via
+        # CREATE_NEW_PROCESS_GROUP (see start()), in every child.
+        SHIELD_CHILDREN = True
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     if args.log_file is not None:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)

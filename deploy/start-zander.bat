@@ -44,7 +44,7 @@ if not errorlevel 1 (
 
 :camera_start
 echo Starting camera stack (camerapi + USB button)...
-start "Zander Camera" /min "%CAMPY%" "%~dp0..\scripts\launch.py" --camera-only --pid-file "%CAMPIDFILE%" --log-file "%~dp0camera-stack.log"
+start "Zander Camera" /min "%CAMPY%" "%~dp0..\scripts\launch.py" --camera-only --ignore-ctrl-c --pid-file "%CAMPIDFILE%" --log-file "%~dp0camera-stack.log"
 
 :camera_done
 echo Waiting a few seconds for services to come up...
