@@ -160,6 +160,10 @@ def main() -> int:
 
     base_env = os.environ.copy()
     base_env["PYTHONUNBUFFERED"] = "1"
+    # Windows consoles/pipes default to cp1252, which can't encode the unicode
+    # arrows/dashes in our log messages ("Logging error" tracebacks, harmless
+    # but alarming). Force UTF-8 for all children.
+    base_env["PYTHONUTF8"] = "1"
 
     try:
         starting = []
