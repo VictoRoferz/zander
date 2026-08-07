@@ -28,8 +28,11 @@ Configuration (env vars, or camerapi/.env which is loaded if present):
 
 Key name formats for BUTTON_*_KEY: pynput Key names (f1–f20, media_*, …),
 f21–f24 (Windows only, via virtual-key codes), vk:<code> (explicit
-virtual-key escape hatch), or a single printable character (dev only — it
-will also type into the focused app).
+virtual-key escape hatch), a single printable character (dev only — it
+will also type into the focused app), or a modifier combo like "ctrl+c"
+(for keypads left on their factory copy/paste mapping). WARNING: a combo
+like ctrl+c fires on every REAL copy anywhere on this PC too — junk
+captures enter the pipeline; prefer reprogramming the keypad to F13/F14.
 
 BUTTON_MODE=stdin is the no-hardware dev mode: Enter or 'c' = capture,
 't' = secondary, 'q' = quit. Run it in its own terminal (under launch.py the
@@ -116,6 +119,34 @@ def parse_key(name: str):
     raise ValueError(f"unrecognized key name '{name}'")
 
 
+def parse_binding(name: str):
+    """
+    Turn a config string into ("single", Key/KeyCode) or ("combo", set-of-keys).
+
+    Combos are "+"-separated pynput hotkey parts: "ctrl+c", "<ctrl>+v",
+    "ctrl+shift+p". Combos support named keys/chars only (no vk:<code>).
+    """
+    from pynput import keyboard
+
+    raw = name.strip().lower()
+    if "+" in raw and len(raw) > 1:
+        parts = [p.strip() for p in raw.split("+") if p.strip()]
+        if len(parts) < 2:
+            raise ValueError(f"bad combo '{name}' (expected e.g. ctrl+c)")
+        spec = "+".join(p if len(p) == 1 else f"<{p.strip('<>')}>" for p in parts)
+        try:
+            keys = keyboard.HotKey.parse(spec)
+        except ValueError as e:
+            raise ValueError(f"bad combo '{name}': {e}")
+        log.warning(
+            f"'{raw}' is a modifier combo — pressing it in ANY program (e.g. a "
+            "real copy/paste) also triggers the camera. Reprogram the keypad to "
+            "F13/F14 when you can."
+        )
+        return "combo", keys
+    return "single", parse_key(raw)
+
+
 def _key_matches(pressed, target) -> bool:
     """Compare a hook event against a parsed target key."""
     from pynput.keyboard import Key
@@ -170,29 +201,40 @@ def run_keyboard_mode(stop: threading.Event) -> int:
         log.error("pynput is not installed — `pip install pynput`, or use BUTTON_MODE=stdin")
         return 2
 
+    wanted = [(CAPTURE_KEY, "capture")]
+    if SECONDARY_KEY.strip() and SECONDARY_ACTION != "none":
+        wanted.append((SECONDARY_KEY, SECONDARY_ACTION))
+
+    single_bindings = []  # (target Key/KeyCode, action, label)
+    hotkeys = []          # pynput HotKey instances (state machine per combo)
     try:
-        capture_key = parse_key(CAPTURE_KEY)
-        secondary_key = (
-            parse_key(SECONDARY_KEY)
-            if SECONDARY_KEY.strip() and SECONDARY_ACTION != "none"
-            else None
-        )
+        for label, action in wanted:
+            kind, val = parse_binding(label)
+            if kind == "single":
+                single_bindings.append((val, action, label))
+            else:
+                hotkeys.append(
+                    keyboard.HotKey(val, lambda a=action, l=label: trigger(a, f"combo '{l}'"))
+                )
     except ValueError as e:
         log.error(
             f"bad key config: {e}. Supported: pynput Key names (f1–f20, media_*), "
-            "f21–f24 (Windows), vk:<code>, or a single character."
+            "f21–f24 (Windows), vk:<code>, a single character, or a combo like ctrl+c."
         )
         return 2
 
-    bindings = [(capture_key, "capture", CAPTURE_KEY)]
-    if secondary_key is not None:
-        bindings.append((secondary_key, SECONDARY_ACTION, SECONDARY_KEY))
-
-    held: set[int] = set()  # binding indices physically held (auto-repeat guard)
+    held: set[int] = set()  # single-binding indices physically held (auto-repeat guard)
+    listener = None  # assigned below; callbacks only run once it is listening
 
     def on_press(key):
         log.debug(f"key press: {key!r}")
-        for i, (target, action, label) in enumerate(bindings):
+        if hotkeys:
+            # canonical() folds ctrl_l/ctrl_r into ctrl and undoes the
+            # control-char translation Windows applies while ctrl is held.
+            k = listener.canonical(key)
+            for hk in hotkeys:  # HotKey ignores repeats of an already-held key
+                hk.press(k)
+        for i, (target, action, label) in enumerate(single_bindings):
             if _key_matches(key, target):
                 if i in held:
                     return
@@ -200,15 +242,17 @@ def run_keyboard_mode(stop: threading.Event) -> int:
                 trigger(action, f"key '{label}'")
 
     def on_release(key):
-        for i, (target, _action, _label) in enumerate(bindings):
+        if hotkeys:
+            k = listener.canonical(key)
+            for hk in hotkeys:
+                hk.release(k)
+        for i, (target, _action, _label) in enumerate(single_bindings):
             if _key_matches(key, target):
                 held.discard(i)
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
-    summary = f"'{CAPTURE_KEY}' → capture"
-    if secondary_key is not None:
-        summary += f", '{SECONDARY_KEY}' → {SECONDARY_ACTION}"
+    summary = ", ".join(f"'{label}' → {action}" for label, action in wanted)
     log.info(f"keyboard hook active: {summary}")
     if sys.platform == "darwin":
         log.info(

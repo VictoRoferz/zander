@@ -61,6 +61,39 @@ for bad in ("", "f99", "not-a-key"):
     except ValueError:
         pass
 
+# parse_binding: singles pass through, "+" strings become pynput hotkey sets.
+kind, val = mod.parse_binding("f13")
+assert kind == "single" and val is Key.f13
+kind, keys = mod.parse_binding("ctrl+c")
+assert kind == "combo" and Key.ctrl in keys and KeyCode.from_char("c") in keys
+kind, keys = mod.parse_binding("<ctrl>+v")  # pre-bracketed form also accepted
+assert kind == "combo" and Key.ctrl in keys and KeyCode.from_char("v") in keys
+kind, keys = mod.parse_binding("ctrl+shift+p")
+assert kind == "combo" and len(keys) == 3
+for bad in ("ctrl+", "nope+alsono"):
+    try:
+        mod.parse_binding(bad)
+        raise AssertionError(f"{bad!r} should fail")
+    except ValueError:
+        pass
+kind, val = mod.parse_binding("+")  # a bare "+" is a plain single-char key
+assert kind == "single" and val == KeyCode.from_char("+")
+
+# A HotKey built from a parsed combo activates on the full chord and
+# re-arms only after release (auto-repeat of the held chord won't re-fire).
+from pynput.keyboard import HotKey  # noqa: E402
+
+fired = []
+hk = HotKey(mod.parse_binding("ctrl+c")[1], lambda: fired.append(1))
+hk.press(Key.ctrl)
+hk.press(KeyCode.from_char("c"))
+assert fired == [1]
+hk.press(KeyCode.from_char("c"))  # OS auto-repeat while held
+assert fired == [1]
+hk.release(KeyCode.from_char("c"))
+hk.press(KeyCode.from_char("c"))
+assert fired == [1, 1]
+
 # _key_matches: enum targets, vk targets (incl. enum-with-value), char targets.
 assert mod._key_matches(Key.f13, Key.f13)
 assert not mod._key_matches(Key.f14, Key.f13)
