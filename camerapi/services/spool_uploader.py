@@ -10,9 +10,9 @@ Runs as a daemon thread started/stopped by main.lifespan. Uses the blocking
 `requests` library on its own thread so it never blocks the event loop.
 
 Retry policy per entry:
-  - 2xx or 409 (already ingested) → delete from spool (success / idempotent).
-  - other 4xx                     → poison; move to spool/failed/ (never retried).
-  - 5xx / connection error        → keep; exponential backoff, capped.
+  - 2xx or 409 (already ingested) -> delete from spool (success / idempotent).
+  - other 4xx                     -> poison; move to spool/failed/ (never retried).
+  - 5xx / connection error        -> keep; exponential backoff, capped.
 A Pi reboot loses only the in-memory backoff timers; the first loop iteration
 re-scans the spool and re-uploads everything still there.
 """
@@ -50,7 +50,7 @@ class SpoolUploader:
             target=self._run, name="spool-uploader", daemon=True
         )
         self._thread.start()
-        logger.info(f"Spool uploader started → {settings.ingest_endpoint}")
+        logger.info(f"Spool uploader started -> {settings.ingest_endpoint}")
 
     def stop(self) -> None:
         self._stop.set()

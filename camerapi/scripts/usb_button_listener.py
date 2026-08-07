@@ -7,8 +7,8 @@ keys to rare codes (F13/F14 recommended — inert in normal apps, so no
 suppression is needed and normal typing can never fire a capture). This
 script installs a global keyboard hook (pynput) and POSTs to camerapi:
 
-    <capture key>   → POST {CAMERAPI_URL}/api/v1/capture
-    <secondary key> → POST {CAMERAPI_URL}/api/v1/test-camera  (configurable)
+    <capture key>   -> POST {CAMERAPI_URL}/api/v1/capture
+    <secondary key> -> POST {CAMERAPI_URL}/api/v1/test-camera  (configurable)
 
 Like the old GPIO listener it sends no X-Triggered-By header — camerapi
 attributes button captures by asking the dashboard who is logged in.
@@ -183,10 +183,10 @@ def trigger(action: str, source: str) -> None:
 def _do_request(action: str) -> None:
     url = ENDPOINTS[action]
     try:
-        log.info(f"{action} → POST {url}")
+        log.info(f"{action} -> POST {url}")
         resp = requests.post(url, timeout=CAPTURE_TIMEOUT)
         body = resp.text[:200].replace("\n", " ")
-        log.info(f"{action} ← {resp.status_code} {body}")
+        log.info(f"{action} <- {resp.status_code} {body}")
     except requests.RequestException as e:
         log.warning(f"{action} failed: {e} — is the camera stack up? Still listening.")
     finally:
@@ -252,7 +252,7 @@ def run_keyboard_mode(stop: threading.Event) -> int:
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
-    summary = ", ".join(f"'{label}' → {action}" for label, action in wanted)
+    summary = ", ".join(f"'{label}' -> {action}" for label, action in wanted)
     log.info(f"keyboard hook active: {summary}")
     if sys.platform == "darwin":
         log.info(

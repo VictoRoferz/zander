@@ -209,10 +209,10 @@ class CameraService:
         Resolve which acquisition profile to use.
 
         Order of precedence:
-          1. settings.camera_transport == "ethernet" / "wifi" → forced.
-          2. "auto" on Windows/macOS → ethernet (direct-attach GigE is the
+          1. settings.camera_transport == "ethernet" / "wifi" -> forced.
+          2. "auto" on Windows/macOS -> ethernet (direct-attach GigE is the
              norm on the hub PC; there is no `ip` binary to probe anyway).
-          3. "auto" on Linux → look up the OS route to the camera's IP and
+          3. "auto" on Linux -> look up the OS route to the camera's IP and
              pick ethernet for eth*/en*, wifi for wl*; detection failure
              falls back to wifi (safer on a Pi-style deployment).
         """

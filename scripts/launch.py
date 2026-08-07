@@ -30,7 +30,7 @@ under pydantic-settings).
 
 First-run bootstrap (manual, once):
   1. Start this launcher; open http://localhost:8081 and create an LS account.
-  2. Copy your token (LS → Account & Settings → Access Token) into
+  2. Copy your token (LS -> Account & Settings -> Access Token) into
      receiver/.env (LABELSTUDIO_API_KEY) and dashboard/.env (LABELSTUDIO_API_KEY).
   3. Create a dashboard login:  python dashboard/manage_users.py add you@x "You"
   4. Restart this launcher.

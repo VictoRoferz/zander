@@ -1,12 +1,12 @@
 """
 HTTP routes for camerapi.
 
-camerapi is a thin capture node: grab → write to the local spool → return.
+camerapi is a thin capture node: grab -> write to the local spool -> return.
 The background spool_uploader ships spooled captures to the ingestion hub;
 their outcome shows up in the camerapi logs (look for "[<capture_id>]").
 
 Triggers:
-  - Production: USB keypad → scripts/usb_button_listener.py → POST /api/v1/capture
+  - Production: USB keypad -> scripts/usb_button_listener.py -> POST /api/v1/capture
                 (or the dashboard "Capture" button, which adds X-Triggered-By)
   - Testing:    curl -X POST http://localhost:8001/api/v1/capture
 """
