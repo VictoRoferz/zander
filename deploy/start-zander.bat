@@ -15,19 +15,28 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM --- Native camera stack (needs the venv from deploy\setup-camera.bat) ---
+REM --- Native camera stack (self-healing: runs the setup itself if needed) ---
 set "CAMPY=%~dp0..\.venv\Scripts\python.exe"
+set "CAMREADY=%~dp0..\.venv\camera-stack-ready"
 set "CAMPIDFILE=%~dp0camera-stack.pid"
 
-if not exist "%CAMPY%" (
-  echo [warn] Camera venv missing - run deploy\setup-camera.bat once.
-  echo [warn] Starting WITHOUT the camera + USB button.
-  goto :camera_done
-)
+if exist "%CAMREADY%" goto :camera_check
+echo Camera stack not set up yet - running the one-time setup now (needs internet)...
+call "%~dp0setup-camera.bat" auto
+cd /d "%~dp0"
+if exist "%CAMREADY%" goto :camera_check
+echo.
+echo *** Camera setup FAILED - starting WITHOUT the camera + USB button.  ***
+echo *** Run deploy\setup-camera.bat by hand to see the error.            ***
+pause
+goto :camera_done
 
+:camera_check
 if not exist "%CAMPIDFILE%" goto :camera_start
 set /p CAMPID=<"%CAMPIDFILE%"
-tasklist /FI "PID eq %CAMPID%" 2>nul | find "%CAMPID%" >nul
+REM Only trust the PID if it is actually a python process — after a reboot
+REM Windows may hand a stale PID to an unrelated program.
+tasklist /FI "PID eq %CAMPID%" /FI "IMAGENAME eq python.exe" 2>nul | find "%CAMPID%" >nul
 if not errorlevel 1 (
   echo Camera stack already running (PID %CAMPID%).
   goto :camera_done

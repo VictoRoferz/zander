@@ -2,6 +2,11 @@
 REM One-time setup for the native camera stack (camerapi + USB button listener).
 REM Creates the repo venv (shared with the windows-native fallback path) and
 REM installs camerapi's dependencies (incl. pypylon + pynput).
+REM Usage: setup-camera.bat [auto]
+REM   "auto" = non-interactive (no pauses); start-zander.bat uses this to
+REM   self-heal a missing or half-finished setup on icon start.
+set "AUTO="
+if /i "%~1"=="auto" set "AUTO=1"
 cd /d "%~dp0\.."
 
 if not exist .venv (
@@ -9,7 +14,7 @@ if not exist .venv (
   python -m venv .venv
   if errorlevel 1 (
     echo *** Could not create the venv. Is Python 3.10+ installed and on PATH? ***
-    pause
+    if not defined AUTO pause
     exit /b 1
   )
 )
@@ -19,7 +24,7 @@ python -m pip install --upgrade pip
 pip install -r camerapi\requirements.txt
 if errorlevel 1 (
   echo *** pip install failed - see output above. ***
-  pause
+  if not defined AUTO pause
   exit /b 1
 )
 
@@ -28,9 +33,14 @@ if not exist camerapi\.env (
   echo Created camerapi\.env from the example ^(defaults suit this single-PC setup^).
 )
 
+REM Completion marker checked by start-zander.bat — written only when every
+REM step above succeeded, so a half-finished setup gets re-run, not trusted.
+echo ok > .venv\camera-stack-ready
+
 echo.
 echo Camera stack is set up. Next steps:
-echo   1. Program the USB keypad: key 1 = F13 ^(capture^), key 2 = F14 ^(test shot^).
-echo   2. Give the camera NIC a static IP on the camera subnet ^(192.168.177.x^).
+echo   1. Program the USB keypad ^(or keep its copy button; see camerapi\.env^).
+echo   2. Make sure the camera is reachable: ping its IP.
 echo   3. Start everything with the Zander desktop icon ^(or start-zander.bat^).
-pause
+if not defined AUTO pause
+exit /b 0

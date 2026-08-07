@@ -38,6 +38,9 @@ dashboard "Capture" ─┘                                    dashboard (Docker,
    This creates the repo venv and installs camerapi's deps (incl. **pypylon** —
    the PyPI wheel bundles the pylon runtime — and **pynput** for the USB button),
    and creates `camerapi\.env` from the example (defaults suit this setup).
+   Safety net: if this step is skipped or half-finished, `start-zander.bat`
+   detects it (missing `.venv\camera-stack-ready` marker) and runs the setup
+   itself on the next start.
 5. **Camera NIC:** give the Ethernet port that the Basler camera is plugged into a
    static IP on the camera subnet (e.g. `192.168.177.90`, mask `255.255.255.0`, no
    gateway). The camera sits at `192.168.177.95`. Verify: `ping 192.168.177.95`.
