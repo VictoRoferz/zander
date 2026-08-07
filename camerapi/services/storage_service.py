@@ -1,10 +1,10 @@
 """
-Local spool storage for camerapi (Raspberry Pi 3).
+Local spool storage for camerapi.
 
 camerapi writes each capture (image + JSON sidecar) into the spool, and the
-background uploader (services/spool_uploader.py) ships it to the laptop
-ingestion hub. An entry stays in the spool until the laptop ACKs it, so a
-brief laptop outage never loses a capture.
+background uploader (services/spool_uploader.py) ships it to the ingestion
+hub. An entry stays in the spool until the receiver ACKs it, so the Docker
+side being down or still booting never loses a capture.
 
 All disk I/O for the app lives here. Camera and HTTP code never touch the
 filesystem directly.

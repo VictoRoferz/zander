@@ -1,6 +1,5 @@
 """
-Logging configuration for Server 1 (Camera Service)
-Provides structured logging optimized for Raspberry Pi 3
+Logging configuration for camerapi.
 """
 import logging
 import sys

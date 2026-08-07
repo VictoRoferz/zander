@@ -1,15 +1,25 @@
-# camerapi (Raspberry Pi 3) Dependencies
+# camerapi dependencies (runs natively on the hub PC: Windows prod / macOS dev)
 
 # Web framework
 fastapi
 uvicorn[standard]
 
-# HTTP client (upload spooled captures to the laptop ingestion hub)
+# HTTP client (upload spooled captures to the ingestion hub)
 requests
 
 # Camera and image processing
 opencv-python-headless
 numpy
+
+# Basler camera SDK. The PyPI wheels bundle the pylon runtime, so capture
+# needs no separate pylon install. If no wheel exists for your dev platform,
+# skip it — the import is guarded and sample.jpg covers dev:
+#   grep -v pypylon requirements.txt | pip install -r /dev/stdin
+pypylon
+
+# USB macro-keypad trigger (scripts/usb_button_listener.py) — global keyboard
+# hook. No admin needed on Windows; macOS needs Accessibility permission.
+pynput
 
 # Configuration management
 pydantic
@@ -17,7 +27,3 @@ pydantic-settings
 
 # Utilities
 python-dotenv
-
-# GPIO button (production trigger). Pi-only — skip on macOS/Windows dev:
-#   grep -v RPi.GPIO requirements.txt | pip install -r /dev/stdin
-RPi.GPIO

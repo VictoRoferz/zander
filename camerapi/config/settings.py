@@ -1,10 +1,11 @@
 """
-Configuration management for camerapi (Raspberry Pi 3).
+Configuration management for camerapi.
 
-camerapi is now a thin capture node: it grabs a frame, writes it to a local
-spool, and a background uploader ships it to the laptop ingestion hub
-(receiver, /api/v1/ingest). Label Studio and all downstream storage live on
-the laptop now — camerapi no longer talks to Label Studio at all.
+camerapi runs natively on the hub PC (Windows prod / macOS dev) with the
+Basler GigE camera direct-attached. It is a thin capture node: it grabs a
+frame, writes it to a local spool, and a background uploader ships it to the
+ingestion hub (receiver, /api/v1/ingest) — normally the Docker containers on
+this same machine. It never talks to Label Studio directly.
 
 All values can be overridden via environment variables (see .env).
 Settings are validated at startup via Pydantic.
@@ -30,30 +31,35 @@ class Settings(BaseSettings):
     camera_height: int = 1080
     camera_fps: int = 30
     fallback_image_path: str = "sample.jpg"
-    # "auto" picks ethernet vs wifi by checking the route to the camera's IP.
+    # "auto" = ethernet on Windows/macOS (direct-attach GigE is the norm);
+    # on Linux it checks the route to the camera's IP (eth* vs wl*).
     # Override to "ethernet" or "wifi" to force a profile (debugging / odd networks).
     camera_transport: str = "auto"
 
-    # ---- Local spool (Pi side) ----
+    # ---- Local spool ----
     # Captures land here first; the background uploader ships them to the
-    # laptop and deletes each entry only once the laptop ACKs it. So a brief
-    # laptop outage never loses a capture. Default suits the Pi; override
-    # DATA_ROOT for dev on a laptop.
-    data_root: Path = Path("/home/pi/zander-data")
+    # receiver and deletes each entry only once it ACKs. So a capture is never
+    # lost while the Docker side is down or still booting.
+    # NOTE: this is NOT the canonical image store. The spool under DATA_ROOT
+    # is transient; the canonical unlabeled/labeled store is the receiver's
+    # DATA_ROOT (deploy\data under Docker). Files move by HTTP, never a
+    # shared path — keep the two roots separate.
+    data_root: Path = Path.home() / "zander-data"
 
-    # ---- Laptop ingestion hub (receiver) ----
-    # Single upload target now (was a comma-separated mirror fan-out). Each
-    # capture is POSTed to {ingest_url}/api/v1/ingest with retry until ACK.
-    ingest_url: str = "http://192.168.0.199:8002"
+    # ---- Ingestion hub (receiver) ----
+    # Single upload target. Each capture is POSTed to
+    # {ingest_url}/api/v1/ingest with retry until ACK. The receiver normally
+    # runs in Docker on this same machine, port-mapped on localhost.
+    ingest_url: str = "http://localhost:8002"
     upload_timeout: int = 30           # seconds per HTTP attempt
     upload_poll_interval: float = 2.0  # seconds between spool scans
     upload_max_backoff: float = 60.0   # cap for per-entry exponential backoff
 
-    # ---- Dashboard (for GPIO-button user attribution) ----
-    # When the GPIO button fires there is no X-Triggered-By header, so camerapi
+    # ---- Dashboard (for USB-button user attribution) ----
+    # When the USB button fires there is no X-Triggered-By header, so camerapi
     # asks the dashboard who is logged in via GET {dashboard_url}/api/current-user.
     # Best-effort — failure never blocks the capture (triggered_by becomes null).
-    dashboard_url: str = "http://192.168.0.199:8003"
+    dashboard_url: str = "http://localhost:8003"
     dashboard_timeout: float = 1.5  # seconds; keep tight so the button stays snappy
 
     # ---- Logging ----

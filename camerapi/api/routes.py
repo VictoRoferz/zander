@@ -2,12 +2,13 @@
 HTTP routes for camerapi.
 
 camerapi is a thin capture node: grab → write to the local spool → return.
-The background spool_uploader ships spooled captures to the laptop ingestion
-hub; their outcome shows up in the camerapi logs (look for "[<capture_id>]").
+The background spool_uploader ships spooled captures to the ingestion hub;
+their outcome shows up in the camerapi logs (look for "[<capture_id>]").
 
 Triggers:
-  - Production: GPIO button → button_listener.py → POST /api/v1/capture
-  - Testing:    curl -X POST http://<pi>:8001/api/v1/capture
+  - Production: USB keypad → scripts/usb_button_listener.py → POST /api/v1/capture
+                (or the dashboard "Capture" button, which adds X-Triggered-By)
+  - Testing:    curl -X POST http://localhost:8001/api/v1/capture
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ router = APIRouter(prefix="/api/v1", tags=["camera"])
 def _ask_dashboard_for_current_user() -> Optional[str]:
     """
     Best-effort identity probe used when the request has no X-Triggered-By
-    (e.g. the GPIO button posted from the Pi). Never raises — returns None
+    (e.g. the USB button listener posted it). Never raises — returns None
     on any failure so the capture flow stays unblocked.
     """
     url = f"{settings.dashboard_url.rstrip('/')}/api/current-user"
@@ -53,16 +54,16 @@ async def capture(
     """
     Capture one image and write it to the local spool, then return 202.
 
-    The background uploader ships the spooled capture to the laptop ingestion
-    hub and retries until it ACKs — so the response returns immediately and a
-    laptop outage never blocks (or loses) a capture. Watch the logs for
+    The background uploader ships the spooled capture to the ingestion hub
+    and retries until it ACKs — so the response returns immediately and a
+    receiver outage never blocks (or loses) a capture. Watch the logs for
     "[<capture_id>] ingested ok".
 
     Attribution lookup, in order:
       1. `X-Triggered-By` request header (the dashboard's "Capture" button
          and any explicit caller set this).
       2. The dashboard's `GET /api/current-user` endpoint (used when the
-         GPIO button posts here directly with no header).
+         USB button listener posts here with no header).
       3. None (button fired with no logged-in user / dashboard unreachable).
     """
     capture_id = new_capture_id()

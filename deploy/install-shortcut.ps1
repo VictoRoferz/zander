@@ -12,7 +12,7 @@ $shell    = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($lnkPath)
 $shortcut.TargetPath       = $target
 $shortcut.WorkingDirectory = $here
-$shortcut.Description       = "Start the Zander labeling hub (Label Studio + receiver + dashboard)"
+$shortcut.Description       = "Start the Zander inspection station (Docker hub + native camera + USB button)"
 if (Test-Path $icon) {
     $shortcut.IconLocation = $icon
 } else {

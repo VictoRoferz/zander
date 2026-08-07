@@ -14,6 +14,7 @@ from __future__ import annotations
 import socket
 import struct
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -209,9 +210,11 @@ class CameraService:
 
         Order of precedence:
           1. settings.camera_transport == "ethernet" / "wifi" → forced.
-          2. "auto" → look up the OS route to the camera's IP and pick
-             ethernet for eth*/en*, wifi for wl*.
-          3. Anything else / detection fails → fall back to wifi (safer).
+          2. "auto" on Windows/macOS → ethernet (direct-attach GigE is the
+             norm on the hub PC; there is no `ip` binary to probe anyway).
+          3. "auto" on Linux → look up the OS route to the camera's IP and
+             pick ethernet for eth*/en*, wifi for wl*; detection failure
+             falls back to wifi (safer on a Pi-style deployment).
         """
         forced = (settings.camera_transport or "auto").strip().lower()
         if forced == "ethernet":
@@ -220,6 +223,13 @@ class CameraService:
         if forced == "wifi":
             logger.info("camera_transport=wifi (forced via .env)")
             return WIFI_PROFILE
+
+        if not sys.platform.startswith("linux"):
+            logger.info(
+                "Non-Linux host — defaulting to ethernet profile (direct-attach "
+                "GigE assumed). Set CAMERA_TRANSPORT=wifi to override."
+            )
+            return ETHERNET_PROFILE
 
         camera_ip = self._camera_ip(device)
         if not camera_ip:

@@ -1,4 +1,7 @@
-# Laptop hub — Label Studio + receiver + dashboard.
+# Zander hub — Label Studio + receiver + dashboard (the whole system runs on
+# this one PC; camerapi + the USB button run natively on the host, started by
+# start-zander.bat, because a container can't reach the GigE camera or hook
+# USB keyboard input).
 # Start:  docker compose up -d      (run from this deploy/ folder)
 # Config: edit ./.env (copy from .env.example) — that's the only file to touch.
 #
@@ -60,7 +63,9 @@ services:
       LABELSTUDIO_PUBLIC_URL: http://${LAPTOP_HOST:-localhost}:8081  # "Open Label Studio" link (browser)
       LABELSTUDIO_API_KEY: ${LABELSTUDIO_API_KEY:-}
       LABELSTUDIO_PROJECT_NAME: ${LABELSTUDIO_PROJECT_NAME:-PCB Defect Inspection}
-      CAMERAPI_URL: http://${PI_IP:-127.0.0.1}:8001                  # Pi (dashboard "Capture" button)
+      # Native camerapi on this PC ("Capture" button). Docker Desktop
+      # (Windows/macOS) resolves host.docker.internal to the host.
+      CAMERAPI_URL: ${CAMERAPI_URL:-http://host.docker.internal:8001}
     volumes:
       - ${DATA_DIR:-./data}:/data
     depends_on:

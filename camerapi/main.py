@@ -1,10 +1,10 @@
 """
-camerapi entry point (Raspberry Pi 3).
+camerapi entry point (native capture service on the hub PC).
 
 Thin capture node — grabs frames and spools them; a background uploader ships
-them to the laptop ingestion hub (receiver). Label Studio and downstream
-storage now live on the laptop. Exposes:
-  POST /api/v1/capture       — capture → spool (uploader ships to the laptop)
+them to the ingestion hub (receiver, normally the Docker containers on this
+same machine). camerapi never talks to Label Studio. Exposes:
+  POST /api/v1/capture       — capture → spool (uploader ships to the receiver)
   POST /api/v1/test-camera   — camera-only test (local save, not spooled)
   GET  /api/v1/status        — camera + spool depth + ingest target
   GET  /api/v1/health        — liveness
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="camerapi",
-    description="Raspberry Pi 3 capture node (spools to the laptop ingestion hub)",
+    description="Native capture service (spools to the ingestion hub)",
     version=settings.service_version,
     lifespan=lifespan,
     docs_url="/docs",

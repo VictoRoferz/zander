@@ -83,7 +83,7 @@ LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://localhost:8081")
 # service name (http://labelstudio:8080) but the link must be host-reachable
 # (http://localhost:8081). Defaults to LABELSTUDIO_URL for the native setup.
 LABELSTUDIO_PUBLIC_URL = os.environ.get("LABELSTUDIO_PUBLIC_URL", LABELSTUDIO_URL)
-CAMERAPI_URL = os.environ.get("CAMERAPI_URL", "http://192.168.0.115:8001")
+CAMERAPI_URL = os.environ.get("CAMERAPI_URL", "http://localhost:8001")
 
 # Label Studio API access (read-only) for the live labeled view.
 LABELSTUDIO_API_KEY = os.environ.get("LABELSTUDIO_API_KEY", "")
