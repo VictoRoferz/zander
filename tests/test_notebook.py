@@ -135,6 +135,44 @@ def test_markdown_states_honest_timings():
     assert "10 GPU-min" not in md and "~2-2.5 h" not in md, "the old, wrong timings are gone"
 
 
+DEIM_CONFIGS = [
+    "configs/matrix/deim_s_def3_fold0.yaml",
+    "configs/matrix/deim_s_def3_fold1.yaml",
+    "configs/matrix/deim_s_def3_fold2.yaml",
+]
+
+
+def test_optional_deim_step():
+    p = _params()
+    assert p["DEIM_MATRIX"] == [], "DEIM is optional: empty by default"
+    assert p["MATRIX"] == EXPECTED_MATRIX and not any("deim" in c for c in p["MATRIX"])
+    text = NB.read_text(encoding="utf-8")
+    for cfg in DEIM_CONFIGS + ["configs/final/deim_s_def3_devall.yaml"]:
+        assert cfg in text and (ML / cfg).is_file(), cfg  # the example in the parameters cell
+    cells = {c["id"]: c for c in _nb()["cells"]}
+    order = [c["id"] for c in _nb()["cells"]]
+    assert order.index("matrix") < order.index("deim_md") < order.index("deim") < order.index("final"), order
+    deim = _src(cells["deim"])
+    assert "if DEIM_NEEDED:" in deim and "if DEIM_MATRIX:" in deim and "_is_deim" in deim
+    assert "train/deim_run.py --install-deps" in deim and "train/deim_run.py --fetch-weights" in deim
+    assert "train/matrix.py --configs {DEIM_ARGS}" in deim and "--drive" in deim and "--max-attempts" in deim
+    for line in deim.splitlines():  # nothing is installed or downloaded unless DEIM is used
+        if "--install-deps" in line or "--fetch-weights" in line:
+            assert line.startswith("    !"), f"unguarded: {line}"
+    assert "requirements.txt" not in deim and "%pip" not in deim and "check=True" not in deim
+    assert "CONFIGS = MATRIX + (FINAL or []) + DEIM_MATRIX" in _src(cells["data"])
+    assert "DEIM_MATRIX" in _src(cells["summary"])
+    md = _src(cells["deim_md"])
+    for needle in ("Optional", "Apache-2.0", "DEIMv2", "estimate", "1.5–3.5 h", "25–50 compute units",
+                   "LICENSE_DEIM"):
+        assert needle in md, needle
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    for needle in ("Optional: DEIM", "DEIM_MATRIX", "--install-deps", "--fetch-weights", "1.5–3.5 h",
+                   "MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth", "LICENSE_DEIM",
+                   "configs/deim_smoke_def3.yaml", "--dry-run"):
+        assert needle in runbook, needle
+
+
 def test_runbook_exists_and_covers_the_steps():
     text = RUNBOOK.read_text(encoding="utf-8")
     for needle in ("cli.py tile --schema def3 --zip", "cli.py tile --schema nal1 --zip",

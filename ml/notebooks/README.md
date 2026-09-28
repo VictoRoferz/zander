@@ -104,6 +104,31 @@ Each bundle holds:
 
 The format is described in `docs/CONTRACTS.md` §8.1.
 
+## 8. Optional: DEIM / D-FINE-S, the Apache-2.0 challenger
+
+The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the license-clean alternative: the DEIM repo is pinned to one commit, its Apache-2.0 LICENSE is checked (text and sha256) at every run, and each bundle ships it as `LICENSE_DEIM`. DEIMv2 and EdgeCrafter are **not** used: they are non-commercial since 2026-08-24.
+
+**GPU budget.** This is an estimate, because no DEIM run has been timed yet:
+- about **1.5–3.5 h per 80-epoch fold run** on an L4. DETR-family training costs roughly 1.5–3× an s-scale YOLO epoch;
+- about **5–10 h for the three folds**, which is **about 25–50 compute units**;
+- the dev_all retrain takes about 40 % longer than a fold run, because it has 4.6k instead of 3.0–3.5k tiles.
+
+**Run it:**
+1. In the Parameters cell, set `DEIM_MATRIX` to the three configs from the comment above it (`configs/matrix/deim_s_def3_fold{0,1,2}.yaml`). The first time, add `DEIM_MATRIX = DEIM_MATRIX[:1]` to time one run.
+2. **Run all.** The DEIM cell runs after the YOLO matrix:
+   - it installs DEIM's extra deps (`python train/deim_run.py --install-deps`: pinned faster-coco-eval, calflops and onnxruntime). Colab's torch is not touched;
+   - it puts the init checkpoint in place (`--fetch-weights`): DEIM's COCO-pretrained DEIM-S from the model zoo of the pinned README, which is hosted on Google Drive;
+   - it then trains through `train/matrix.py`, like the YOLO runs: skip, resume and retry work the same way.
+3. If Google Drive refuses the download (quota), download the "S" checkpoint of DEIM's model zoo by hand and upload it as `MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth`. The cell copies it from there in every later session too. Its sha256 is pinned on first use, in `<file>.sha256` next to it.
+4. If DEIM wins on the Mac: `FINAL = ['configs/final/deim_s_def3_devall.yaml']`. The DEIM cell then installs the deps before the final cell runs.
+
+**How the DEIM runs differ from the YOLO runs** (details: the docstring of `train/deim_run.py`):
+- 80 epochs at batch 16, fine-tuned from the COCO checkpoint. Batch 32, DEIM's COCO batch, would not fit an L4 at the 800-px multi-scale maximum.
+- The schedule follows from the epochs and the view size: 8 epochs without photometric aug at the end, LR warm-up over 2 epochs, EMA memory of about 2.7 epochs.
+- The **last** epoch is bundled. DEIM's own "stage 2", which reloads the checkpoint that scored best on the fold's validation photos, is switched off. That would be a selection leak into the out-of-fold evaluation.
+- The augmentation mirrors the YOLO policy: flips plus ColorJitter at the Ultralytics HSV strengths. Mosaic, zoom-out and IoU crops are off, because they shrink or rotate 28-px defects.
+- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
+
 ## Troubleshooting
 
 | symptom | meaning / fix |
@@ -118,6 +143,12 @@ The format is described in `docs/CONTRACTS.md` §8.1.
 | very slow epochs, few vCPUs | With ≤ 4 vCPUs the GPU profile turns on `cache=disk`, so the first epoch is slower while it caches. Prefer L4 with High-RAM |
 | Drive storage full | Replaced mirror checkpoints can end up in the Drive trash, about 1 GB per run. Empty the trash |
 | two notebooks at once | Never train the **same** run in two sessions on one Drive folder, because they would share `mirror/<run>/`. Split `MATRIX` into disjoint lists instead |
+| `DEIM runtime modules missing` | The DEIM cell did not run or its install failed. Run `python train/deim_run.py --install-deps`, then `--check-deps` |
+| `init checkpoint ... missing` | The COCO checkpoint is not in place. Run the DEIM cell again, or upload it to `MyDrive/ZanderML/pretrained/` (section 8) |
+| `... sha256 ... != recorded` | A different init checkpoint than in earlier sessions. Delete the `.sha256` record only if that is intended |
+| `LICENSE ... != pinned` | The pinned DEIM commit's licence no longer matches. Stop and re-check the licence; never just update the pin |
+| `ONNX export does not match the torch model` | The parity gate caught an export problem. The training is safe in the mirror; report the numbers from the log |
+| `DEIM training exited 0 but ...` | DEIM stopped early without an error code. The log above it says why; the run resumes from its last checkpoint |
 
 Runtime knobs, set as environment variables before `train/matrix.py`:
 - `ZANDER_MIRROR_INTERVAL_S` (default 300): the minimum number of seconds between mirror copies;
@@ -137,3 +168,12 @@ python train/matrix.py --configs configs/smoke_resume_def3.yaml --drive /tmp/zan
 ```
 
 Use `--device cpu` on the Mac. Ultralytics training on MPS crashes with the pinned torch 2.5.1.
+
+DEIM without a GPU:
+```bash
+cd ml
+python train/deim_run.py --config configs/matrix/deim_s_def3_fold0.yaml --dry-run   # the full plan: clone, override, schedule, commands
+python train/deim_run.py --check-deps                                                # DEIM's extra deps are NOT in ml/.venv (by design)
+python train/dispatch.py --config configs/deim_smoke_def3.yaml --device cpu          # 2 CPU epochs, random init -> bundle
+```
+The CPU smoke needs DEIM's extra deps (faster-coco-eval, calflops, tensorboard) in the interpreter that runs it.
