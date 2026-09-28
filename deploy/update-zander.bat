@@ -4,12 +4,15 @@ REM Update the Zander station to the latest code. Run it after new code was
 REM pushed (needs internet):
 REM   1. git pull --ff-only        stops on local edits or a diverged branch
 REM   2. docker compose build      new receiver/dashboard/inspector images
-REM   3. camera stack packages     pip install -r camerapi\requirements.txt
-REM   4. restart everything        stop-zander.bat, then start-zander.bat
-REM                                (docker compose up -d with the new images,
-REM                                camera stack with the new code)
-REM If a step fails, nothing after it runs and the station keeps running the
-REM version it had. Every step is appended to deploy\update-zander.log.
+REM   3. stop-zander.bat           the running camera stack holds its packages'
+REM                                DLLs open, so pip could not replace them
+REM   4. camera stack packages     pip install -r camerapi\requirements.txt
+REM   5. start-zander.bat          docker compose up -d with the new images,
+REM                                camera stack with the new code
+REM If step 1 or 2 fails, nothing after it runs and the station keeps running
+REM the version it had. Once the station is stopped (step 3) it is always
+REM started again, even if step 4 fails. Every step is appended to
+REM deploy\update-zander.log.
 REM
 REM git pull may replace this very file, and cmd reads a running batch file
 REM from disk line by line: the work runs from a copy in %TEMP%, so the pull
@@ -52,27 +55,41 @@ call :log "Building the Docker images (docker compose build)..."
 docker compose build
 if errorlevel 1 goto :build_failed
 
-REM --- 3. Camera stack packages (only if the camera stack was set up) ---
+REM --- 3. Stop: the camera stack only picks up new code when restarted, and
+REM its running Python holds the packages' DLLs open (pip cannot replace them) ---
+call :log "Stopping Zander for the update..."
+REM stop-zander.bat ends with "pause": an empty stdin lets it return at once.
+call "%DEPLOY%stop-zander.bat" <nul
+cd /d "%DEPLOY%"
+REM taskkill returns before Windows has released the killed processes' files.
+timeout /t 3 /nobreak >nul
+
+REM --- 4. Camera stack packages (only if the camera stack was set up) ---
+set "PIPOK=yes"
 set "CAMPY=%DEPLOY%..\.venv\Scripts\python.exe"
 if not exist "%CAMPY%" goto :restart
 call :log "Updating the camera stack's Python packages..."
 "%CAMPY%" -m pip install -r "%REPO%\camerapi\requirements.txt"
-if errorlevel 1 goto :pip_failed
+if errorlevel 1 set "PIPOK=no"
+if "%PIPOK%"=="no" call :log "*** Updating the camera stack's packages FAILED - see above; usually no internet. Starting anyway with the packages it had ***"
 
 :restart
-REM --- 4. Restart: the camera stack only picks up new code when restarted ---
-call :log "Restarting Zander with the new version..."
-REM stop-zander.bat ends with "pause": an empty stdin lets it return at once.
-call "%DEPLOY%stop-zander.bat" <nul
-cd /d "%DEPLOY%"
+REM --- 5. Start the new version (always, once the station was stopped) ---
+call :log "Starting Zander with the new version..."
 call "%DEPLOY%start-zander.bat"
 if errorlevel 1 goto :start_problem
+if "%PIPOK%"=="no" goto :pip_problem
 call :log "Update to %NEWREV% complete."
 exit /b 0
 
 :start_problem
+REM start-zander.bat has already shown its problem and waited for a key.
 call :log "*** Updated to %NEWREV%, but start-zander.bat reported a problem - see its messages ***"
 exit /b 1
+
+:pip_problem
+call :log "*** Updated to %NEWREV%, but the camera stack's packages are not updated. If the Zander Camera window shows an import error, run update-zander.bat again once online ***"
+goto :failed
 
 :no_git
 call :log "*** git is not installed or not on PATH - install Git for Windows, then run update-zander.bat again ***"
@@ -88,10 +105,6 @@ goto :failed
 
 :build_failed
 call :log "*** docker compose build FAILED - see above; usually no internet. The station keeps running the version it had; run update-zander.bat again once online ***"
-goto :failed
-
-:pip_failed
-call :log "*** Updating the camera stack's packages FAILED - see above; usually no internet. Nothing was restarted; run update-zander.bat again once online ***"
 goto :failed
 
 :failed

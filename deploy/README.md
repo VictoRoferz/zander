@@ -158,15 +158,19 @@ Double-click **`deploy\update-zander.bat`** (needs internet). It:
 1. `git pull --ff-only` — stops without changing anything on local edits or a
    diverged branch (`git status` shows why);
 2. `docker compose build` — new receiver/dashboard/inspector images;
-3. updates the camera stack's Python packages (`pip install -r camerapi\requirements.txt`
+3. stops the station (`stop-zander.bat`) — a running camera stack never picks up new
+   code by itself, and its Python holds the packages' DLLs open, so pip could not
+   replace them while it runs;
+4. updates the camera stack's Python packages (`pip install -r camerapi\requirements.txt`
    in `.venv`);
-4. restarts everything: `stop-zander.bat`, then `start-zander.bat` (containers with the
-   new images, camera stack with the new code — a running camera stack never picks up
-   new code by itself).
+5. starts the new version (`start-zander.bat`: containers with the new images, camera
+   stack with the new code).
 
-If a step fails, the steps after it are skipped and the station keeps running the
-version it had; the log is `deploy\update-zander.log`. By hand, the same is
-`git pull`, `docker compose build`, `stop-zander.bat`, `start-zander.bat`. Check the
+If step 1 or 2 fails, the steps after it are skipped and the station keeps running the
+version it had. Once the station has been stopped it is always started again; a failed
+package update is reported, and the station starts with the packages it had. The log
+is `deploy\update-zander.log`. By hand, the same is `git pull`,
+`docker compose build`, `stop-zander.bat`, `pip install …`, `start-zander.bat`. Check the
 running versions afterwards: `curl http://localhost:8001/api/v1/status` (camerapi) and
 `curl http://localhost:8002/api/v1/status` (receiver) report `version`.
 
@@ -243,9 +247,10 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
   or another app holds the camera (pylon Viewer open?). After a hard kill the camera
   can stay claimed a few seconds (GigE heartbeat) — retry.
 - **A `.bat` stops with "The system cannot find the batch label specified"** → the
-  checkout has Unix (LF) line endings, which cmd mishandles. Git for Windows normally
-  converts them; otherwise run `git config core.autocrlf true` in the repo, delete the
-  `deploy\*.bat` files and restore them with `git checkout -- deploy`.
+  checkout has Unix (LF) line endings, which cmd mishandles. The repo's `.gitattributes`
+  checks `*.bat` out with CRLF; a checkout made before it arrived keeps LF until the
+  files are rewritten: delete the `deploy\*.bat` files and restore them with
+  `git checkout -- deploy`.
 - **Slow captures (~8 s)** → the WiFi transport profile got forced somehow; ensure
   `CAMERA_TRANSPORT=ethernet` in `camerapi\.env` (auto also picks ethernet on Windows).
 - **Images don't render in LS** → the `DATA_DIR` bind mount isn't shared in Docker
