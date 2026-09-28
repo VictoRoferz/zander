@@ -254,9 +254,9 @@ def latency(cand: dict, stacker_path: Path, n_photos: int, warmup: int, threads:
         "total_50_ms": {"p50": q(tot50, 50), "p95": q(tot50, 95)},
         "verifier_50_native_ms": {"p50": q(native_ms, 50), "p95": q(native_ms, 95)},
         "note": ("the gate uses each photo's actual top-50 detector candidates (repeated if "
-                 "fewer); the native row times 50 NAL-sized boxes (s = 1) for reference: huge "
-                 "boxes (s >> 1) cost 50-80 ms each to window, so a detector that proposes "
-                 "them dominates the verifier time"),
+                 "fewer); the native row times 50 NAL-sized boxes (s = 1) for reference: a "
+                 "window for a huge box (s >> 1) costs 10-40 ms on a 2616x1960 photo, so a "
+                 "detector that proposes many of them dominates the verifier time"),
     }
     return out
 
