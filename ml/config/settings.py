@@ -87,6 +87,11 @@ class Settings(BaseSettings):
         return self.datasets_dir / "photo_attributes_v1.csv"
 
     @property
+    def test_ledger_file(self) -> Path:
+        """Committed audit trail of every test-bucket evaluation (one-shot rule)."""
+        return self.reports_dir / "test_ledger.csv"
+
+    @property
     def eval_dir(self) -> Path:
         return self.ml_data_root / "eval"
 
@@ -107,6 +112,12 @@ class Settings(BaseSettings):
     @property
     def run_dirs_dir(self) -> Path:
         return self.ml_data_root / "run_dirs"
+
+    @property
+    def bundles_dir(self) -> Path:
+        """Imported bundles, extracted flat: bundles/<run_name>/{model.onnx, meta.json, ...}
+        (`cli.py import-run`); eval needs model.onnx and meta.json side by side."""
+        return self.ml_data_root / "bundles"
 
     @property
     def mlruns_dir(self) -> Path:
