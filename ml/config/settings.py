@@ -27,14 +27,24 @@ class Settings(BaseSettings):
     ml_data_root: Path = REPO_ROOT / "ml_data"
 
     # ---- Source data (raw photos + label snapshots) ----
-    # The canonical capture dump: <id>.jpg + <id>.json sidecar + <id>.task.
-    source_images_dir: Path = REPO_ROOT / "data_fotos" / "Bilder 27-07-26"
-    # Label snapshot v1: the July-27 Label Studio YOLO export (lossy; a full
-    # LS JSON export should replace it as snapshot v2 before test metrics).
+    # Capture dumps: <id>.jpg + <id>.json sidecar + <id>.task. Batch 1 = the
+    # Pi-era captures (Jun 9 – Jul 20), batch 2 = the PC captures (Aug 7 + 17;
+    # the folder is called "labeled 2" but holds unlabeled-format captures).
+    source_images_dirs: list[Path] = [
+        REPO_ROOT / "data_fotos" / "Bilder 27-07-26",
+        REPO_ROOT / "data_fotos" / "labeled 2",
+    ]
+    # Label snapshot v2: the Aug-17 Label Studio YOLO export (superset of the
+    # July-27 v1 export: identical 298 label files + 33 board-B photos).
     snapshot_dir: Path = (
-        REPO_ROOT / "data_fotos" / "project-2-at-2026-07-27-06-28-47dc2d74"
+        REPO_ROOT / "data_fotos" / "project-2-at-2026-08-17-13-14-5747402b"
     )
-    snapshot_id: str = "v1_2026-07-27_yolo"
+    snapshot_id: str = "v2_2026-08-17_yolo"
+    # The gitignored photo audit the committed attributes table is built from.
+    audit_csv: Path = REPO_ROOT / "ml_data" / "audit" / "photo_audit_2026-09-28.csv"
+
+    # ---- Frozen split in use ----
+    split_id: str = "split_v2"
 
     # ---- Determinism ----
     seed: int = 20260806
@@ -55,7 +65,7 @@ class Settings(BaseSettings):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.ml_data_root = self.ml_data_root.expanduser()
-        self.source_images_dir = self.source_images_dir.expanduser()
+        self.source_images_dirs = [p.expanduser() for p in self.source_images_dirs]
         self.snapshot_dir = self.snapshot_dir.expanduser()
         self.ml_data_root.mkdir(parents=True, exist_ok=True)
 
@@ -70,6 +80,15 @@ class Settings(BaseSettings):
     def reports_dir(self) -> Path:
         """Committed dataset card, eval reports, results.csv."""
         return REPO_ROOT / "ml" / "reports"
+
+    @property
+    def attributes_csv(self) -> Path:
+        """Committed, anonymised per-photo attributes (board, pose, content)."""
+        return self.datasets_dir / "photo_attributes_v1.csv"
+
+    @property
+    def eval_dir(self) -> Path:
+        return self.ml_data_root / "eval"
 
     # ---- Derived paths (gitignored side) ----
 

@@ -10,10 +10,18 @@ meta.json (git sha, dataset fingerprint, versions). MLflow never syncs across
 machines; bundles do (Drive), and `python cli.py import-run <bundle>` turns
 one into a local MLflow run.
 
-Locked augmentation policy for 28-px defects (plan): flips both axes, small
-rotations, scale jitter capped at 0.2 (the 0.5 default would shrink 10-px
-boxes to 5), mild HSV (solder color is signal), mosaic with close_mosaic,
-no mixup. Tile duplication (oversample K) already lives in the dataset view.
+Augmentation policy v2 (2026-09-28; augment only against MEASURED nuisance
+variation — see dataprep/tiler.py for the offline part):
+  - orientation: offline D4 per tile (exact on boxes) + online flips here;
+    free-angle `degrees` is OFF — a 10-degree rotation inflates a 28-px box's
+    enclosing box by ~18 %, i.e. it corrupts the labels of tiny defects.
+  - scale jitter capped at 0.2 (fixed camera distance; 0.5 would halve boxes).
+  - HSV: brightness spans 122-177 (mean luma) across sessions, so value/
+    saturation jitter is moderate; hue stays small (solder colour is signal);
+    the large A<->B colour shift is handled by offline colour transfer.
+  - mosaic 1.0 + close_mosaic 10 (mixes board-A and board-B tiles in one
+    image — may weaken the product shortcut; ablation candidate), no mixup.
+  - class balance: repeat-factor sampling lives in the dataset view.
 """
 from __future__ import annotations
 
@@ -30,21 +38,23 @@ from pathlib import Path
 import yaml
 
 from config.settings import settings
-from dataprep.tiler import DATASET_ID
+from dataprep.tiler import load_provenance
 
 logger = logging.getLogger("ml.train")
 
 DEFAULT_AUGMENT = {
     "fliplr": 0.5,
     "flipud": 0.5,
-    "degrees": 10.0,
+    "degrees": 0.0,
     "scale": 0.2,
-    "hsv_h": 0.01,
-    "hsv_s": 0.3,
-    "hsv_v": 0.3,
+    "translate": 0.1,
+    "hsv_h": 0.015,
+    "hsv_s": 0.4,
+    "hsv_v": 0.35,
     "mosaic": 1.0,
     "close_mosaic": 10,
     "mixup": 0.0,
+    "copy_paste": 0.0,
 }
 
 
@@ -63,25 +73,21 @@ def _git_meta() -> dict:
     }
 
 
-def _write_data_yaml(fold: str, out: Path) -> Path:
+def _write_data_yaml(ds_id: str, fold: str, out: Path) -> Path:
     """Runtime data.yaml with absolute paths — survives Colab relocation."""
-    yolo_root = (settings.yolo_dir / DATASET_ID).resolve()
+    yolo_root = (settings.yolo_dir / ds_id).resolve()
     if not yolo_root.exists():
         raise FileNotFoundError(
-            f"{yolo_root} missing — run `python cli.py tile` first (or set "
-            "ML_DATA_ROOT to the unzipped dataset location)"
+            f"{yolo_root} missing — run `python cli.py tile --schema <schema>` first "
+            "(or set ML_DATA_ROOT to the unzipped dataset location)"
         )
+    classes = load_provenance(ds_id)["classes"]
     train = f"images/{fold}_train" if fold != "dev_all" else "images/dev_all_train"
     val = f"images/{fold}_val" if fold != "dev_all" else "images/fold0_val"
     out.write_text(
         "\n".join(
-            [
-                f"path: {yolo_root}",
-                f"train: {train}",
-                f"val: {val}",
-                "names:",
-                "  0: Nicht ausreichend Lot",
-            ]
+            [f"path: {yolo_root}", f"train: {train}", f"val: {val}", "names:"]
+            + [f"  {i}: {c}" for i, c in enumerate(classes)]
         )
         + "\n",
         encoding="utf-8",
@@ -136,7 +142,8 @@ def run(config_path: Path, device: str | None = None) -> Path:
 
     run_root = settings.run_dirs_dir
     run_root.mkdir(parents=True, exist_ok=True)
-    data_yaml = _write_data_yaml(fold, run_root / f"{name}_data.yaml")
+    ds_id = cfg["dataset_id"]
+    data_yaml = _write_data_yaml(ds_id, fold, run_root / f"{name}_data.yaml")
 
     train_kwargs = dict(
         data=str(data_yaml),
@@ -176,12 +183,7 @@ def run(config_path: Path, device: str | None = None) -> Path:
     ).stdout
     (bundle / "pip-freeze.txt").write_text(freeze, encoding="utf-8")
 
-    provenance_path = settings.tiles_dir / DATASET_ID / "provenance.json"
-    provenance = (
-        json.loads(provenance_path.read_text(encoding="utf-8"))
-        if provenance_path.exists()
-        else {}
-    )
+    provenance = load_provenance(ds_id)
     import torch
     import ultralytics
 
@@ -190,11 +192,15 @@ def run(config_path: Path, device: str | None = None) -> Path:
         "framework": "ultralytics",
         "adapter": "ultralytics",
         "fold": fold,
-        "dataset_id": DATASET_ID,
+        "dataset_id": ds_id,
+        "schema": provenance.get("schema"),
+        "classes": provenance.get("classes"),
         "dataset_fingerprint": provenance.get("dataset_fingerprint"),
         "snapshot_id": provenance.get("snapshot_id"),
         "split_id": provenance.get("split_id"),
-        "oversample_k": provenance.get("oversample_k"),
+        "tiler_version": provenance.get("tiler_version"),
+        "augmentation_offline": provenance.get("augmentation"),
+        "augmentation_online": augment,
         "ultralytics_version": ultralytics.__version__,
         "torch_version": torch.__version__,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",

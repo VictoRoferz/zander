@@ -6,8 +6,9 @@ exported ONNX model and serves tiled full-photo detection over HTTP. CPU-only
 by design — no torch/ultralytics anywhere in this service; the inference code
 is shared with the ML toolchain (ml/infer, pure numpy + onnxruntime).
 
-`confidence_threshold` must be set to the t* chosen on the dev folds by the
-evaluation harness (ml/reports/results.csv) — never tuned on test-v1.
+`confidence_threshold` must be set to the frozen t* from
+`python cli.py choose-op` (ml_data/eval/operating_point_*.json, chosen on the
+out-of-fold dev predictions) — never tuned on test.
 """
 from pathlib import Path
 
@@ -30,7 +31,9 @@ class Settings(BaseSettings):
     # MODEL_PATH=/data/models/nal_detector.onnx on the shared DATA_ROOT.
     model_path: Path = REPO_ROOT / "ml_data" / "exports" / "nal_detector.onnx"
     adapter: str = "ultralytics"  # or "deim", matching the winning framework
-    confidence_threshold: float = 0.25  # REPLACE with t* from the eval harness
+    confidence_threshold: float = 0.25  # REPLACE with t* from `cli.py choose-op`
+    # Class order of the exported model (the training schema, ml/dataprep/remap.py).
+    class_names: list[str] = ["Nicht ausreichend Lot", "Brücke", "Fahne"]
     ort_threads: int = 0  # 0 = onnxruntime default
 
     # ---- Optional photo store (capture_id lookups) ----

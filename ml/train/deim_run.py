@@ -26,19 +26,39 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import settings  # noqa: E402
-from dataprep.tiler import DATASET_ID  # noqa: E402
+from dataprep.remap import schema_classes  # noqa: E402
+from dataprep.tiler import dataset_id  # noqa: E402
 
 logger = logging.getLogger("ml.deim")
 
 DEIM_REPO = "https://github.com/ShihuaHuang95/DEIM"
-# Pin before first real run: `git ls-remote https://github.com/ShihuaHuang95/DEIM HEAD`
-DEIM_COMMIT = "PIN_ME_BEFORE_FIRST_RUN"
+# Pinned 2026-09-28 (HEAD of DEIM v1). LICENSE at this commit: Apache-2.0
+# (checked). NOT DEIMv2 — that repo switched to a non-commercial license on
+# 2026-08-24.
+DEIM_COMMIT = "09d35d53d39ee3145a1e61e3a989b28b9468d1dd"
+
+# DEIM's default recipe is tuned for COCO: Mosaic at output_size 320 (halves
+# object size), RandomZoomOut + RandomIoUCrop (rescale), mixup 0.5. For
+# 28-px defects on native-resolution tiles those shrink/blend the signal, so
+# the override mirrors the Ultralytics policy (train/ultralytics_run.py):
+# photometric jitter + flips only; orientation (D4) and colour transfer are
+# already baked into the tiles by the dataset builder.
+TRAIN_OPS = """      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: [4, 64, 120]
+        ops: ['RandomPhotometricDistort']"""
 BASE_CONFIG = "configs/deim_dfine/deim_hgnetv2_s_coco.yml"
 
 
-def prepare_dataset_layout(fold: str, work: Path) -> Path:
+def prepare_dataset_layout(fold: str, work: Path, schema: str) -> Path:
     """COCO layout the DEIM configs expect: images dir + annotation jsons."""
-    tiles = settings.tiles_dir / DATASET_ID
+    tiles = settings.tiles_dir / dataset_id(schema)
     ds = work / "dataset"
     ds.mkdir(parents=True, exist_ok=True)
     if not (ds / "images").exists():
@@ -51,17 +71,21 @@ def prepare_dataset_layout(fold: str, work: Path) -> Path:
     return ds
 
 
-def write_override(fold: str, work: Path, ds: Path, epochs: int) -> Path:
+def write_override(fold: str, work: Path, ds: Path, epochs: int, schema: str) -> Path:
     """Minimal YAML override on top of DEIM's D-FINE-S COCO config."""
     override = work / f"zander_{fold}.yml"
     override.write_text(
         f"""__include__: [../{BASE_CONFIG}]
-num_classes: 1
+num_classes: {len(schema_classes(schema))}
 remap_mscoco_category: False
 train_dataloader:
   dataset:
     img_folder: {ds / 'images'}
     ann_file: {ds / 'train.json'}
+    transforms:
+{TRAIN_OPS}
+  collate_fn:
+    mixup_prob: 0.0
 val_dataloader:
   dataset:
     img_folder: {ds / 'images'}
@@ -74,12 +98,12 @@ output_dir: {work / 'output'}
     return override
 
 
-def run(fold: str, epochs: int, dry_run: bool) -> None:
-    work = settings.run_dirs_dir / f"deim_s_{fold}"
+def run(fold: str, epochs: int, dry_run: bool, schema: str = "def3") -> None:
+    work = settings.run_dirs_dir / f"deim_s_{schema}_{fold}"
     work.mkdir(parents=True, exist_ok=True)
     repo = work / "DEIM"
-    ds = prepare_dataset_layout(fold, work)
-    override = write_override(fold, work, ds, epochs)
+    ds = prepare_dataset_layout(fold, work, schema)
+    override = write_override(fold, work, ds, epochs, schema)
 
     steps = [
         ["git", "clone", DEIM_REPO, str(repo)],
@@ -103,8 +127,6 @@ def run(fold: str, epochs: int, dry_run: bool) -> None:
             "`python cli.py import-run`; evaluate with adapter 'deim'."
         )
         return
-    if DEIM_COMMIT == "PIN_ME_BEFORE_FIRST_RUN":
-        raise RuntimeError("pin DEIM_COMMIT before running for real")
     for s in steps:
         logger.info("$ " + " ".join(s))
         subprocess.run(s, check=True)
@@ -116,7 +138,8 @@ def run(fold: str, epochs: int, dry_run: bool) -> None:
                 "fold": fold,
                 "deim_repo": DEIM_REPO,
                 "deim_commit": DEIM_COMMIT,
-                "dataset_id": DATASET_ID,
+                "dataset_id": dataset_id(schema),
+                "schema": schema,
             },
             indent=1,
         ),
@@ -127,8 +150,9 @@ def run(fold: str, epochs: int, dry_run: bool) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fold", default="fold0")
+    parser.add_argument("--schema", default="def3", choices=["def3", "nal1"])
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level="INFO")
-    run(args.fold, args.epochs, args.dry_run)
+    run(args.fold, args.epochs, args.dry_run, schema=args.schema)

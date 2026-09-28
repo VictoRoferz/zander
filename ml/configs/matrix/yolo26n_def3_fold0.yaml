@@ -1,0 +1,11 @@
+# Phase-1 matrix (split_v2, 3 classes) — same frozen data, same photo-level
+# scorer for every candidate. Online augmentation: train/ultralytics_run.py.
+name: yolo26n_def3_fold0
+model: yolo26n.pt
+adapter: ultralytics
+dataset_id: ds_v2_def3
+fold: fold0
+epochs: 120
+imgsz: 640
+batch: 16
+seed: 20260806

@@ -84,7 +84,7 @@ def import_run(bundle_path: Path) -> str | None:
         _flatten("", config, params)
         for key in (
             "fold", "dataset_id", "dataset_fingerprint", "snapshot_id",
-            "split_id", "oversample_k", "framework", "git_sha", "git_dirty",
+            "split_id", "schema", "tiler_version", "framework", "git_sha", "git_dirty",
             "gpu", "ultralytics_version", "torch_version",
         ):
             if key in meta and meta[key] is not None:

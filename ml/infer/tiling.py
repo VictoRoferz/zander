@@ -19,10 +19,19 @@ every tile cache and metric comparison):
 
 Canonical box format everywhere: pixel [x1, y1, x2, y2] floats in the parent
 image's coordinate system; rounding only happens at final file write.
+
+TILER v2 (2026-09-28): same grid; adds the dihedral (D4) tile transforms used
+by the dataset builder for offline augmentation. Element k in 0..7 is
+  k = r + 4*f  ->  T_k(img) = rot90_ccw^r( flip_lr^f(img) )
+matching numpy (`np.rot90(np.fliplr(a) if f else a, r)`) and PIL
+(`FLIP_LEFT_RIGHT` then `ROTATE_90/180/270`, all counter-clockwise). Axis-
+aligned boxes stay exactly axis-aligned under D4 (no box inflation, unlike a
+free-angle rotation). Inference never transforms tiles — only training data.
 """
 from __future__ import annotations
 
-TILER_VERSION = "v1"
+TILER_VERSION = "v2"
+D4_ELEMENTS = tuple(range(8))
 TILE_SIZE = 640
 STRIDE = 512
 MIN_VISIBILITY = 0.2
@@ -88,6 +97,49 @@ def clip_box_to_tile(
     if w < min_side or h < min_side:
         return None
     return (cx1 - ox, cy1 - oy, cx2 - ox, cy2 - oy)
+
+
+def box_visibility(
+    box: tuple[float, float, float, float], origin: tuple[int, int], tile: int = TILE_SIZE
+) -> float:
+    """Visible fraction (0..1) of a photo-coordinate box inside one tile."""
+    x1, y1, x2, y2 = box
+    ox, oy = origin
+    w = min(x2, ox + tile) - max(x1, ox)
+    h = min(y2, oy + tile) - max(y1, oy)
+    if w <= 0 or h <= 0:
+        return 0.0
+    return (w * h) / max((x2 - x1) * (y2 - y1), 1e-9)
+
+
+def d4_box(
+    box: tuple[float, float, float, float], k: int, size: int = TILE_SIZE
+) -> tuple[float, float, float, float]:
+    """Apply D4 element k to a tile-coordinate xyxy box (square tile of `size`)."""
+    if k not in D4_ELEMENTS:
+        raise ValueError(f"D4 element must be 0..7, got {k}")
+    r, f = k % 4, k // 4
+    x1, y1, x2, y2 = box
+    if f:  # flip left-right: x -> S - x
+        x1, x2 = size - x2, size - x1
+    for _ in range(r):  # rot90 ccw: (x, y) -> (y, S - x)
+        x1, y1, x2, y2 = y1, size - x2, y2, size - x1
+    return (x1, y1, x2, y2)
+
+
+def d4_image(img, k: int):
+    """Apply D4 element k to a PIL image (same convention as d4_box)."""
+    from PIL import Image
+
+    r, f = k % 4, k // 4
+    if f:
+        img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    if r:
+        img = img.transpose(
+            {1: Image.Transpose.ROTATE_90, 2: Image.Transpose.ROTATE_180,
+             3: Image.Transpose.ROTATE_270}[r]
+        )
+    return img
 
 
 def tile_to_photo(

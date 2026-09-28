@@ -16,8 +16,13 @@ False positives at the operating point that overlap a known other-defect
 region (IoU >= 0.1 with other_gt) are tagged separately — the model firing on
 a real-but-out-of-scope defect is a different failure than a phantom call.
 
-Bootstrap CIs resample PHOTOS (the independent unit) and re-derive the
-operating point per resample.
+Bootstrap CIs re-derive the operating point per resample. By default they
+resample PHOTOS; pass `cluster_ids` (the split_v2 group of each photo) to
+resample whole board GROUPS instead — re-shots of one board are not
+independent, and photo resampling would understate the uncertainty.
+
+v2: this module stays single-class; eval/photo_scorer.py calls it once per
+class (and once class-agnostically) on class-filtered records.
 """
 from __future__ import annotations
 
@@ -156,7 +161,21 @@ def _box_side(b) -> float:
     return math.sqrt(max((b[2] - b[0]) * (b[3] - b[1]), 0.0))
 
 
-def score_photos(photos, iou_op=IOU_OPERATING, seed=0) -> dict:
+def cluster_resample(n_items: int, cluster_ids, rng) -> list[int]:
+    """Indices of one bootstrap resample: whole clusters (or items) with replacement."""
+    if cluster_ids is None:
+        return [rng.randrange(n_items) for _ in range(n_items)]
+    members: dict = {}
+    for i, c in enumerate(cluster_ids):
+        members.setdefault(c, []).append(i)
+    keys = sorted(members)
+    out: list[int] = []
+    for _ in keys:
+        out.extend(members[keys[rng.randrange(len(keys))]])
+    return out
+
+
+def score_photos(photos, iou_op=IOU_OPERATING, seed=0, cluster_ids=None) -> dict:
     points, n_gt = _froc_points(photos, iou_op)
     froc = {}
     for target in FPPI_TARGETS:
@@ -193,13 +212,13 @@ def score_photos(photos, iou_op=IOU_OPERATING, seed=0) -> dict:
             if any(iou(box, og) >= 0.1 for og in p.get("other_gt", [])):
                 fp_other += 1
 
-    # ---- bootstrap CI on the operating recall (resample photos; the
-    # per-photo match stats are computed once and reused) ----
+    # ---- bootstrap CI on the operating recall (resample photos or board
+    # groups; the per-photo match stats are computed once and reused) ----
     rng = random.Random(seed)
     stats = _photo_stats(photos, iou_op)
     boot = []
     for _ in range(BOOTSTRAP_N):
-        sample = [stats[rng.randrange(len(stats))] for _ in stats]
+        sample = [stats[i] for i in cluster_resample(len(stats), cluster_ids, rng)]
         pts, sample_gt = _froc_from_stats(sample)
         if sample_gt == 0:
             continue
@@ -223,6 +242,7 @@ def score_photos(photos, iou_op=IOU_OPERATING, seed=0) -> dict:
         "fppi_operating": FPPI_OPERATING,
         "recall_at_op": round(op_recall, 4),
         "recall_ci95": [round(ci[0], 4), round(ci[1], 4)],
+        "ci_unit": "group" if cluster_ids is not None else "photo",
         "threshold_at_op": op_t,
         "froc": froc,
         "ap50": round(ap50, 4),

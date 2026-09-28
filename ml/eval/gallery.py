@@ -1,6 +1,10 @@
 """
-Single-file HTML error gallery: FN and FP crops with context, base64-embedded
-(the repo gitignores *.jpg/*.png, so reports must be self-contained files).
+Single-file HTML error gallery: crops with context per error section, base64-
+embedded (the repo gitignores *.jpg/*.png, so reports must be self-contained).
+
+v2: sections are passed in by the caller (missed defects, wrong class, false
+positives) and every item carries its own caption, so class information
+(GT vs predicted) is shown on each crop.
 """
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ from PIL import Image, ImageDraw
 
 CONTEXT_PX = 140
 MAX_ITEMS_PER_SECTION = 60
+COLOURS = ["#e53935", "#8e24aa", "#fb8c00", "#1e88e5"]
 
 
 def _crop_b64(photo: Image.Image, box, color: str) -> str:
@@ -21,9 +26,7 @@ def _crop_b64(photo: Image.Image, box, color: str) -> str:
     cx2, cy2 = min(w, int(x2) + CONTEXT_PX), min(h, int(y2) + CONTEXT_PX)
     crop = photo.crop((cx1, cy1, cx2, cy2)).convert("RGB")
     draw = ImageDraw.Draw(crop)
-    draw.rectangle(
-        [x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], outline=color, width=3
-    )
+    draw.rectangle([x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], outline=color, width=3)
     buf = io.BytesIO()
     crop.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()
@@ -31,38 +34,29 @@ def _crop_b64(photo: Image.Image, box, color: str) -> str:
 
 def write_gallery(
     out_path: Path,
-    source_dir: Path,
-    fn_items: list[dict],  # {capture_id, box}
-    fp_items: list[dict],  # {capture_id, box, score, other_defect: bool}
+    photo_paths: dict[str, Path],  # capture_id -> jpg
+    sections: dict[str, list[dict]],  # title -> [{capture_id, box, label}]
     title: str,
 ) -> Path:
-    def section(name: str, items: list[str]) -> str:
-        body = "\n".join(items) if items else "<p><em>none 🎉</em></p>"
-        return f"<h2>{name} ({len(items)})</h2>\n<div class='grid'>{body}</div>"
-
     photo_cache: dict[str, Image.Image] = {}
 
     def photo(cid: str) -> Image.Image:
         if cid not in photo_cache:
-            photo_cache[cid] = Image.open(source_dir / f"{cid}.jpg").convert("RGB")
+            photo_cache[cid] = Image.open(photo_paths[cid]).convert("RGB")
         return photo_cache[cid]
 
-    fn_cards = []
-    for item in fn_items[:MAX_ITEMS_PER_SECTION]:
-        b64 = _crop_b64(photo(item["capture_id"]), item["box"], "#e53935")
-        fn_cards.append(
-            f"<figure><img src='data:image/jpeg;base64,{b64}'>"
-            f"<figcaption>FN · {item['capture_id'][:8]}</figcaption></figure>"
-        )
-    fp_cards = []
-    for item in fp_items[:MAX_ITEMS_PER_SECTION]:
-        tag = " · other-defect" if item.get("other_defect") else ""
-        b64 = _crop_b64(photo(item["capture_id"]), item["box"], "#fb8c00")
-        fp_cards.append(
-            f"<figure><img src='data:image/jpeg;base64,{b64}'>"
-            f"<figcaption>FP {item['score']:.2f}{tag} · "
-            f"{item['capture_id'][:8]}</figcaption></figure>"
-        )
+    parts = []
+    for n, (name, items) in enumerate(sections.items()):
+        cards = []
+        for item in items[:MAX_ITEMS_PER_SECTION]:
+            b64 = _crop_b64(photo(item["capture_id"]), item["box"], COLOURS[n % len(COLOURS)])
+            cards.append(
+                f"<figure><img src='data:image/jpeg;base64,{b64}'>"
+                f"<figcaption>{item['label']} · {item['capture_id'][:8]}</figcaption></figure>"
+            )
+        body = "\n".join(cards) if cards else "<p><em>none</em></p>"
+        more = f" — first {MAX_ITEMS_PER_SECTION} shown" if len(items) > MAX_ITEMS_PER_SECTION else ""
+        parts.append(f"<h2>{name} ({len(items)}{more})</h2>\n<div class='grid'>{body}</div>")
 
     html = f"""<!doctype html><meta charset="utf-8"><title>{title}</title>
 <style>
@@ -73,8 +67,7 @@ def write_gallery(
  figcaption {{ font-size: 12px; color: #555; padding-top: 3px; }}
 </style>
 <h1>{title}</h1>
-{section("False negatives (missed defects)", fn_cards)}
-{section("False positives at operating point", fp_cards)}
+{''.join(parts)}
 """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")

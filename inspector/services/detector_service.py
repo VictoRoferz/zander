@@ -26,6 +26,7 @@ for candidate in (_here.parents[2] / "ml", _here.parents[1] / "ml"):
         break
 
 from infer.pipeline import TiledDetector  # noqa: E402
+from infer.verdict import photo_verdict  # noqa: E402
 
 logger = logging.getLogger("inspector.detector")
 
@@ -63,21 +64,28 @@ class DetectorService:
 
     def inspect_array(self, photo_rgb: np.ndarray) -> dict:
         assert self._detector is not None
-        boxes, scores, ms = self._detector.detect(photo_rgb)
+        det = self._detector.detect(photo_rgb)
+        # The same decision function the evaluation harness scores.
+        decision = photo_verdict(
+            det.boxes, det.scores, det.labels,
+            threshold=settings.confidence_threshold, class_names=settings.class_names,
+        )
         return {
+            "verdict": decision["verdict"],
+            "classes": decision["classes"],
             "detections": [
                 {
-                    "x1": round(b[0], 1),
-                    "y1": round(b[1], 1),
-                    "x2": round(b[2], 1),
-                    "y2": round(b[3], 1),
-                    "score": round(s, 4),
-                    "label": "Nicht ausreichend Lot",
+                    "x1": d["box"][0],
+                    "y1": d["box"][1],
+                    "x2": d["box"][2],
+                    "y2": d["box"][3],
+                    "score": d["score"],
+                    "label": d["class"],
                 }
-                for b, s in zip(boxes, scores)
+                for d in decision["defects"]
             ],
-            "count": len(boxes),
-            "latency_ms": round(ms, 1),
+            "count": len(decision["defects"]),
+            "latency_ms": round(det.elapsed_ms, 1),
             "model_version": f"{settings.model_path.name}@{self.model_sha8}",
             "tiler_version": self._detector.tiler_version,
             "confidence_threshold": settings.confidence_threshold,

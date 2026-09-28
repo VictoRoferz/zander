@@ -8,7 +8,10 @@ threshold sweep — is shared code in pipeline.py/stitch.py and identical for
 every model. No per-model post-processing tuning.
 
 Both adapters take an RGB uint8 tile of exactly (TILE_SIZE, TILE_SIZE) — the
-tiler guarantees this, so there is no resizing/letterboxing anywhere.
+tiler guarantees this, so there is no resizing/letterboxing anywhere — and
+return (boxes xyxy, scores, labels) with labels = the model's class index
+(schema order, dataprep/remap.py). A single-class model returns all-zero
+labels, so NAL-only models flow through the same code.
 
 A 5-image ONNX-vs-native parity check must pass once per framework before any
 benchmark row is trusted (see eval/run_eval.py --help).
@@ -42,6 +45,15 @@ class UltralyticsAdapter:
     def __init__(self, model_path: str, threads: int = 0):
         self.sess = _session(model_path, threads)
         self.input_name = self.sess.get_inputs()[0].name
+        # Raw export (1, 4+nc, N): the class count is static -> sanity check
+        # against the evaluation schema. Unknown for end-to-end exports.
+        shape = self.sess.get_outputs()[0].shape
+        self.num_classes = (
+            shape[1] - 4
+            if len(shape) == 3 and isinstance(shape[1], int) and isinstance(shape[2], int)
+            and shape[1] < shape[2] and shape[2] != 6
+            else None
+        )
 
     def preprocess(self, tile_rgb: np.ndarray) -> dict:
         x = tile_rgb.astype(np.float32) / 255.0
@@ -55,17 +67,22 @@ class UltralyticsAdapter:
         if out.shape[2] == 6:  # end-to-end export: rows [xyxy, score, cls]
             rows = out[0]
             keep = rows[:, 4] >= conf_floor
-            return rows[keep, :4].copy(), rows[keep, 4].copy()
+            return (
+                rows[keep, :4].copy(), rows[keep, 4].copy(),
+                rows[keep, 5].astype(np.int64),
+            )
         if out.shape[1] < out.shape[2]:  # (1, 4+nc, N) -> (N, 4+nc)
             rows = out[0].T
         else:
             rows = out[0]
-        scores = rows[:, 4:].max(axis=1)
+        cls_scores = rows[:, 4:]
+        labels = cls_scores.argmax(axis=1)
+        scores = cls_scores.max(axis=1)
         keep = scores >= conf_floor
-        rows, scores = rows[keep], scores[keep]
+        rows, scores, labels = rows[keep], scores[keep], labels[keep]
         cx, cy, w, h = rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3]
         boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
-        return boxes, scores
+        return boxes, scores, labels.astype(np.int64)
 
     def run(self, tile_rgb: np.ndarray, conf_floor: float):
         outputs = self.sess.run(None, self.preprocess(tile_rgb))
@@ -95,21 +112,25 @@ class DeimAdapter:
         if self.size_input:
             feed[self.size_input] = np.array([[w, h]], dtype=np.int64)
         outputs = self.sess.run(None, feed)
-        # Identify (labels, boxes, scores) by shape, robust to output order.
-        boxes = scores = None
+        # Identify (labels, boxes, scores) by shape/dtype, robust to output order.
+        boxes = scores = labels = None
         for out in outputs:
             arr = out[0] if out.ndim == 3 or out.ndim == 2 else out
             if arr.ndim == 2 and arr.shape[1] == 4:
                 boxes = arr
             elif arr.ndim == 1 and arr.dtype in (np.float32, np.float64):
                 scores = arr
+            elif arr.ndim == 1 and np.issubdtype(arr.dtype, np.integer):
+                labels = arr
         if boxes is None or scores is None:
             raise ValueError(
                 f"could not identify DEIM outputs from shapes "
                 f"{[o.shape for o in outputs]}"
             )
+        if labels is None:
+            labels = np.zeros(len(scores), dtype=np.int64)
         keep = scores >= conf_floor
-        return boxes[keep].copy(), scores[keep].copy()
+        return boxes[keep].copy(), scores[keep].copy(), labels[keep].astype(np.int64)
 
 
 ADAPTERS = {"ultralytics": UltralyticsAdapter, "deim": DeimAdapter}

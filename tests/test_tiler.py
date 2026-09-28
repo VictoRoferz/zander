@@ -3,7 +3,8 @@ Unit tests for the pinned tile geometry + cross-tile merge (ml/infer).
 
 The tiler is the single most correctness-critical code in the ML toolchain:
 dataset GT, evaluation and the inspector all share it. These tests pin the
-exact TILER v1 contract from the plan.
+exact TILER contract (v1 grid, v2 D4 transforms) and — when the dataset has
+been built locally — the invariants of the ds_v2 training views.
 
 Run (no pytest needed):  python tests/test_tiler.py
 """
@@ -117,6 +118,116 @@ def test_merge_duplicate_from_overlap_region():
     b = (1540.4, 700.2, 1568.5, 728.6)
     boxes, scores = merge_detections([a, b], [0.85, 0.83])
     assert len(boxes) == 1
+
+
+
+# ---------------------------------------------------------------- TILER v2
+
+
+def _inverse(k):
+    r, f = k % 4, k // 4
+    return k if f else (4 - r) % 4
+
+
+def test_d4_box_matches_image_transform_for_all_8_elements():
+    import numpy as np
+    from PIL import Image
+
+    from infer.tiling import d4_box, d4_image
+
+    size = 64
+    a = np.zeros((size, size), np.uint8)
+    a[5:12, 20:40] = 255  # box x 20..40, y 5..12
+    for k in range(8):
+        b = np.asarray(d4_image(Image.fromarray(a), k))
+        ref = np.rot90(np.fliplr(a) if k // 4 else a, k % 4)
+        assert (b == ref).all(), f"PIL vs numpy convention differs at k={k}"
+        ys, xs = np.nonzero(b)
+        got = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+        assert got == tuple(int(v) for v in d4_box((20, 5, 40, 12), k, size)), k
+
+
+def test_d4_round_trip_and_area_preserved():
+    from infer.tiling import d4_box
+
+    box = (100.5, 30.25, 128.0, 71.0)
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    for k in range(8):
+        t = d4_box(box, k)
+        assert abs((t[2] - t[0]) * (t[3] - t[1]) - area) < 1e-9  # no box inflation
+        back = d4_box(t, _inverse(k))
+        assert all(abs(u - v) < 1e-9 for u, v in zip(back, box)), k
+
+
+def test_box_visibility():
+    from infer.tiling import box_visibility
+
+    assert box_visibility((10, 10, 40, 40), (0, 0)) == 1.0
+    assert box_visibility((630, 10, 650, 30), (0, 0)) == 0.5
+    assert box_visibility((700, 10, 720, 30), (0, 0)) == 0.0
+
+
+def _built(schema):
+    from config.settings import settings
+    from dataprep.tiler import dataset_id
+
+    d = settings.tiles_dir / dataset_id(schema)
+    return d if (d / "provenance.json").exists() else None
+
+
+def test_training_views_invariants():
+    import json
+
+    from dataprep.ingest import load_manifest, usable
+    from dataprep.split import load_split
+
+    manifest, split = load_manifest(), load_split()
+    by_id = {e["capture_id"]: e for e in manifest["entries"]}
+    probe_ids = {p["capture_id"] for p in split["probe_boxes"]}
+    checked = 0
+    for schema in ("def3", "nal1"):
+        d = _built(schema)
+        if d is None:
+            continue
+        prov = json.loads((d / "provenance.json").read_text(encoding="utf-8"))
+        for view in ("fold0_train", "fold1_train", "fold2_train", "dev_all_train"):
+            coco = json.loads((d / "coco" / f"{view}.json").read_text(encoding="utf-8"))
+            assert [c["name"] for c in coco["categories"]] == prov["classes"]
+            held_out = {"test"} | ({f"fold{view[4]}"} if view != "dev_all_train" else set())
+            for im in coco["images"]:
+                e = by_id[im["capture_id"]]
+                assert usable(e), f"{view}: unusable capture {e['capture_id']}"
+                assert im["bucket"] not in held_out, f"{view}: leaked {im['bucket']} tile"
+            v = prov["views"][view]
+            assert abs(v["positive_share"] - 0.30) < 0.02, (view, v["positive_share"])
+            parity = max(abs(a - b) for a, b in zip(v["orientation_pos"], v["orientation_neg"]))
+            assert parity < 0.06, f"{view}: orientation leaks label info ({parity:.3f})"
+            if schema == "def3":
+                # no training tile may show a probe box (board-A Brücke/Fahne)
+                from infer.tiling import TILE_SIZE, box_visibility
+
+                probe = {}
+                for p in split["probe_boxes"]:
+                    probe.setdefault(p["capture_id"], []).append(p["box"])
+                for im in coco["images"]:
+                    for b in probe.get(im["capture_id"], []):
+                        assert box_visibility(b, tuple(im["origin"]), TILE_SIZE) == 0.0
+            checked += 1
+        for im in json.loads((d / "coco" / "fold0_val.json").read_text(encoding="utf-8"))["images"]:
+            assert im["ct_target"] is None, "validation tiles must not be recoloured"
+    if not checked:
+        print("  (skipped: no ds_v2 dataset built locally)")
+
+
+def test_view_building_is_deterministic():
+    if _built("nal1") is None:
+        print("  (skipped: no ds_v2 dataset built locally)")
+        return
+    from dataprep.tiler import build_views
+
+    _, p1, _ = build_views("nal1")
+    _, p2, _ = build_views("nal1")
+    assert p1["dataset_fingerprint"] == p2["dataset_fingerprint"]
 
 
 if __name__ == "__main__":

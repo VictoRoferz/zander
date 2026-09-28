@@ -1,49 +1,57 @@
 """
-Ingest: raw capture dump + label snapshot -> the committed manifest.
+Ingest: raw capture dumps + label snapshot + photo attributes -> the committed
+manifest (ml/datasets/manifest.json), the single source of truth for every
+downstream step. One entry per photo:
 
-The manifest (ml/datasets/manifest.json) is the single source of truth for
-every downstream step. One entry per photo:
+  capture_id, captured_at, session, image_path (repo-relative, POSIX),
+  width/height, source, brightness, ls_task_id, sha256_ok,
+  board (A|A2|B), pose (seated|handheld), lighting, content,   # attributes table
+  label_state  in {annotated, unannotated, review},
+  verdict      "NiO" (>= 1 box) | "iO" (annotated, no box) | None,
+  classes_present  sorted class names with >= 1 box,
+  boxes        [[class_name, [x1,y1,x2,y2]], ...]  pixel floats, photo coords,
+  quarantine_reason (None = usable), review_note
 
-  capture_id, captured_at, session, width/height, source, brightness,
-  ls_task_id, sha256_ok,
-  label_state  in {annotated_positive, annotated_negative, unannotated},
-  quarantine_reason (None = usable), review_note,
-  nal_boxes    [[x1,y1,x2,y2], ...]  pixel floats, photo coords,
-  other_boxes  [[class_name, [x1,y1,x2,y2]], ...]  dropped Brücke/Fahne
+Class schemas (dataprep/remap.py) are applied later, per training view — the
+manifest itself is schema-free.
 
-Label semantics (critical): an image is a NEGATIVE only if an annotator
-submitted it (a label file exists, possibly empty). The 183 images without a
-label file are UNANNOTATED — they are excluded from training/eval, never fed
-as implicit negatives.
+Label semantics (critical): a photo is a NEGATIVE only if an annotator
+submitted it (a label file exists, possibly empty). Photos without a label
+file are UNANNOTATED — excluded from training/eval, never implicit negatives.
+Photos on the review list (contradictory labels) are excluded as well.
 
-Gates: hard-verified counts from the 2026-08-06 dataset analysis. A new label
-snapshot that changes them must be a conscious re-baseline (--no-gates once,
-then update EXPECTED).
+Gates: hard-verified counts of the RAW snapshot (pre-quarantine, pre-review).
+A new snapshot that changes them must be a conscious re-baseline (--no-gates
+once, then update EXPECTED).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 
 from PIL import Image
 
-from config.settings import settings
-from dataprep.quarantine import REVIEW_NOTES, quarantine_reason
-from dataprep.remap import split_boxes
+from config.settings import REPO_ROOT, settings
+from dataprep.attributes import load_attributes
+from dataprep.quarantine import BOX_NOTES, REVIEW, quarantine_reason
+from dataprep.remap import check_class
 from infer.tiling import yolo_to_xyxy
 
 logger = logging.getLogger("ml.ingest")
 
-# Verified against snapshot v1 (July-27 YOLO export) on 2026-08-06.
+# Verified against snapshot v2 (Aug-17 YOLO export) on 2026-09-28.
 EXPECTED = {
-    "total": 481,
-    "annotated": 298,
-    "annotated_positive": 99,
-    "nal_boxes": 263,
-    "annotated_negative": 199,  # 194 empty label files + 5 Brücke/Fahne-only
-    "unannotated": 183,
+    "total": 566,
+    "label_files": 331,
+    "with_boxes": 136,
+    "empty": 195,
+    "unannotated": 235,
+    "boxes_Nicht ausreichend Lot": 263,
+    "boxes_Brücke": 522,
+    "boxes_Fahne": 191,
 }
 
 
@@ -90,22 +98,47 @@ def load_yolo_snapshot(
     return labels, classes
 
 
+def _collect_photos(dirs: list[Path]) -> dict[str, Path]:
+    """capture_id -> jpg path across all source dirs; duplicates are an error."""
+    photos: dict[str, Path] = {}
+    for d in dirs:
+        if not d.is_dir():
+            raise FileNotFoundError(f"source images dir not found: {d}")
+        for jpg in sorted(d.glob("*.jpg")):
+            if jpg.stem in photos:
+                raise ValueError(
+                    f"capture {jpg.stem} exists in two source dirs: "
+                    f"{photos[jpg.stem].parent} and {d}"
+                )
+            photos[jpg.stem] = jpg
+    return photos
+
+
 def build_manifest(verify_sha: bool = True) -> dict:
-    src = settings.source_images_dir
-    if not src.is_dir():
-        raise FileNotFoundError(f"source images dir not found: {src}")
+    photos = _collect_photos(settings.source_images_dirs)
+    attributes = load_attributes()
     snapshot_labels, snapshot_classes = load_yolo_snapshot(settings.snapshot_dir)
     logger.info(
         f"snapshot {settings.snapshot_id}: {len(snapshot_labels)} label files, "
-        f"classes={snapshot_classes}"
+        f"classes={snapshot_classes}; {len(photos)} photos in "
+        f"{len(settings.source_images_dirs)} dirs"
     )
+    orphan_labels = set(snapshot_labels) - set(photos)
+    if orphan_labels:
+        raise ValueError(f"label files without a photo: {sorted(orphan_labels)[:5]}…")
+    missing_attr = set(photos) - set(attributes)
+    if missing_attr:
+        raise ValueError(
+            f"{len(missing_attr)} photos have no row in {settings.attributes_csv.name} "
+            f"(e.g. {sorted(missing_attr)[:3]}) — audit the new captures first"
+        )
 
     entries = []
-    for jpg in sorted(src.glob("*.jpg")):
-        capture_id = jpg.stem
-        sidecar = json.loads((src / f"{capture_id}.json").read_text(encoding="utf-8"))
-        task_file = src / f"{capture_id}.task"
+    for capture_id, jpg in sorted(photos.items()):
+        sidecar = json.loads(jpg.with_suffix(".json").read_text(encoding="utf-8"))
+        task_file = jpg.with_suffix(".task")
         ls_task_id = int(task_file.read_text().strip()) if task_file.exists() else None
+        attr = attributes[capture_id]
 
         sha_ok = True
         if verify_sha:
@@ -118,61 +151,83 @@ def build_manifest(verify_sha: bool = True) -> dict:
 
         raw = snapshot_labels.get(capture_id)
         if raw is None:
-            label_state = "unannotated"
-            nal_boxes: list = []
-            other_boxes: list = []
+            label_state, boxes = "unannotated", []
         else:
-            named = [
-                (snapshot_classes[cid], yolo_to_xyxy(ybox, width, height))
+            boxes = [
+                [
+                    check_class(snapshot_classes[cid]),
+                    [round(v, 2) for v in yolo_to_xyxy(ybox, width, height)],
+                ]
                 for cid, ybox in raw
             ]
-            nal, other = split_boxes(named)
-            nal_boxes = [[round(v, 2) for v in b] for b in nal]
-            other_boxes = [[name, [round(v, 2) for v in b]] for name, b in other]
-            label_state = "annotated_positive" if nal_boxes else "annotated_negative"
-
+            label_state = "review" if capture_id in REVIEW else "annotated"
+        classes_present = sorted({name for name, _ in boxes})
+        verdict = (
+            ("NiO" if boxes else "iO") if label_state == "annotated" else None
+        )
+        source = sidecar.get("source", "unknown")
         entries.append(
             {
                 "capture_id": capture_id,
                 "captured_at": sidecar["captured_at"],
                 "session": sidecar["captured_at"][:10],
+                "image_path": jpg.relative_to(REPO_ROOT).as_posix(),
                 "width": width,
                 "height": height,
-                "source": sidecar.get("source", "unknown"),
+                "source": source,
                 "brightness": round(brightness, 1),
                 "ls_task_id": ls_task_id,
                 "sha256_ok": sha_ok,
+                "board": attr["board"],
+                "pose": attr["pose"],
+                "lighting": attr["lighting"],
+                "content": attr["content"],
                 "label_state": label_state,
+                "verdict": verdict,
+                "classes_present": classes_present,
+                "boxes": boxes,
                 "quarantine_reason": quarantine_reason(
-                    sidecar.get("source", "unknown"), brightness
+                    source, brightness, attr["content"]
                 ),
-                "review_note": REVIEW_NOTES.get(capture_id),
-                "nal_boxes": nal_boxes,
-                "other_boxes": other_boxes,
+                "review_note": REVIEW.get(capture_id) or BOX_NOTES.get(capture_id),
             }
         )
 
-    manifest = {
+    return {
+        "manifest_version": 2,
         "snapshot_id": settings.snapshot_id,
-        "source_images_dir": str(src),
-        "train_classes": ["Nicht ausreichend Lot"],
+        "source_images_dirs": [
+            p.relative_to(REPO_ROOT).as_posix() for p in settings.source_images_dirs
+        ],
+        "box_classes": sorted({n for e in entries for n, _ in e["boxes"]}),
         "entries": entries,
     }
-    return manifest
 
 
 def check_gates(manifest: dict) -> dict:
-    """Label-stat gates (computed pre-quarantine, matching the raw analysis)."""
+    """Raw-snapshot gates (pre-quarantine, pre-review), matching the export."""
     e = manifest["entries"]
+    labeled = [x for x in e if x["label_state"] != "unannotated"]
     got = {
         "total": len(e),
-        "annotated": sum(1 for x in e if x["label_state"] != "unannotated"),
-        "annotated_positive": sum(1 for x in e if x["label_state"] == "annotated_positive"),
-        "nal_boxes": sum(len(x["nal_boxes"]) for x in e),
-        "annotated_negative": sum(1 for x in e if x["label_state"] == "annotated_negative"),
-        "unannotated": sum(1 for x in e if x["label_state"] == "unannotated"),
+        "label_files": len(labeled),
+        "with_boxes": sum(1 for x in labeled if x["boxes"]),
+        "empty": sum(1 for x in labeled if not x["boxes"]),
+        "unannotated": len(e) - len(labeled),
     }
+    per_class = Counter(n for x in e for n, _ in x["boxes"])
+    for name in ("Nicht ausreichend Lot", "Brücke", "Fahne"):
+        got[f"boxes_{name}"] = per_class.get(name, 0)
     return got
+
+
+def usable(entry: dict) -> bool:
+    """Train/eval eligible: not quarantined, annotated, not on the review list."""
+    return entry["quarantine_reason"] is None and entry["label_state"] == "annotated"
+
+
+def photo_path(entry: dict) -> Path:
+    return REPO_ROOT / entry["image_path"]
 
 
 def run(verify_sha: bool = True, enforce_gates: bool = True) -> Path:
@@ -180,17 +235,24 @@ def run(verify_sha: bool = True, enforce_gates: bool = True) -> Path:
     got = check_gates(manifest)
     ok = got == EXPECTED
     for key in EXPECTED:
-        marker = "ok" if got[key] == EXPECTED[key] else f"EXPECTED {EXPECTED[key]}"
+        marker = "ok" if got[key] == EXPECTED.get(key) else f"EXPECTED {EXPECTED.get(key)}"
         logger.info(f"gate {key}: {got[key]} ({marker})")
 
-    quarantined = [x for x in manifest["entries"] if x["quarantine_reason"]]
-    q_annotated = [x for x in quarantined if x["label_state"] != "unannotated"]
+    entries = manifest["entries"]
+    quarantined = [x for x in entries if x["quarantine_reason"]]
+    q_labeled = [x for x in quarantined if x["label_state"] != "unannotated"]
     logger.info(
-        f"quarantined: {len(quarantined)} "
-        f"(of which annotated: {len(q_annotated)} "
-        f"{[x['capture_id'][:8] for x in q_annotated]})"
+        f"quarantined: {len(quarantined)} (of which labeled: {len(q_labeled)} "
+        f"{[x['capture_id'][:8] for x in q_labeled]})"
     )
-    bad_sha = [x["capture_id"] for x in manifest["entries"] if not x["sha256_ok"]]
+    for x in entries:
+        if x["label_state"] == "review":
+            logger.info(f"review (excluded): {x['capture_id'][:8]} — {x['review_note']}")
+    n_usable = sum(1 for x in entries if usable(x))
+    verdicts = Counter(x["verdict"] for x in entries if usable(x))
+    logger.info(f"usable for train/eval: {n_usable} photos {dict(verdicts)}")
+
+    bad_sha = [x["capture_id"] for x in entries if not x["sha256_ok"]]
     if bad_sha:
         raise RuntimeError(f"sha256 mismatches — fix the copies first: {bad_sha}")
     if enforce_gates and not ok:
@@ -205,7 +267,7 @@ def run(verify_sha: bool = True, enforce_gates: bool = True) -> Path:
     out.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
     )
-    logger.info(f"manifest written: {out} ({len(manifest['entries'])} entries)")
+    logger.info(f"manifest written: {out} ({len(entries)} entries)")
     return out
 
 
@@ -213,4 +275,7 @@ def load_manifest() -> dict:
     path = settings.datasets_dir / "manifest.json"
     if not path.exists():
         raise FileNotFoundError(f"run `python cli.py ingest` first — missing {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("manifest_version") != 2:
+        raise RuntimeError("manifest.json is v1 — rerun `python cli.py ingest`")
+    return manifest

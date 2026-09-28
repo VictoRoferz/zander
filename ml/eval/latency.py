@@ -20,7 +20,7 @@ from pathlib import Path
 import onnxruntime as ort
 
 from config.settings import settings
-from dataprep.ingest import load_manifest
+from dataprep.ingest import load_manifest, photo_path, usable
 from infer.pipeline import TiledDetector
 from infer.tiling import TILE_SIZE, tile_origins
 
@@ -36,21 +36,16 @@ def run(
     threads: int = 0,
 ) -> dict:
     manifest = load_manifest()
-    usable = [
-        e for e in manifest["entries"]
-        if e["quarantine_reason"] is None and e["label_state"] != "unannotated"
-    ]
-    sample = usable[:: max(1, len(usable) // n_photos)][:n_photos]
-    source_dir = Path(manifest["source_images_dir"])
+    photos = [e for e in manifest["entries"] if usable(e)]
+    sample = photos[:: max(1, len(photos) // n_photos)][:n_photos]
     detector = TiledDetector(model_path, adapter_name, threads=threads)
 
     for e in sample[:WARMUP]:
-        detector.detect_file(source_dir / f"{e['capture_id']}.jpg")
+        detector.detect_file(photo_path(e))
 
     times = []
     for e in sample:
-        _, _, ms = detector.detect_file(source_dir / f"{e['capture_id']}.jpg")
-        times.append(ms)
+        times.append(detector.detect_file(photo_path(e)).elapsed_ms)
 
     n_tiles = len(tile_origins(sample[0]["width"], sample[0]["height"]))
     result = {

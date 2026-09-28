@@ -1,0 +1,10 @@
+# NAL-only comparison for the def3 model (gate: def3 must not be worse on NAL).
+name: yolo26n_nal1_fold2
+model: yolo26n.pt
+adapter: ultralytics
+dataset_id: ds_v2_nal1
+fold: fold2
+epochs: 120
+imgsz: 640
+batch: 16
+seed: 20260806

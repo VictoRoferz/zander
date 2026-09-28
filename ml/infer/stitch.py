@@ -13,6 +13,10 @@ Contract: greedy over descending score; a candidate with IoS >= threshold
 against an already-kept box is absorbed into it (kept box grows to the union
 rectangle, score stays the max = the kept one's score).
 
+Class-aware (v2): merging only ever happens WITHIN one predicted class
+(`merge_by_class`) — a bridge and an adjacent insufficient-solder joint are two
+defects, not fragments of one.
+
 Implementation is numpy-vectorized per candidate (kept-set IoS in one shot):
 at the eval conf floor (0.001) a photo easily carries thousands of raw boxes
 and a pure-python O(n*m) inner loop dominated the whole pipeline. Candidates
@@ -67,3 +71,24 @@ def merge_detections(
         )
         kept_scores.append(float(s[i]))
     return [tuple(map(float, k)) for k in kept], kept_scores
+
+
+def merge_by_class(
+    boxes: list[tuple[float, float, float, float]],
+    scores: list[float],
+    labels: list[int],
+    ios_threshold: float = 0.5,
+    max_per_class: int | None = None,
+) -> tuple[list[tuple[float, float, float, float]], list[float], list[int]]:
+    """merge_detections per class; returns (boxes, scores, labels), score-desc."""
+    out: list[tuple[tuple[float, float, float, float], float, int]] = []
+    for c in sorted(set(labels)):
+        idx = [i for i, lab in enumerate(labels) if lab == c]
+        b, s = merge_detections(
+            [boxes[i] for i in idx], [scores[i] for i in idx], ios_threshold
+        )
+        if max_per_class is not None:
+            b, s = b[:max_per_class], s[:max_per_class]
+        out.extend((bb, ss, c) for bb, ss in zip(b, s))
+    out.sort(key=lambda t: -t[1])
+    return [t[0] for t in out], [t[1] for t in out], [t[2] for t in out]
