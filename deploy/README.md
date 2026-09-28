@@ -123,8 +123,21 @@ camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ─
 
 ## Daily use
 
-- **Start:** double-click **Zander** (or `start-zander.bat`). The camera stack runs
-  in a minimized console window titled **"Zander Camera"**.
+- **Start:** double-click **Zander** (or `start-zander.bat`). It runs
+  `docker compose up -d --build` (rebuilds only images whose code changed; unchanged
+  ones come from the cache, so no internet is needed then) and starts the camera
+  stack, which runs in a minimized console window titled **"Zander Camera"**. The
+  camera stack **always** starts, whatever happens to Docker: captures wait in its
+  spool until the hub is up. If the hub does not come up cleanly the window stays
+  open with one of these messages (details in `deploy\start-zander.log`):
+  - *Docker is not running* → open Docker Desktop, wait for *running*, start Zander again.
+  - *The images could not be rebuilt* → the containers run the images built before
+    (after a code update: the old version). Get internet, run `update-zander.bat`.
+  - *DEGRADED: inspector not running (build failed - needs internet once)* → the
+    inspector image was never built. Capture and labeling work; results show "none"
+    until you start Zander once with internet.
+  - *The Docker containers did not start* → read the `docker compose` messages above
+    it (a port in use, a broken `.env`, ...).
 - **Capture:** press the keypad button (F13) or the dashboard's **Capture** button.
 - **Stop:** `stop-zander.bat` (kills the camera stack via `camera-stack.pid`, then
   stops the containers; data is kept).
@@ -132,11 +145,29 @@ camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ─
   `labelstudio`); camera stack → the "Zander Camera" window or `deploy\camera-stack.log`.
 - **Status:** `docker compose ps`; camera + spool depth →
   `curl http://localhost:8001/api/v1/status`; model → `curl http://localhost:8004/api/v1/status`.
-- **After pulling code changes:** `docker compose up -d --build` once (the first build of
-  the inspector image needs internet), then restart the camera stack.
+- **After pulling code changes:** run `update-zander.bat` (see below).
 - **Result view:** after each capture the dashboard shows the photo large with the
   model's boxes, the verdict (iO/NiO) and the defect classes (about 2–3 s after the key
   press). It is advisory until the model has passed its test evaluation.
+
+### After pulling code changes (updating the station)
+
+Double-click **`deploy\update-zander.bat`** (needs internet). It:
+
+1. `git pull --ff-only` — stops without changing anything on local edits or a
+   diverged branch (`git status` shows why);
+2. `docker compose build` — new receiver/dashboard/inspector images;
+3. updates the camera stack's Python packages (`pip install -r camerapi\requirements.txt`
+   in `.venv`);
+4. restarts everything: `stop-zander.bat`, then `start-zander.bat` (containers with the
+   new images, camera stack with the new code — a running camera stack never picks up
+   new code by itself).
+
+If a step fails, the steps after it are skipped and the station keeps running the
+version it had; the log is `deploy\update-zander.log`. By hand, the same is
+`git pull`, `docker compose build`, `stop-zander.bat`, `start-zander.bat`. Check the
+running versions afterwards: `curl http://localhost:8001/api/v1/status` (camerapi) and
+`curl http://localhost:8002/api/v1/status` (receiver) report `version`.
 
 ### Data & persistence
 
@@ -210,6 +241,10 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
 - **Camera not found** → NIC static IP wrong/missing (`ping 192.168.177.95`), cable,
   or another app holds the camera (pylon Viewer open?). After a hard kill the camera
   can stay claimed a few seconds (GigE heartbeat) — retry.
+- **A `.bat` stops with "The system cannot find the batch label specified"** → the
+  checkout has Unix (LF) line endings, which cmd mishandles. Git for Windows normally
+  converts them; otherwise run `git config core.autocrlf true` in the repo, delete the
+  `deploy\*.bat` files and restore them with `git checkout -- deploy`.
 - **Slow captures (~8 s)** → the WiFi transport profile got forced somehow; ensure
   `CAMERA_TRANSPORT=ethernet` in `camerapi\.env` (auto also picks ethernet on Windows).
 - **Images don't render in LS** → the `DATA_DIR` bind mount isn't shared in Docker
@@ -224,7 +259,8 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
   receiver retries on its own: `inspector unreachable` until the inspector answers
   (checked every 2 s, backing off to 60 s), a timeout or `HTTP 5xx` a few times per
   capture. If it stays, `docker compose logs -f inspector` (not running at all?
-  `docker compose ps`); the capture itself is safe in Label Studio. Re-run one:
+  `docker compose ps`; start-zander says DEGRADED when its image was never built); the
+  capture itself is safe in Label Studio. Re-run one:
   `curl -X POST http://localhost:8002/api/v1/predict/<id>?force=true`; everything that
   still lacks a result: `curl -X POST http://localhost:8002/api/v1/predict/rescan`.
   `curl http://localhost:8002/api/v1/status` → `predictions` shows how many wait

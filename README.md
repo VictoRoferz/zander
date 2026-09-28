@@ -201,8 +201,11 @@ button listener). One-time bootstrap after the first start:
    `docker compose up -d` and restart the camera stack.
 
 Daily use: double-click the **Zander** desktop icon (`start-zander.bat` →
-`docker compose up -d` + the minimized **"Zander Camera"** window + opens the
-dashboard). `install-shortcut.ps1` creates the icon. `stop-zander.bat` stops both.
+`docker compose up -d --build`, falling back to the existing images when a build fails,
++ the minimized **"Zander Camera"** window, which starts even when Docker has a
+problem + opens the dashboard). `install-shortcut.ps1` creates the icon.
+`stop-zander.bat` stops both; `update-zander.bat` pulls, rebuilds and restarts after
+code changes.
 Camera-stack logs: the minimized window, or `deploy\camera-stack.log`.
 
 ### Dev — everything native (macOS/Windows, no Docker)
@@ -244,8 +247,8 @@ Key invariants:
 - The receiver talks to LS at the in-network URL `http://labelstudio:8080`; browsers
   use `http://<host>:8081` (`LABELSTUDIO_PUBLIC_URL` for the dashboard's link).
 - After editing `deploy/.env`, run `docker compose up -d` again (recreate —
-  a plain `restart` does not pick up env changes). After pulling code changes,
-  `docker compose up -d --build`.
+  a plain `restart` does not pick up env changes). After code changes, run
+  `deploy\update-zander.bat` (pull, build, restart incl. the camera stack).
 - Label Studio runs as a non-root user: files in `/data` must be world-readable
   (the receiver writes 0644 for exactly this reason).
 
