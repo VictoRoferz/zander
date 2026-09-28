@@ -146,3 +146,214 @@ section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; 
   font-style: italic;
   padding: 20px 4px;
 }
+
+/* ==== Live camera + latest result ======================================== */
+/* New components only; the rules above keep their colours. */
+
+:root {
+  --surface: #ffffff;
+  --surface-2: #f3f5f7;
+  --text: #1c1f23;
+  --text-muted: #6a737d;
+  --border: #e1e4e8;
+  --pass-bg: #e6f4ea;
+  --pass-fg: #137333;
+  --fail-bg: #fce8e6;
+  --fail-fg: #b3261e;
+  --review-bg: #fff4ce;
+  --review-fg: #8a6d00;
+  --neutral-bg: #eceff3;
+  --neutral-fg: #4a5560;
+  --frame-bg: #111418;
+  --live: #d93025;
+  /* Detection classes: boxes, chips and crops. */
+  --cls-nal: #2f7df6;       /* Nicht ausreichend Lot: blue */
+  --cls-bruecke: #1fb35c;   /* Bruecke: green */
+  --cls-fahne: #e5383b;     /* Fahne: red */
+  --cls-other: #f29d0b;
+  --box-casing: rgba(0, 0, 0, 0.7);
+}
+
+section.live-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 960px) {
+  section.live-row { grid-template-columns: minmax(0, 1fr); }
+}
+.live-row [hidden] { display: none !important; }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-height: 28px;
+}
+.live-row .panel-title { margin: 0; }
+.panel-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.small { font-size: 12px; }
+.button:disabled { opacity: 0.6; cursor: progress; }
+
+/* Live stream */
+.live-frame {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  background: var(--frame-bg);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.live-frame img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.live-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(17, 20, 24, 0.72);
+  color: #f1f3f5;
+  text-align: center;
+}
+.live-overlay-box { display: grid; gap: 6px; max-width: 36ch; font-size: 14px; line-height: 1.4; }
+.live-overlay-detail { font-size: 12.5px; color: #c9d1d9; overflow-wrap: anywhere; }
+
+/* Verdict badge */
+.verdict {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+}
+.verdict-nio { background: var(--fail-fg); color: #ffffff; }
+.verdict-io { background: var(--pass-fg); color: #ffffff; }
+.verdict-pending { background: var(--review-bg); color: var(--review-fg); }
+.verdict-no-model,
+.verdict-none { background: var(--neutral-bg); color: var(--neutral-fg); }
+.verdict-error { background: var(--fail-bg); color: var(--fail-fg); }
+
+/* Chips (class counts, live state, warnings) */
+.chips { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.chips:empty { display: none; }
+.chip {
+  --c: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  background: var(--neutral-bg);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chip::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+  flex: none;
+}
+.chip-live { --c: var(--live); background: var(--fail-bg); color: var(--fail-fg); }
+.chip-live::before { animation: live-pulse 1.6s ease-in-out infinite; }
+.chip-warn { --c: var(--review-fg); background: var(--review-bg); color: var(--review-fg); }
+.chip-error { --c: var(--fail-fg); background: var(--fail-bg); color: var(--fail-fg); }
+@keyframes live-pulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) {
+  .chip-live::before { animation: none; }
+}
+
+/* Class colours (shared by chips, boxes and crops) */
+.cls-nal { --c: var(--cls-nal); }
+.cls-bruecke { --c: var(--cls-bruecke); }
+.cls-fahne { --c: var(--cls-fahne); }
+.cls-other { --c: var(--cls-other); }
+
+/* Result photo with the SVG overlay (viewBox = photo pixels) */
+.result-message { margin: 0; min-height: 1.4em; font-size: 14px; color: var(--text-muted); }
+.result-message.is-error { color: var(--fail-fg); }
+.result-figure {
+  background: var(--frame-bg);
+  border-radius: 6px;
+  overflow: hidden;
+  min-height: 120px;
+}
+.result-figure svg,
+.result-figure img { display: block; width: 100%; height: auto; }
+.result-empty { padding: 48px 16px; text-align: center; font-size: 14px; color: #c9d1d9; }
+.result-meta {
+  min-height: 1.2em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* Detections (strokes in screen px via vector-effect: non-scaling-stroke) */
+.det-casing { fill: none; stroke: var(--box-casing); stroke-width: 4px; pointer-events: none; }
+.det-box { fill: none; stroke: var(--c, var(--cls-other)); stroke-width: 2px; pointer-events: all; }
+.det-halo { fill: none; stroke: var(--c, var(--cls-other)); stroke-width: 1.5px; stroke-opacity: 0.9; pointer-events: none; }
+.det-num { pointer-events: none; }
+.det-num circle { fill: var(--c, var(--cls-other)); stroke: var(--box-casing); stroke-width: 1.5px; }
+.det-num text {
+  fill: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-weight: 700;
+}
+.det.is-hl .det-box { stroke-width: 4px; }
+.det.is-hl .det-casing { stroke-width: 7px; }
+.det.is-hl .det-halo { stroke-width: 3px; }
+
+/* Zoomed crops, one per defect */
+.crops {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 8px;
+}
+.crops:empty { display: none; }
+.crop {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin: 0;
+  padding: 6px;
+  background: var(--surface-2);
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+.crop:hover,
+.crop:focus-visible { border-color: var(--c, var(--border)); outline: none; }
+.crop svg { display: block; width: 112px; height: 112px; background: var(--frame-bg); border-radius: 6px; }
+.crop figcaption { display: grid; gap: 2px; min-width: 0; font-size: 12px; color: var(--text-muted); }
+.crop figcaption b { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+.crop-more { align-self: center; padding: 8px; font-size: 13px; color: var(--text-muted); }

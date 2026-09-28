@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <title>Camera Pipeline — Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version }}" />
 </head>
 <body>
   <header class="topbar">
@@ -28,6 +28,41 @@
     <div class="stat-detail" id="capture-status"></div>
   </section>
 
+  <!-- Live camera + latest result. Kept outside the grids below, which are
+       rebuilt by polling; app.js updates these panels on their own. -->
+  <section class="live-row" aria-label="Live camera and latest result">
+    <div class="panel live-panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Live camera</h2>
+        <span id="live-status" class="chip chip-off">checking</span>
+      </div>
+      <div class="live-frame">
+        <img id="live-img" alt="Live camera preview" hidden />
+        <div id="live-overlay" class="live-overlay" role="status">
+          <div class="live-overlay-box"><strong>Checking the camera…</strong></div>
+        </div>
+      </div>
+      <div class="panel-foot">
+        <span id="live-detail" class="muted small"></span>
+        <button id="live-capture-btn" class="button primary" type="button">Capture (F13)</button>
+      </div>
+    </div>
+
+    <div class="panel result-panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Latest result</h2>
+        <span id="result-verdict" class="verdict verdict-none">…</span>
+        <span id="result-classes" class="chips"></span>
+        <span id="result-capture" class="muted small"></span>
+        <span id="result-note" class="muted small"></span>
+      </div>
+      <p id="result-message" class="result-message" aria-live="polite"></p>
+      <div id="result-figure" class="result-figure"></div>
+      <div id="result-crops" class="crops"></div>
+      <div id="result-meta" class="result-meta"></div>
+    </div>
+  </section>
+
   <section>
     <h2>Unlabeled</h2>
     <div class="grid" id="grid-unlabeled"></div>
@@ -38,6 +73,6 @@
     <div class="grid" id="grid-labeled"></div>
   </section>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ asset_version }}"></script>
 </body>
 </html>
