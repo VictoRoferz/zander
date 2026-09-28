@@ -61,6 +61,7 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 - UTF-8 with `ensure_ascii=False`.
 - `pending` is never written; the dashboard derives it.
 - A file with `status:"ok"` is only replaced by another `ok` from a different `model_version`. It is never downgraded to `no_model` or `error`.
+- A non-`ok` result with the same `status` and `error` as the stored one is not rewritten (a retry that failed the same way): `created_at` stays the time of the first failure.
 
 | field | type | notes |
 |---|---|---|
@@ -108,8 +109,9 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
   - Each part: `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: N\r\n\r\n<jpeg>\r\n`.
   - The last frame, or a placeholder, is re-sent at least every 2 s.
 - `GET /api/v1/preview/frame.jpg`: one fresh preview JPEG. Waits up to 3 s and starts the stream if it is idle. `Cache-Control: no-store`.
-- `GET /api/v1/preview/status`: returns `enabled, state, source, camera_model, camera_serial, profile, fps_target, fps_measured, clients, frame_seq, last_frame_age_s, frames_incomplete, reconnects, last_error, preview_width, preview_height, boot_id`.
+- `GET /api/v1/preview/status`: returns `enabled, state, source, camera_model, camera_serial, profile, fps_target, fps_measured, clients, frame_seq, last_frame_age_s, stream_age_s, frames_incomplete, reconnects, last_error, preview_width, preview_height, boot_id`.
   - `state` is one of `disabled`, `starting`, `idle`, `streaming`, `reconnecting`, `unavailable` (Wi-Fi profile), `stopped`.
+  - `stream_age_s`: seconds since the running stream started; null unless `state` is `streaming`. `streaming` with `last_frame_age_s: null` and a growing `stream_age_s` = no frame ever arrived (e.g. the Windows firewall drops the camera's UDP stream); the dashboard shows "no frames" after 5 s instead of LIVE.
   - When disabled it returns 200 with `enabled:false`.
 - Stream and frame return 404 when the preview is disabled, and 503 when `PREVIEW_MAX_CLIENTS` is reached.
 - `GET /api/v1/status` gains a `live` block with the same fields as preview status.
@@ -120,7 +122,7 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
 
 Otherwise the answer is 401 (token missing or wrong) or 403 (not local and no token configured). Additionally, with an empty token a request whose `Origin` names a non-local host gets 403 (camerapi allows CORS from `*`, so without this any web page open on the PC could read the camera with `fetch()`). Production uses the token, because Docker→host traffic is not guaranteed to arrive as loopback. The browser never sees the token: the dashboard proxies the stream.
 
-**Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`.
+**Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`. On the Wi-Fi profile (state `unavailable`, a full frame takes ~8 s) a capture makes **one** `GrabOne` of 30 s, as the one-shot path does, instead of 3 × `LIVE_GRAB_TIMEOUT_MS`, and the caller waits at least 35 s instead of `LIVE_CAPTURE_TIMEOUT_S` (still below the keypad's 40 s request timeout).
 
 **Env vars:**
 
@@ -148,6 +150,7 @@ Log strings stay ASCII (Windows cp1252 consoles).
  "state": "pending"|"ok"|"no_model"|"error"|"none",
  "prediction": null | <pred.json as stored>}
 ```
+  - `/api/latest` is the newest capture by the sidecar's `captured_at` (the image mtime while the sidecar is missing or has no valid time), not by arrival: after a spool backlog camerapi uploads in uuid order.
   - `width`/`height` come from `prediction.image_*`, falling back to the capture sidecar.
   - `state` is the file's `status` when a prediction file exists. Without one it is `pending` while the photo is younger than `PREDICTION_PENDING_TIMEOUT_S`, and `none` after that.
   - A `schema_version > 1` gives `state:"error"` ("unsupported").
@@ -157,23 +160,31 @@ Log strings stay ASCII (Windows cp1252 consoles).
 
 ## 6. Receiver prediction hook (`:8002`)
 
+- **Capture ids:** every service accepts only a *full* match of `[A-Za-z0-9_-]{1,64}` (never `re.match`, whose `$` also accepts a trailing newline); camerapi sends uuid4 hex. `POST /api/v1/ingest` rejects any other id with 422 (poison for the spool) before it touches the disk.
 - **Env:**
   - `INSPECTOR_URL` (`""` turns predictions off; compose sets `http://inspector:8004`; `launch.py` injects `http://localhost:8004` only when it started the inspector itself).
-  - `INSPECTOR_TIMEOUT` (`60`), `INSPECTOR_STATUS_TIMEOUT` (`5`), `PREDICTION_QUEUE_MAX` (`1000`).
+  - `INSPECTOR_TIMEOUT` (`60`), `INSPECTOR_STATUS_TIMEOUT` (`5`), `PREDICTION_QUEUE_MAX` (`1000`, applied to new captures and, separately, to rescan backfill).
+  - `PREDICTION_RETRY_INITIAL_S` (`2`), `PREDICTION_RETRY_MAX_S` (`60`), `PREDICTION_RETRY_MAX_ATTEMPTS` (`8`).
 - **Queue:**
   - `prediction_service.enqueue(capture_id, force=False) -> bool` never blocks.
-  - Ingest calls it after `write_task_marker`, and in the dedupe branch only when no `pred.json` exists. Both calls are wrapped so the ingest ACK is never affected.
-  - One worker thread (the `spool_uploader` pattern) handles one inspector request at a time. The queue is bounded and deduped by id.
+  - Ingest calls it after `write_task_marker`, and in the dedupe branch only when the capture still needs a prediction (the rescan rule below). Both calls are wrapped so the ingest ACK is never affected.
+  - One worker thread (the `spool_uploader` pattern) handles one inspector request at a time. The work list is bounded and deduped by id; enqueuing an id that waits for a retry tries it now. Order: new captures first, then retries, then rescan backfill; FIFO within each.
+  - It lives in memory: the startup rescan re-queues what a restart dropped.
+- **Retries** (transient failures; the `error` document is written at the first failure so the dashboard shows it meanwhile, and an `ok` is never downgraded):
+  - `GET /status` unreachable, timed out or 5xx ("inspector unreachable", "inspector status HTTP 5xx: ..."): the capture waits for the inspector. While it is down, one request probes it after `PREDICTION_RETRY_INITIAL_S`, doubling to `PREDICTION_RETRY_MAX_S`; the first answer releases every waiting capture. New captures are always tried at once.
+  - `POST /inspect` timed out, lost its connection, or answered 5xx other than 503 ("inspector timed out ...", "inspector request failed: ...", "HTTP 5xx: ..."): that capture alone backs off on the same schedule, at most `PREDICTION_RETRY_MAX_ATTEMPTS` attempts (a photo that keeps failing must not load the inspector forever).
+  - Everything else (4xx, undecodable or missing image, invalid response, `no_model`) is final until a rescan or `POST /api/v1/predict/{id}`.
+- **Rescan** (in a background thread at receiver startup, and `POST /api/v1/predict/rescan` → 202 `{"queued": n}`): queues as backfill every capture with a task marker whose `pred.json` is missing or unreadable, `no_model`, or an `error` with one of the transient texts above, newest first by the sidecar's `captured_at`, at most `PREDICTION_QUEUE_MAX`. So after a model deploy (`docker compose restart inspector`) a receiver restart or this endpoint classifies the older captures.
 - **`process_one(capture_id)`:**
-  1. `GET /status`. If unreachable, write `error` ("inspector unreachable"). If `model_loaded:false`, write `no_model` with the `load_error`.
+  1. `GET /status`. If unreachable (or 5xx), write `error` ("inspector unreachable"). If `model_loaded:false`, write `no_model` with the `load_error`.
   2. Skip if an existing `ok` has the same `model_version` (unless `force`).
   3. `POST /inspect` with the file and the `capture_id`:
      - 200 → validated `ok` document (`confidence_threshold` maps to `threshold`);
      - 503 → `no_model`;
      - anything else → `error` "HTTP <code>: <detail>".
   4. Never overwrite an existing `ok` with a non-`ok` result.
-- **Optional:** `POST /api/v1/predict/{capture_id}?force=false` returns 202 `{"queued": bool}`, or 404 if there is no image.
-- `/api/v1/status` gains `predictions: {enabled, inspector_url, queue_depth, count}`.
+- **Optional:** `POST /api/v1/predict/{capture_id}?force=false` returns 202 `{"queued": bool}`, or 404 if there is no image. (`/predict/rescan` is routed first.)
+- `/api/v1/status` gains `predictions: {enabled, inspector_url, queue_depth, retrying, backfill, count}`: `queue_depth` = captures waiting for a prediction, of which `retrying` failed at least once and `backfill` came from a rescan.
 
 ## 7. Deploy
 

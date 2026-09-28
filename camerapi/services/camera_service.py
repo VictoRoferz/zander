@@ -43,6 +43,10 @@ except ImportError:
     logger.warning("pypylon not available - falling back to OpenCV VideoCapture")
 
 
+# The one-shot path's GrabOne timeout. Also the live path's budget on the WiFi
+# profile, where one full frame takes ~8 s over the throttled link.
+ONE_SHOT_GRAB_TIMEOUT_MS = 30000
+
 # Transport profiles: pylon node values tuned per network medium.
 # Ethernet: full throughput, no spacing, small retransmit window.
 # WiFi: throttled, large inter-packet delay, generous resends.
@@ -424,12 +428,15 @@ class CameraService:
         max_attempts = 3
         last_error: Optional[str] = None
         for attempt in range(1, max_attempts + 1):
-            logger.info(f"GrabOne attempt {attempt}/{max_attempts} (30s timeout)...")
+            logger.info(
+                f"GrabOne attempt {attempt}/{max_attempts} "
+                f"({ONE_SHOT_GRAB_TIMEOUT_MS // 1000}s timeout)..."
+            )
             grab_result = None
             try:
                 # Inside the try: a timeout used to escape the retry loop.
                 grab_result = self._camera.GrabOne(
-                    30000, pylon.TimeoutHandling_ThrowException
+                    ONE_SHOT_GRAB_TIMEOUT_MS, pylon.TimeoutHandling_ThrowException
                 )
                 if grab_result.GrabSucceeded():
                     image = self._converter.Convert(grab_result)

@@ -19,6 +19,7 @@ up on restart.
 """
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI
@@ -28,11 +29,23 @@ from api.routes import router
 from config.settings import settings
 from services.detector_service import detector_service
 
+
+def _log_level(name: str) -> Optional[int]:
+    """LOG_LEVEL as a logging level, case-insensitively; None for a name that
+    is no level. logging.basicConfig raises ValueError for "debug", which
+    crashed the inspector at import (a restart loop in Docker)."""
+    level = getattr(logging, str(name).strip().upper(), None)
+    return level if isinstance(level, int) else None
+
+
+LOG_LEVEL = _log_level(settings.log_level)
 logging.basicConfig(
-    level=settings.log_level,
+    level=logging.INFO if LOG_LEVEL is None else LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 LOG = logging.getLogger("inspector")
+if LOG_LEVEL is None:
+    LOG.warning(f"LOG_LEVEL={settings.log_level!a} is not a log level; using INFO")
 
 
 @asynccontextmanager

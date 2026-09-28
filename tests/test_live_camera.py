@@ -102,6 +102,7 @@ class ScriptedSource:
         self.lose_always = False   # every read_stream raises SourceLost (flapping)
         self.grab_delay = 0.0
         self.grab_error = None
+        self.no_frames = False     # read_stream times out forever (firewall case)
         self.frames_incomplete = 0
         self.last_error = None
         self.last_streamed = 0     # stamp of the last frame read_stream returned
@@ -132,6 +133,11 @@ class ScriptedSource:
         if self.lose_on_read or self.lose_always:
             self.lose_on_read = False
             raise SourceLost("fake cable pulled")
+        if self.no_frames:  # like BaslerSource when no packet ever arrives
+            time.sleep(min(timeout_s, 0.02))
+            self.frames_incomplete += 1
+            self.last_error = f"no frame within {timeout_s:.1f} s"
+            return None
         time.sleep(0.002)
         frame, n = fake.next_frame(640, 480)
         self.last_streamed = n
@@ -236,6 +242,33 @@ def test_one_client_gets_downscaled_jpegs_at_the_target_rate():
         assert wait_until(lambda: cam.state == "idle", timeout=2.0), cam.state
         assert "stop_stream" in src.calls
         assert cam.status()["fps_measured"] == 0.0
+
+
+def test_stream_without_frames_reports_its_age():
+    # The Windows-firewall case: the stream runs, but no frame ever arrives.
+    # last_frame_age_s stays null, so the dashboard needs stream_age_s to tell
+    # "no frame for N s" from "just started".
+    src = ScriptedSource()
+    src.no_frames = True
+    with running(src) as cam:
+        assert wait_until(lambda: cam.state == "idle")
+        cam.add_client()
+        try:
+            assert wait_until(lambda: cam.state == "streaming")
+            time.sleep(0.3)
+            st = cam.status()
+            assert st["state"] == "streaming" and st["last_frame_age_s"] is None, st
+            assert st["fps_measured"] == 0.0 and st["frame_seq"] >= 0
+            assert isinstance(st["stream_age_s"], float) and st["stream_age_s"] >= 0.25, st
+            assert st["frames_incomplete"] > 0 and "no frame within" in st["last_error"], st
+            src.no_frames = False  # frames arrive (the firewall rule was added)
+            assert wait_until(lambda: cam.status()["last_frame_age_s"] is not None)
+            st = cam.status()
+            assert st["stream_age_s"] >= 0.3 and st["last_frame_age_s"] < 1.0, st
+        finally:
+            cam.remove_client()
+        assert wait_until(lambda: cam.state == "idle", timeout=2.0)
+        assert cam.status()["stream_age_s"] is None  # only reported while streaming
 
 
 def test_idle_grace_keeps_the_stream_warm_but_encodes_nothing():
@@ -424,18 +457,62 @@ def test_unexpected_grab_error_falls_back_and_reconnects():
 
 
 def test_wifi_profile_is_unavailable_but_captures_work():
-    src = ScriptedSource(streamable=False)
-    with running(src) as cam:
-        assert wait_until(lambda: cam.state == "unavailable"), cam.state
-        cam.add_client()
+    # WiFi transport profile (2 Mbit/s): a full frame takes ~8 s, longer than a
+    # LIVE_GRAB_TIMEOUT_MS attempt (5 s) and than LIVE_CAPTURE_TIMEOUT_S would
+    # allow for three of them. Scaled down: 200 ms attempts (this file's
+    # LIVE_GRAB_TIMEOUT_MS), a 0.3 s caller budget, and a fake GrabOne that
+    # needs 0.5 s and, like pylon, times out after its timeout. The capture
+    # must still be the camera's photo, not sample.jpg.
+    fake.reset(devices=1)
+    with setting("camera_transport", "wifi"), setting("live_capture_timeout_s", 0.3):
+        cam = LiveCamera(source_factory=BaslerSource)
+        cam.start()
         try:
-            assert wait_until(lambda: cam.latest_preview() is not None)
-            assert decode(cam.latest_preview().jpeg) is not None  # the placeholder
-            assert cam.capture_frame()[1]["source"] == "basler"
-            time.sleep(0.1)
-            assert "start_stream" not in src.calls
+            assert wait_until(lambda: cam.state == "unavailable"), cam.state
+            camera = fake.last_camera()
+            cam.add_client()
+            try:
+                assert wait_until(lambda: cam.latest_preview() is not None)
+                assert decode(cam.latest_preview().jpeg) is not None  # the placeholder
+                camera.grab_delay = 0.5
+                frame, info = cam.capture_frame()
+                assert info["source"] == "basler", info
+                assert frame.shape == (48, 64, 3)
+                grabs = fake.calls(camera, "GrabOne")
+                # ONE attempt with the one-shot path's 30 s budget
+                assert [g[2][0] for g in grabs] == [30000], grabs
+                assert "StartGrabbing" not in fake.methods(camera)  # never streams on WiFi
+                assert cam.status()["profile"] == "wifi" and cam.state == "unavailable"
+            finally:
+                cam.remove_client()
         finally:
-            cam.remove_client()
+            cam.stop()
+
+
+def test_wifi_capture_queued_before_the_camera_opened_gets_the_longer_budget():
+    # The first capture after a (re)connect: the caller starts waiting with the
+    # normal budget; the owner then opens the camera onto the WiFi profile, and
+    # the caller must keep waiting for the (slow) grab instead of giving up.
+    gate = threading.Event()
+    fake.reset(devices=1, open_gate=gate)
+    with setting("camera_transport", "wifi"), setting("live_capture_timeout_s", 0.3):
+        cam = LiveCamera(source_factory=BaslerSource)
+        cam.start()
+        try:
+            assert wait_until(lambda: fake.CAMERAS and fake.methods(fake.last_camera()))
+            camera = fake.last_camera()  # Open() is blocked on the gate
+            camera.grab_delay = 0.5
+            results = []
+            caller = threading.Thread(target=lambda: results.append(cam.capture_frame()))
+            caller.start()
+            time.sleep(0.1)
+            gate.set()
+            caller.join(10)
+            assert results, "capture did not return"
+            assert results[0][1]["source"] == "basler", results[0][1]
+        finally:
+            gate.set()
+            cam.stop()
 
 
 def test_sample_source_overlays_the_preview_but_never_the_capture():
@@ -500,13 +577,14 @@ def test_stop_is_fast_and_closes_the_source():
 def test_status_shapes_match_the_contract():
     keys = {"enabled", "state", "source", "camera_model", "camera_serial", "profile",
             "fps_target", "fps_measured", "clients", "frame_seq", "last_frame_age_s",
-            "frames_incomplete", "reconnects", "last_error", "preview_width",
-            "preview_height", "boot_id"}
+            "stream_age_s", "frames_incomplete", "reconnects", "last_error",
+            "preview_width", "preview_height", "boot_id"}
     cam = LiveCamera(source_factory=ScriptedSource)
     assert set(cam.status()) == keys
     off = cam.disabled_status()
     assert set(off) == keys and off["enabled"] is False and off["state"] == "disabled"
-    assert cam.status()["state"] == "stopped"
+    assert off["stream_age_s"] is None
+    assert cam.status()["state"] == "stopped" and cam.status()["stream_age_s"] is None
 
 
 # ---- MJPEG generator (api/preview.py) ------------------------------------------------

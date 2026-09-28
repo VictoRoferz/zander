@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,10 +29,30 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__, level=settings.log_level)
 
+# Windows refuses os.replace onto a file another process holds open
+# (PermissionError, WinError 5 / 32) until that reader closes it, e.g. an
+# antivirus scan of the previous version. Retry briefly there. POSIX renames
+# over open files, so it tries exactly once (behaviour unchanged).
+# Keep in sync with receiver/services/storage_service.py.
+_REPLACE_RETRIES = 5 if os.name == "nt" else 0
+_REPLACE_RETRY_S = 0.05
+
 
 def new_capture_id() -> str:
     """Generate a fresh capture ID. UUID4 — collision-free in practice."""
     return uuid.uuid4().hex
+
+
+def _replace(src: str, dst: Path) -> None:
+    """os.replace, retried while Windows reports the target as in use."""
+    for attempt in range(_REPLACE_RETRIES + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt >= _REPLACE_RETRIES:
+                raise
+            time.sleep(_REPLACE_RETRY_S)
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -49,7 +70,7 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, target)
+        _replace(tmp_name, target)
     except Exception:
         try:
             os.unlink(tmp_name)

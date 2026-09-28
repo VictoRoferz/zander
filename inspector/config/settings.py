@@ -36,7 +36,7 @@ DEFAULT_CLASS_NAMES = ("Nicht ausreichend Lot", "Brücke", "Fahne")
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "zander-inspector"
-    service_version: str = "0.2.0"
+    service_version: str = "0.2.1"
 
     # ---- Server ----
     # Loopback by default: nothing outside this PC needs the inspector (the

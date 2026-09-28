@@ -33,7 +33,12 @@ import cv2
 import numpy as np
 
 from config.settings import settings
-from services.camera_service import PYPYLON_AVAILABLE, CameraService, camera_service
+from services.camera_service import (
+    ONE_SHOT_GRAB_TIMEOUT_MS,
+    PYPYLON_AVAILABLE,
+    CameraService,
+    camera_service,
+)
 from utils.logger import setup_logger
 
 if PYPYLON_AVAILABLE:
@@ -46,6 +51,10 @@ logger = setup_logger(__name__, level=settings.log_level)
 PLACEHOLDER_REFRESH_S = 1.0  # placeholders are re-published this often
 IDLE_POLL_S = 1.0            # owner wake-up period while not streaming
 STABLE_OPEN_S = 10.0         # open this long without trouble = not flapping
+LIVE_GRAB_ATTEMPTS = 3       # GrabOne attempts per capture on a streamable link
+# A capture caller waits at least this long on the WiFi profile, where the
+# owner makes ONE GrabOne of ONE_SHOT_GRAB_TIMEOUT_MS (a frame takes ~8 s+).
+SLOW_LINK_CAPTURE_WAIT_S = 35.0
 RECONNECT_TEXT = "Camera unavailable - reconnecting ..."
 WIFI_TEXT = "Preview unavailable (wifi profile)"
 WAITING_TEXT = "Waiting for camera ..."
@@ -172,7 +181,8 @@ class BaslerSource:
             self._cap_frame_rate(camera, float(settings.preview_fps))
             self.profile = self._svc.profile_label
             # The WiFi profile caps the link at 2 Mbit/s: a stream would
-            # starve the captures, so the preview is unavailable there.
+            # starve the captures, so the preview is unavailable there, and a
+            # capture gets the one-shot path's budget (see grab_fresh).
             self.streamable = self.profile != "wifi"
             try:
                 info = camera.GetDeviceInfo()
@@ -283,12 +293,21 @@ class BaslerSource:
                     pass
 
     def grab_fresh(
-        self, timeout_ms: Optional[int] = None, attempts: int = 3
+        self, timeout_ms: Optional[int] = None, attempts: Optional[int] = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
         camera = self._camera
         if camera is None:
             raise SourceLost("camera is not open")
-        timeout_ms = int(timeout_ms or settings.live_grab_timeout_ms)
+        if self.streamable:
+            timeout_ms = int(timeout_ms or settings.live_grab_timeout_ms)
+            attempts = int(attempts or LIVE_GRAB_ATTEMPTS)
+        else:
+            # WiFi profile: a full frame needs ~8 s+ over the 2 Mbit/s link, so
+            # every LIVE_GRAB_TIMEOUT_MS (5 s) attempt timed out and each capture
+            # fell back to sample.jpg. Use the one-shot path's budget instead:
+            # ONE attempt of 30 s (a timeout means the stream is not arriving).
+            timeout_ms = int(timeout_ms or ONE_SHOT_GRAB_TIMEOUT_MS)
+            attempts = int(attempts or 1)
         # GrabOne refuses to run while the stream grabs, and stopping flushes
         # the queue: the exposure starts after this call, so the capture is
         # the first frame after the trigger.
@@ -437,8 +456,15 @@ class LiveCamera:
         self._camera_model: Optional[str] = None
         self._camera_serial: Optional[str] = None
         self._profile: Optional[str] = None
+        # The open source cannot stream (WiFi profile): captures get the
+        # one-shot budget, so callers wait longer (see _capture_wait_s).
+        self._slow_link = False
         self._fps_ema = 0.0
         self._last_frame_t: Optional[float] = None
+        # When the running stream started: with _last_frame_t still None it
+        # tells "no frame yet" (e.g. the Windows firewall drops the camera's
+        # UDP stream) from "just started" (status "stream_age_s").
+        self._stream_started_t: Optional[float] = None
         self._frame_w: Optional[int] = None
         self._frame_h: Optional[int] = None
         self._frames_incomplete = 0
@@ -453,11 +479,12 @@ class LiveCamera:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        grab_budget_s = 3 * settings.live_grab_timeout_ms / 1000.0
+        grab_budget_s = LIVE_GRAB_ATTEMPTS * settings.live_grab_timeout_ms / 1000.0
         if grab_budget_s >= settings.live_capture_timeout_s:
             logger.warning(
                 f"LIVE_CAPTURE_TIMEOUT_S={settings.live_capture_timeout_s:g} is not above "
-                f"3 x LIVE_GRAB_TIMEOUT_MS ({grab_budget_s:g} s): slow grabs fall back to sample.jpg"
+                f"{LIVE_GRAB_ATTEMPTS} x LIVE_GRAB_TIMEOUT_MS ({grab_budget_s:g} s): "
+                "slow grabs fall back to sample.jpg"
             )
         self._stop.clear()
         self._wake.clear()
@@ -537,12 +564,23 @@ class LiveCamera:
             logger.warning("Live camera is not running; falling back to sample image")
             return camera_service.load_fallback()
         request = _CaptureRequest()
+        started = time.monotonic()
         with self._lock:
             self._requests.append(request)
         self._wake.set()
 
-        timeout_s = float(settings.live_capture_timeout_s)
-        if not request.done.wait(timeout_s):
+        timeout_s = self._capture_wait_s()
+        done = request.done.wait(timeout_s)
+        while not done:
+            # The camera may have been opened (or re-opened) onto the WiFi
+            # profile while this request waited: its longer budget applies,
+            # counted from the request.
+            longer = self._capture_wait_s()
+            if longer <= timeout_s:
+                break
+            timeout_s = longer
+            done = request.done.wait(max(0.0, started + timeout_s - time.monotonic()))
+        if not done:
             with self._lock:
                 if not request.done.is_set():
                     request.abandoned = True
@@ -562,6 +600,16 @@ class LiveCamera:
             )
             return camera_service.load_fallback()
         return request.frame, request.info
+
+    def _capture_wait_s(self) -> float:
+        """How long a capture caller waits for the owner: LIVE_CAPTURE_TIMEOUT_S,
+        and at least SLOW_LINK_CAPTURE_WAIT_S on the WiFi profile, where the
+        owner makes one 30 s GrabOne (BaslerSource.grab_fresh). Both stay below
+        the keypad listener's 40 s request timeout."""
+        wait = float(settings.live_capture_timeout_s)
+        if self._slow_link:
+            wait = max(wait, SLOW_LINK_CAPTURE_WAIT_S)
+        return wait
 
     def _has_requests(self) -> bool:
         with self._lock:
@@ -601,9 +649,12 @@ class LiveCamera:
     def status(self) -> dict[str, Any]:
         """The CONTRACTS section 4 preview status (also /status "live")."""
         preview = self._preview
+        now = time.monotonic()
         last = self._last_frame_t
-        age = None if last is None else round(time.monotonic() - last, 2)
+        age = None if last is None else round(now - last, 2)
         live = self._state == "streaming" and age is not None and age < 2.0
+        started = self._stream_started_t
+        streaming = self._state == "streaming" and started is not None
         return {
             "enabled": True,
             "state": self._state,
@@ -616,6 +667,7 @@ class LiveCamera:
             "clients": self._client_count(),
             "frame_seq": preview.seq if preview is not None else 0,
             "last_frame_age_s": age,
+            "stream_age_s": round(now - started, 2) if streaming else None,
             "frames_incomplete": self._frames_incomplete,
             "reconnects": self._reconnects,
             "last_error": self._last_error,
@@ -638,6 +690,7 @@ class LiveCamera:
             "clients": 0,
             "frame_seq": 0,
             "last_frame_age_s": None,
+            "stream_age_s": None,
             "frames_incomplete": 0,
             "reconnects": 0,
             "last_error": None,
@@ -728,6 +781,7 @@ class LiveCamera:
                         source.start_stream()
                         streaming = True
                         self._fps_ema, self._last_frame_t = 0.0, None
+                        self._stream_started_t = time.monotonic()
                     elif streaming and not want:
                         source.stop_stream()
                         streaming = False
@@ -780,12 +834,16 @@ class LiveCamera:
         self._camera_model = getattr(source, "camera_model", None)
         self._camera_serial = getattr(source, "camera_serial", None)
         self._profile = getattr(source, "profile", None)
+        self._slow_link = not source.streamable
         logger.info(
             f"Live camera open: source={self._source_name} model={self._camera_model} "
             f"serial={self._camera_serial} profile={self._profile}"
         )
         if not source.streamable:
-            logger.warning("WiFi transport profile: live preview unavailable (captures still work)")
+            logger.warning(
+                "WiFi transport profile: live preview unavailable; each capture "
+                f"makes one {ONE_SHOT_GRAB_TIMEOUT_MS // 1000} s GrabOne, as with the preview off"
+            )
         self._set_state("idle" if source.streamable else "unavailable")
 
     def _open_failed(self, error: Exception, retry_in: float) -> None:

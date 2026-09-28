@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -494,6 +495,42 @@ def test_detect_is_serialized_across_threads():
     assert elapsed >= 0.14, f"3 x 50 ms detect ran in {elapsed:.3f}s, so not serialized"
 
 
+# ---- Startup -------------------------------------------------------------------------
+def test_log_level_is_case_insensitive():
+    assert main._log_level("debug") == logging.DEBUG
+    assert main._log_level(" Warning ") == logging.WARNING
+    assert main._log_level("bogus") is None and main._log_level("basic_format") is None
+    # The real failure mode: INSPECTOR_LOG_LEVEL=debug -> logging.basicConfig("debug")
+    # raised ValueError at import, and Docker restarted the container forever.
+    for value, warns in (("debug", False), ("bogus", True)):
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", "import main"],
+            cwd=TMP, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "LOG_LEVEL": value, "PYTHONPATH": str(ROOT / "inspector")},
+        )
+        assert proc.returncode == 0, (value, proc.stderr[-800:])
+        assert ("is not a log level; using INFO" in proc.stderr) is warns, (value, proc.stderr[-800:])
+
+
+def test_ml_is_appended_to_sys_path_not_prepended():
+    # inspector/config and ml/config are both namespace packages with a
+    # settings.py: with ml/ in front, a (re-)import of config.settings after
+    # detector_service resolved to the ML toolchain's settings.
+    ml_dir, inspector_dir = str(ROOT / "ml"), str(ROOT / "inspector")
+    assert sys.path.index(ml_dir) > sys.path.index(inspector_dir), sys.path[:4]
+    probe = (
+        "import sys, services.detector_service; "
+        "[sys.modules.pop(m) for m in list(sys.modules) if m == 'config' or m.startswith('config.')]; "
+        "import config.settings as s; print(s.__file__)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", probe], cwd=TMP, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONPATH": inspector_dir},
+    )
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert Path(proc.stdout.strip()) == ROOT / "inspector" / "config" / "settings.py", proc.stdout
+
+
 # ---- HTTP ----------------------------------------------------------------------------
 def test_http_status_and_health_without_model():
     _reset()
@@ -535,6 +572,11 @@ def test_http_inspect_422_cases():
     code, body = _post_file(b"")
     assert code == 422, (code, body)
     code, body = _request("POST", "/api/v1/inspect", fields={"capture_id": "../etc"})
+    assert code == 422 and body["detail"] == "invalid capture_id", (code, body)
+    # fullmatch, not re.match: "$" alone would accept a trailing newline
+    code, body = _request("POST", "/api/v1/inspect", fields={"capture_id": "abc\n"})
+    assert code == 422 and body["detail"] == "invalid capture_id", (code, body)
+    code, body = _post_file(_jpeg(), capture_id="abc\n")  # an upload does not excuse a bad id
     assert code == 422 and body["detail"] == "invalid capture_id", (code, body)
     code, body = _request("POST", "/api/v1/inspect", fields={"other": "x"})
     assert code == 422, (code, body)

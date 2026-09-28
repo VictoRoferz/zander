@@ -61,8 +61,8 @@ from services.live_camera import live_camera  # noqa: E402
 AUTH = {"X-Preview-Token": TOKEN}
 STATUS_KEYS = {"enabled", "state", "source", "camera_model", "camera_serial", "profile",
                "fps_target", "fps_measured", "clients", "frame_seq", "last_frame_age_s",
-               "frames_incomplete", "reconnects", "last_error", "preview_width",
-               "preview_height", "boot_id"}
+               "stream_age_s", "frames_incomplete", "reconnects", "last_error",
+               "preview_width", "preview_height", "boot_id"}
 
 client = TestClient(main.app)  # peer "testclient", Host "testserver"
 local = TestClient(main.app, base_url="http://localhost", client=("127.0.0.1", 50000))
@@ -214,7 +214,7 @@ def test_flag_off_capture_is_202_and_spools():
         assert _spooled(r.json()["capture_id"])[1]["triggered_by"] == "anna@example.com"
 
         status = client.get("/api/v1/status").json()
-        assert status["version"] == "3.1.0"
+        assert status["version"] == "3.2.0"
         assert status["live"]["enabled"] is False and set(status["live"]) == STATUS_KEYS
         assert status["camera"]["use_camera"] is False and "owner" not in status["camera"]
         assert status["spool"]["pending"] >= 2
@@ -234,6 +234,50 @@ def test_flag_on_capture_goes_through_the_owner():
         assert status["camera"]["owner"] == "live"
         r = client.post("/api/v1/test-camera")
         assert r.status_code == 200 and r.json()["source"] == "fallback"
+
+
+def test_spool_write_survives_a_briefly_locked_file():
+    # Windows: os.replace onto a file another process has open raises
+    # PermissionError (WinError 32) for a moment; the capture must still spool.
+    import services.storage_service as ss
+
+    real, calls = os.replace, []
+
+    def locked(times):
+        def replace(src, dst):
+            calls.append(str(dst))
+            if len(calls) <= times:
+                raise PermissionError(13, "being used by another process", str(dst))
+            return real(src, dst)
+        return replace
+
+    saved = ss._REPLACE_RETRIES
+    try:
+        ss._REPLACE_RETRIES = 5  # the Windows setting
+        os.replace = locked(times=1)
+        with configured(live_preview_enabled=False):
+            r = client.post("/api/v1/capture")
+        assert r.status_code == 202, r.text
+        _spooled(r.json()["capture_id"])
+        assert len(calls) == 3, calls  # the image (locked once, then ok) + its sidecar
+
+        # A lock that never goes away: the error surfaces, no temp file is left.
+        target = DATA_ROOT / "atomic" / "x.bin"
+        for retries in (5, 0):  # Windows, then POSIX
+            calls.clear()
+            ss._REPLACE_RETRIES = retries
+            os.replace = locked(times=10**6)
+            try:
+                ss._atomic_write_bytes(target, b"data")
+                raise AssertionError("expected PermissionError")
+            except PermissionError:
+                pass
+            assert len(calls) == retries + 1, (retries, calls)
+            assert not [p for p in target.parent.iterdir() if p.name.endswith(".tmp")]
+    finally:
+        os.replace = real
+        ss._REPLACE_RETRIES = saved
+    assert ss._REPLACE_RETRIES == (5 if os.name == "nt" else 0)  # POSIX: one attempt
 
 
 def test_root_lists_the_preview_endpoints():

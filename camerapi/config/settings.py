@@ -19,7 +19,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "camera-service"
-    service_version: str = "3.1.0"
+    service_version: str = "3.2.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"
@@ -54,10 +54,13 @@ class Settings(BaseSettings):
     preview_idle_stop_s: float = Field(default=10.0, ge=0)
     preview_max_clients: int = Field(default=8, ge=1, le=256)
     camera_reconnect_max_backoff_s: float = Field(default=30.0, gt=0)
-    # Per-GrabOne-attempt timeout in live mode (3 attempts per capture).
+    # Per-GrabOne-attempt timeout in live mode (3 attempts per capture). Not
+    # used on the WiFi profile: a frame takes ~8 s there, so a capture makes
+    # one 30 s attempt, as the one-shot path does.
     live_grab_timeout_ms: int = Field(default=5000, ge=100)
     # A capture request waits this long for the camera owner, then falls back
-    # to sample.jpg (as a failed legacy grab does).
+    # to sample.jpg (as a failed legacy grab does). At least 35 s on the WiFi
+    # profile.
     live_capture_timeout_s: float = Field(default=20.0, gt=0)
 
     # ---- Local spool ----

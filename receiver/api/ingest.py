@@ -11,14 +11,16 @@ lets a re-send short-circuit to a 200 without creating a duplicate task.
 
 Status contract (drives the Pi's retry policy):
   200 → stored + LS task created (or already existed). Pi deletes the spool entry.
-  422 → bad payload (unparseable metadata / empty image / sha mismatch). Poison;
-        the Pi parks it in spool/failed/.
+  422 → bad payload (invalid capture_id / unparseable metadata / empty image /
+        sha mismatch). Poison; the Pi parks it in spool/failed/. The capture_id
+        is checked before anything else: it names the files on disk.
   503 → Label Studio not reachable. Pi keeps the entry and retries later.
 
 Predictions (docs/CONTRACTS.md section 6): once the capture is stored and its
 task marker written, it is handed to the prediction worker; a re-send that is
-deduped is handed over only if it has no pred.json yet. The hand-off is an
-O(1) non-blocking enqueue wrapped so it can never change the ACK.
+deduped is handed over only if it still needs a prediction (no pred.json, a
+transient error or no_model: the rescan rule). The hand-off is a
+non-blocking enqueue wrapped so it can never change the ACK.
 """
 from __future__ import annotations
 
@@ -29,7 +31,11 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from models.schemas import CaptureMetadata
 from services.labelstudio_service import labelstudio_service
-from services.prediction_service import prediction_service
+from services.prediction_service import (
+    CAPTURE_ID_PATTERN,
+    needs_prediction,
+    prediction_service,
+)
 from services.storage_service import storage_service
 
 logger = logging.getLogger("receiver.ingest")
@@ -37,10 +43,10 @@ logger = logging.getLogger("receiver.ingest")
 router = APIRouter(prefix="/api/v1", tags=["ingest"])
 
 
-def _queue_prediction(capture_id: str, only_if_missing: bool = False) -> None:
+def _queue_prediction(capture_id: str, only_if_needed: bool = False) -> None:
     """Hand the capture to the prediction worker. Never raises, never blocks."""
     try:
-        if only_if_missing and storage_service.has_prediction(capture_id):
+        if only_if_needed and not needs_prediction(storage_service.read_prediction(capture_id)):
             return
         prediction_service.enqueue(capture_id)
     except Exception as e:  # the ingest ACK must not depend on predictions
@@ -49,7 +55,10 @@ def _queue_prediction(capture_id: str, only_if_missing: bool = False) -> None:
 
 @router.post("/ingest")
 async def ingest(
-    capture_id: str = Form(...),
+    # Validated by FastAPI before this body runs (422, a validation error), so an
+    # id like "../x" or "abc\n" never reaches a file path. Same rule as the
+    # dashboard and the inspector; camerapi sends uuid4 hex (32 characters).
+    capture_id: str = Form(..., pattern=CAPTURE_ID_PATTERN),
     metadata_json: str = Form(...),
     file: UploadFile = File(...),
 ) -> dict:
@@ -57,7 +66,7 @@ async def ingest(
     if storage_service.has_task_marker(capture_id):
         existing = storage_service.read_task_marker(capture_id)
         logger.info(f"[{capture_id}] already ingested (task {existing}); ack")
-        _queue_prediction(capture_id, only_if_missing=True)
+        _queue_prediction(capture_id, only_if_needed=True)
         return {
             "status": "ok",
             "capture_id": capture_id,
