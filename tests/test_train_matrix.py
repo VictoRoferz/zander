@@ -253,7 +253,8 @@ def test_dry_run_trains_nothing():
 
 
 def test_committed_matrix_configs_load():
-    cfgs = sorted(str(p) for p in (ML / "configs" / "matrix").glob("*.yaml"))
+    cfgs = sorted(str(p) for p in (ML / "configs" / "matrix").glob("*.yaml")
+                  if not p.name.startswith("deim_"))  # DEIM: tests/test_deim_override.py
     items, errors = M.load_items(cfgs, {})
     assert not errors and len(items) == 12, errors
     assert {it.family for it in items} == {"yolo26n_def3", "yolo26s_def3", "yolo11s_def3", "yolo26n_nal1"}
