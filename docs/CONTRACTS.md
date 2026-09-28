@@ -149,6 +149,7 @@ Log strings stay ASCII (Windows cp1252 consoles).
  "state": "pending"|"ok"|"no_model"|"error"|"none",
  "prediction": null | <pred.json as stored>}
 ```
+  - `/api/latest` is the newest capture by the sidecar's `captured_at` (the image mtime while the sidecar is missing or has no valid time), not by arrival: after a spool backlog camerapi uploads in uuid order.
   - `width`/`height` come from `prediction.image_*`, falling back to the capture sidecar.
   - `state` is the file's `status` when a prediction file exists. Without one it is `pending` while the photo is younger than `PREDICTION_PENDING_TIMEOUT_S`, and `none` after that.
   - A `schema_version > 1` gives `state:"error"` ("unsupported").

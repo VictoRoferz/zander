@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # The dashboard reads its settings at import time: set them all first.
@@ -70,19 +71,32 @@ def set_age(path, age_s):
     os.utime(path, (t, t))
 
 
-def make_capture(cid, age_s=0.0, sidecar=True, source="basler", directory=None):
+def iso(age_s):
+    """captured_at the way camerapi writes it (pydantic: UTC, "Z"), age_s ago."""
+    t = datetime.fromtimestamp(time.time() - age_s, tz=timezone.utc)
+    return t.isoformat().replace("+00:00", "Z")
+
+
+def write_sidecar(cid, captured_at, source="basler", directory=None):
+    (directory or UNLABELED).joinpath(f"{cid}.json").write_text(json.dumps({
+        "capture_id": cid,
+        "captured_at": captured_at,
+        "triggered_by": "op@example.com",
+        "source": source,
+        "width": 2616,
+        "height": 1960,
+    }), "utf-8")
+
+
+def make_capture(cid, age_s=0.0, sidecar=True, source="basler", directory=None,
+                 captured_at=None):
+    """An image aged age_s (+ sidecar). captured_at defaults to the image's
+    own age: camerapi stamps the photo a moment before the receiver stores it."""
     directory = directory or UNLABELED
     jpg = directory / f"{cid}.jpg"
     jpg.write_bytes(b"\xff\xd8\xff\xd9")   # never decoded by the dashboard
     if sidecar:
-        (directory / f"{cid}.json").write_text(json.dumps({
-            "capture_id": cid,
-            "captured_at": "2026-09-28T10:00:00Z",
-            "triggered_by": "op@example.com",
-            "source": source,
-            "width": 2616,
-            "height": 1960,
-        }), "utf-8")
+        write_sidecar(cid, iso(age_s) if captured_at is None else captured_at, source, directory)
     set_age(jpg, age_s)
     return jpg
 
@@ -236,8 +250,9 @@ def test_newest_capture_is_cached_on_directory_mtime():
 
 def test_newest_capture_ttl_and_full_restat():
     d = Path(tempfile.mkdtemp(prefix="index-", dir=TMP))
-    make_capture("a", age_s=30, directory=d)
-    make_capture("b", age_s=10, directory=d)
+    # No sidecars: these rank by mtime, which only a full re-stat refreshes.
+    make_capture("a", age_s=30, sidecar=False, directory=d)
+    make_capture("b", age_s=10, sidecar=False, directory=d)
     index = dash._CaptureIndex(d, ttl_s=0.0, full_restat_s=0.0)
     assert index.newest() == "b"
     set_age(d / "a.jpg", -2)   # touched in place: no directory change
@@ -246,6 +261,62 @@ def test_newest_capture_ttl_and_full_restat():
 
 def test_newest_capture_missing_directory():
     assert dash._CaptureIndex(TMP / "does-not-exist").newest() is None
+
+
+def test_newest_capture_by_capture_time_not_arrival():
+    # A spool backlog drains in uuid order: the photo taken last can arrive
+    # first. The panel must show the photo taken last.
+    d = Path(tempfile.mkdtemp(prefix="index-", dir=TMP))
+    index = dash._CaptureIndex(d)
+    make_capture("taken-last", age_s=30, captured_at=iso(300), directory=d)   # arrived first
+    make_capture("taken-first", age_s=10, captured_at=iso(500), directory=d)  # arrived last
+    make_capture("taken-mid", age_s=20, captured_at=iso(400), directory=d)
+    assert index.newest() == "taken-last"
+    make_capture("live", age_s=0, captured_at=iso(1), directory=d)            # a new capture
+    assert index.newest() == "live"
+
+
+def test_newest_capture_without_a_usable_time_ranks_by_mtime():
+    d = Path(tempfile.mkdtemp(prefix="index-", dir=TMP))
+    index = dash._CaptureIndex(d)
+    make_capture("dated", age_s=5, captured_at=iso(100), directory=d)
+    # The receiver writes the image before its sidecar: until then the new
+    # capture ranks by its (fresh) mtime...
+    make_capture("arriving", age_s=0, sidecar=False, directory=d)
+    assert index.newest() == "arriving"
+    # ...and once the sidecar lands (the directory changes), by its captured_at.
+    write_sidecar("arriving", iso(200), directory=d)
+    assert index.newest() == "dated"
+    # An unparseable captured_at falls back to the mtime too.
+    make_capture("garbled", age_s=0, captured_at="yesterday-ish", directory=d)
+    assert index.newest() == "garbled"
+
+
+def test_newest_capture_reads_each_sidecar_once():
+    d = Path(tempfile.mkdtemp(prefix="index-", dir=TMP))
+    for n, cid in enumerate(("a", "b", "c")):
+        make_capture(cid, age_s=30 - n, captured_at=iso(300 - n), directory=d)
+    index = dash._CaptureIndex(d, ttl_s=0.0, full_restat_s=0.0)   # every call rescans, fully
+    reads = []
+    real = dash._sidecar_captured_at
+    dash._sidecar_captured_at = lambda path: reads.append(path.name) or real(path)
+    try:
+        assert index.newest() == "c" and sorted(reads) == ["a.json", "b.json", "c.json"]
+        reads.clear()
+        assert index.newest() == "c" and reads == [], reads   # known: never re-read
+        make_capture("d", age_s=0, captured_at=iso(1), directory=d)
+        assert index.newest() == "d" and reads == ["d.json"], reads
+    finally:
+        dash._sidecar_captured_at = real
+
+
+def test_iso_timestamp():
+    assert dash._iso_timestamp("2026-09-28T10:00:00Z") == 1790589600.0
+    assert dash._iso_timestamp("2026-09-28T10:00:00.250000+00:00") == 1790589600.25
+    assert dash._iso_timestamp("2026-09-28T12:00:00+02:00") == 1790589600.0
+    assert dash._iso_timestamp("2026-09-28T10:00:00") == 1790589600.0   # no offset = UTC
+    for bad in (None, "", "   ", "yesterday", 1790589600, "2026-13-01T00:00:00Z"):
+        assert dash._iso_timestamp(bad) is None, repr(bad)
 
 
 # ---- capture view -----------------------------------------------------------------
@@ -258,7 +329,7 @@ def test_capture_id_validation():
 
 
 def test_capture_fields():
-    make_capture("fields", source="fallback")
+    make_capture("fields", source="fallback", captured_at="2026-09-28T10:00:00Z")
     view = dash._capture_view("fields")
     assert set(view) == {"capture", "state", "prediction"}
     cap = view["capture"]
@@ -623,6 +694,10 @@ TESTS = [
     test_newest_capture_is_cached_on_directory_mtime,
     test_newest_capture_ttl_and_full_restat,
     test_newest_capture_missing_directory,
+    test_newest_capture_by_capture_time_not_arrival,
+    test_newest_capture_without_a_usable_time_ranks_by_mtime,
+    test_newest_capture_reads_each_sidecar_once,
+    test_iso_timestamp,
     test_capture_id_validation,
     test_capture_fields,
     test_pending_then_none,

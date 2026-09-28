@@ -38,6 +38,7 @@ import stat
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -360,7 +361,7 @@ def thumb(
 
 @app.get("/api/latest")
 def api_latest(_: str = Depends(auth.current_user_email)) -> dict:
-    """The newest capture (by image mtime) with its prediction state."""
+    """The newest capture (by capture time, see _CaptureIndex) with its prediction state."""
     for _attempt in range(2):
         capture_id = _newest_capture()
         if capture_id is None:
@@ -619,16 +620,23 @@ def _unlabeled_from_folder(labeled_ids: set[str]) -> list[dict]:
 
 class _CaptureIndex:
     """
-    Finds the newest capture in unlabeled/ (by image mtime) cheaply enough to
-    be polled every 750 ms.
+    Finds the newest capture in unlabeled/ cheaply enough to be polled every
+    750 ms. Newest = the latest CAPTURE time (the sidecar's captured_at), not
+    the latest arrival: after a spool backlog camerapi uploads in uuid order,
+    so image mtimes do not follow capture order. A capture without a usable
+    captured_at (no sidecar yet, or an invalid one) ranks by its image mtime.
 
     A rescan happens when the directory's mtime_ns changes (a file was added,
     replaced or removed) or after `ttl_s`, because a bind mount (Docker on
-    Windows) may not report directory mtimes reliably. Stats are slow on such
-    mounts, so a rescan only stats files it has not seen; known files keep
-    their first-seen mtime (a jpg is only rewritten when an ingest is retried)
-    until the full re-stat every `full_restat_s`. The pending age of a capture
-    never comes from here: _capture_view stats its image itself.
+    Windows) may not report directory mtimes reliably. Stats and reads are
+    slow on such mounts, so a rescan only stats files it has not seen; known
+    files keep their first-seen mtime (a jpg is only rewritten when an ingest
+    is retried) until the full re-stat every `full_restat_s`. A sidecar is
+    read once per capture (captured_at never changes): a missing one is
+    retried on the next rescan while its image is younger than
+    `full_restat_s` (the receiver writes the image first), an unusable one on
+    the next full re-stat. The pending age of a capture never comes from here:
+    _capture_view stats its image itself.
     """
 
     def __init__(self, directory: Path, ttl_s: float = 5.0, full_restat_s: float = 60.0) -> None:
@@ -637,6 +645,8 @@ class _CaptureIndex:
         self.full_restat_s = full_restat_s
         self._lock = threading.Lock()
         self._mtimes: dict[str, float] = {}
+        # capture_id -> captured_at (POSIX s), or None = no usable time (mtime ranks)
+        self._captured: dict[str, Optional[float]] = {}
         self._newest: Optional[str] = None
         self._dir_mtime_ns: Optional[int] = None
         self._scanned_at = -math.inf
@@ -654,6 +664,7 @@ class _CaptureIndex:
         except OSError:
             with self._lock:
                 self._mtimes, self._newest, self._dir_mtime_ns = {}, None, None
+                self._captured = {}
             return None
         with self._lock:
             now = time.monotonic()
@@ -693,16 +704,71 @@ class _CaptureIndex:
                         continue
                     mtime = st.st_mtime
                 fresh[capture_id] = mtime
-        self._mtimes = fresh
-        # Ties (coarse mtimes) are broken by id so the answer is stable.
-        self._newest = max(fresh, key=lambda k: (fresh[k], k)) if fresh else None
+
+        now = time.time()
+        captured: dict[str, Optional[float]] = {}
+        for capture_id, mtime in fresh.items():
+            if capture_id in self._captured:
+                value = self._captured[capture_id]
+                if value is not None or not full:
+                    captured[capture_id] = value
+                    continue
+            value = _sidecar_captured_at(self.directory / f"{capture_id}.json")
+            if value is _NO_SIDECAR:
+                if abs(now - mtime) < self.full_restat_s:
+                    continue  # probably not written yet: try again next rescan
+                value = None
+            captured[capture_id] = value
+        self._mtimes, self._captured = fresh, captured
+
+        def rank(capture_id: str) -> tuple[float, float, str]:
+            # Ties (coarse clocks) are broken by mtime, then id: a stable answer.
+            mtime = fresh[capture_id]
+            at = captured.get(capture_id)
+            return (mtime if at is None else at, mtime, capture_id)
+
+        self._newest = max(fresh, key=rank) if fresh else None
+
+
+_NO_SIDECAR = object()  # _sidecar_captured_at: the file cannot be read (yet)
+
+
+def _sidecar_captured_at(path: Path) -> Any:
+    """A capture sidecar's captured_at as a POSIX timestamp; None when the file
+    has no usable one; _NO_SIDECAR when it cannot be read."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return _NO_SIDECAR
+    try:
+        data = json.loads(raw.decode("utf-8"), parse_constant=lambda _name: None)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return _iso_timestamp(data.get("captured_at")) if isinstance(data, dict) else None
+
+
+def _iso_timestamp(value: Any) -> Optional[float]:
+    """An ISO-8601 time as a POSIX timestamp (no offset = UTC); None if invalid."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1] in "Zz":
+        text = text[:-1] + "+00:00"  # datetime.fromisoformat takes "Z" only from 3.11
+    try:
+        moment = datetime.fromisoformat(text)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        stamp = moment.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+    return stamp if math.isfinite(stamp) else None
 
 
 _capture_index = _CaptureIndex(UNLABELED_DIR)
 
 
 def _newest_capture() -> Optional[str]:
-    """capture_id of the newest image in unlabeled/, or None if there is none."""
+    """capture_id of the newest capture in unlabeled/, or None if there is none."""
     return _capture_index.newest()
 
 
