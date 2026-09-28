@@ -1458,6 +1458,7 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
     (docs/CONTRACTS.md §8.1; the dispatch entry point for `framework: deim`)."""
     config_path = Path(config_path)
     overrides = dict(overrides or {})
+    resolve_config(B.load_config(config_path), overrides)  # config errors first: pure, no deps
     missing = missing_modules()
     if missing:
         raise B.ConfigError(

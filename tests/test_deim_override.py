@@ -491,8 +491,12 @@ def test_dispatch_routes_deim_configs_to_run_from_config():
         assert calls[-1][1:3] == ("cpu", {"epochs": 7})
     assert dispatch.framework_of(B.load_config(path)) == "deim"
     assert dispatch.resolve(path) == D.resolve_config(B.load_config(path))
-    rc = dispatch.main(["--config", str(_write_cfg(final_weights="best"))])
+    best = _write_cfg(final_weights="best")
+    rc = dispatch.main(["--config", str(best)])
     assert rc == dispatch.EXIT_CONFIG, "config errors are not retried by the matrix"
+    # ... and reported as such even where DEIM's deps are missing (checked after the config)
+    with patched((D, "missing_modules", lambda *a: ["faster_coco_eval"])):
+        _raises(B.ConfigError, lambda: D.run_from_config(best), "selection leak")
 
 
 def test_device_plan_and_commands():
