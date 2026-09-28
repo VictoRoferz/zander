@@ -1,13 +1,17 @@
-# Zander hub — Label Studio + receiver + dashboard (the whole system runs on
-# this one PC; camerapi + the USB button run natively on the host, started by
-# start-zander.bat, because a container can't reach the GigE camera or hook
-# USB keyboard input).
+# Zander hub — Label Studio + receiver + dashboard + inspector (the whole
+# system runs on this one PC; camerapi + the USB button run natively on the
+# host, started by start-zander.bat, because a container can't reach the GigE
+# camera or hook USB keyboard input).
 # Start:  docker compose up -d      (run from this deploy/ folder)
 # Config: edit ./.env (copy from .env.example) — that's the only file to touch.
 #
-# All three services share ONE folder so Label Studio can serve images off disk:
-#   host ${DATA_DIR}  ->  /data  in every container
+# All services share ONE folder so Label Studio can serve images off disk:
+#   host ${DATA_DIR}  ->  /data  in every container (read-only for the inspector)
 #   LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT == DATA_ROOT == /data
+# Predictions: the receiver sends each capture to the inspector and writes
+# /data/predictions/<id>.pred.json. The model + its card live in
+# ${DATA_DIR}/models/ (detector.onnx + detector.json); after replacing them run
+# `docker compose restart inspector`.
 name: zander
 
 services:
@@ -40,6 +44,10 @@ services:
       LABELSTUDIO_URL: http://labelstudio:8080      # in-network API endpoint
       LABELSTUDIO_API_KEY: ${LABELSTUDIO_API_KEY:-}
       LABELSTUDIO_PROJECT_NAME: ${LABELSTUDIO_PROJECT_NAME:-PCB Defect Inspection}
+      # "-" (not ":-"): unset -> the inspector container; set EMPTY in .env to
+      # turn predictions off. No depends_on: the receiver never waits for it.
+      INSPECTOR_URL: ${INSPECTOR_URL-http://inspector:8004}
+      INSPECTOR_TIMEOUT: ${INSPECTOR_TIMEOUT:-60}
     volumes:
       - ${DATA_DIR:-./data}:/data
     depends_on:
@@ -66,6 +74,10 @@ services:
       # Native camerapi on this PC ("Capture" button). Docker Desktop
       # (Windows/macOS) resolves host.docker.internal to the host.
       CAMERAPI_URL: ${CAMERAPI_URL:-http://host.docker.internal:8001}
+      # Live preview relay: must equal PREVIEW_TOKEN in camerapi\.env.
+      PREVIEW_TOKEN: ${PREVIEW_TOKEN:-}
+      # A capture without pred.json shows "pending" this long, then "none".
+      PREDICTION_PENDING_TIMEOUT_S: ${PREDICTION_PENDING_TIMEOUT_S:-60}
     volumes:
       - ${DATA_DIR:-./data}:/data
     depends_on:
@@ -77,6 +89,31 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  inspector:
+    # Built from the repo root: the image needs inspector/ + ml/infer/ (the
+    # repo-root .dockerignore is an allowlist of exactly those two).
+    build:
+      context: ..
+      dockerfile: inspector/Dockerfile
+    container_name: zander-inspector
+    ports:
+      - "127.0.0.1:8004:8004"  # this PC only; the receiver uses the compose network
+    environment:
+      DATA_ROOT: /data
+      MODEL_PATH: /data/models/detector.onnx  # + detector.json next to it
+      ORT_THREADS: ${INSPECTOR_ORT_THREADS:-0}
+      LOG_LEVEL: ${INSPECTOR_LOG_LEVEL:-INFO}
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+    restart: unless-stopped
+    healthcheck:
+      # Liveness only: stays healthy without a model (/api/v1/status says why).
+      test: ["CMD", "curl", "-f", "http://localhost:8004/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   ls_internal:
