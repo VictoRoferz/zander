@@ -9,6 +9,10 @@ images directly from `data_root` via local-files serving — so the receiver's
 
 Cross-platform: `data_root` defaults to ~/zander-data, which resolves on both
 Windows (C:\\Users\\<u>\\zander-data) and macOS (/Users/<u>/zander-data).
+
+Predictions (docs/CONTRACTS.md section 6): with INSPECTOR_URL set, every
+ingested capture is queued for the inspector and the result is written to
+data_root/predictions/<id>.pred.json. Empty INSPECTOR_URL = predictions off.
 """
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,7 +21,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "zander-receiver"
-    service_version: str = "2.0.0"
+    service_version: str = "2.1.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"
@@ -33,6 +37,14 @@ class Settings(BaseSettings):
     labelstudio_project_name: str = "PCB Defect Inspection"
     labelstudio_timeout: int = 30
 
+    # ---- Predictions (inspector, optional) ----
+    # "" = off. Compose: http://inspector:8004; scripts/launch.py injects
+    # http://localhost:8004 when it started the inspector itself.
+    inspector_url: str = ""
+    inspector_timeout: float = 60.0  # one /inspect call (a full photo on CPU)
+    inspector_status_timeout: float = 5.0  # the /status pre-check
+    prediction_queue_max: int = 1000
+
     # ---- Logging ----
     log_level: str = "INFO"
 
@@ -47,8 +59,10 @@ class Settings(BaseSettings):
         super().__init__(**kwargs)
         # Expand a leading ~ if DATA_ROOT was given as "~/zander-data".
         self.data_root = self.data_root.expanduser()
+        self.inspector_url = self.inspector_url.strip().rstrip("/")
         self.unlabeled_dir.mkdir(parents=True, exist_ok=True)
         self.labeled_dir.mkdir(parents=True, exist_ok=True)
+        self.predictions_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Derived paths ----
 
@@ -59,6 +73,10 @@ class Settings(BaseSettings):
     @property
     def labeled_dir(self) -> Path:
         return self.data_root / "labeled"
+
+    @property
+    def predictions_dir(self) -> Path:
+        return self.data_root / "predictions"
 
 
 # Global settings instance.

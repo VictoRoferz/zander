@@ -5,8 +5,13 @@ Runs on the laptop next to Label Studio. Responsibilities:
   POST /api/v1/ingest                     — intake a capture from the Pi:
                                             store it + create the LS task
   POST /api/v1/webhook/annotation-created — LS callback: export labeled data
-  GET  /api/v1/status                     — paths, counts, LS health
+  POST /api/v1/predict/{capture_id}       — re-queue one capture for the inspector
+  GET  /api/v1/status                     — paths, counts, LS + prediction health
   GET  /api/v1/health                     — liveness
+
+Predictions: with INSPECTOR_URL set, a background worker (started in the
+lifespan) sends every ingested capture to the inspector and writes
+data_root/predictions/<id>.pred.json (docs/CONTRACTS.md sections 2 and 6).
 
 Label Studio reads images straight from data_root via local-files serving, so
 the receiver owns LS project + local-storage setup. The dashboard reads LS
@@ -22,9 +27,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.ingest import router as ingest_router
+from api.predictions import router as predictions_router
 from api.webhooks import router as webhook_router
 from config.settings import settings
 from services.labelstudio_service import labelstudio_service
+from services.prediction_service import prediction_service
 from services.storage_service import storage_service
 
 logging.basicConfig(
@@ -37,8 +44,11 @@ LOG = logging.getLogger("receiver")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     LOG.info(
-        f"receiver starting: data_root={settings.data_root} ls={settings.labelstudio_url}"
+        f"receiver starting: data_root={settings.data_root} ls={settings.labelstudio_url} "
+        f"inspector={settings.inspector_url or 'off'}"
     )
+    # First: independent of Label Studio, whose init below may retry for a while.
+    prediction_service.start()
     # Bring Label Studio up if we can, but DON'T crash if it isn't ready yet —
     # /ingest lazily re-initializes and returns 503 until LS is reachable, so
     # the Pi's spool just retries. This is strictly safer than dropping tasks.
@@ -51,6 +61,7 @@ async def lifespan(app: FastAPI):
         )
     yield
     LOG.info("receiver shutting down")
+    prediction_service.stop()
 
 
 app = FastAPI(title="zander-receiver", version=settings.service_version, lifespan=lifespan)
@@ -64,6 +75,7 @@ app.add_middleware(
 
 app.include_router(ingest_router)
 app.include_router(webhook_router)
+app.include_router(predictions_router)
 
 
 @app.get("/api/v1/status")
@@ -74,11 +86,18 @@ async def status() -> dict:
         "data_root": str(settings.data_root),
         "unlabeled_dir": str(settings.unlabeled_dir),
         "labeled_dir": str(settings.labeled_dir),
+        "predictions_dir": str(settings.predictions_dir),
         "unlabeled_count": storage_service.count_unlabeled(),
         "labeled_count": storage_service.count_labeled(),
         "label_studio": {
             "url": settings.labelstudio_url,
             "ready": labelstudio_service.is_healthy(),
+        },
+        "predictions": {
+            "enabled": prediction_service.enabled,
+            "inspector_url": settings.inspector_url or None,
+            "queue_depth": prediction_service.queue_depth(),
+            "count": storage_service.count_predictions(),
         },
     }
 
@@ -95,6 +114,7 @@ async def root() -> dict:
         "endpoints": {
             "ingest": "POST /api/v1/ingest",
             "webhook": "POST /api/v1/webhook/annotation-created",
+            "predict": "POST /api/v1/predict/{capture_id}?force=false",
             "status": "GET /api/v1/status",
             "health": "GET /api/v1/health",
         },
