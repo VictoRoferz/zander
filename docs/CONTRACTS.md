@@ -37,7 +37,7 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 - If `verifier` is null, `conf_floor <= threshold` (export writes them equal). Otherwise `conf_floor == verifier.candidate_floor`.
 - `tiler_version`, `tile_size` and `stride` equal `infer.tiling`'s constants.
 
-**Why `conf_floor == threshold` is safe without a verifier.** Merging is greedy by descending score, and a kept box keeps its maximum score. So the verdict, the class set and `photo_score` are identical at floor t and at 0.001. Only box outlines are tighter.
+**Why `conf_floor == threshold` is safe without a verifier.** Merging is greedy by descending score, and a kept box keeps its maximum score. So the verdict and the class set are identical at floor t and at 0.001, and so is `photo_score` for NiO photos. Only box outlines are tighter. For iO photos `photo_score` is **0.0** at floor t (no box below t is ever produced), so it is not a confidence and the UI never shows it.
 
 **Inspector behaviour:**
 - **The card is authoritative.** When a card exists, `ADAPTER`, `CONFIDENCE_THRESHOLD` and `CLASS_NAMES` from the environment are ignored, with a WARNING.
@@ -77,7 +77,7 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 | `image_width`, `image_height` | int \| null | the pixel frame of all boxes |
 | `verdict` | `"iO"` \| `"NiO"` \| null | null unless `ok` |
 | `classes` | list[str] | `[]` unless `ok`; in schema order |
-| `photo_score` | float \| null | the highest detection score |
+| `photo_score` | float \| null | the highest detection score; 0.0 for iO photos (nothing reaches `threshold`), so never shown as a confidence |
 | `detections` | list of `{x1,y1,x2,y2: float, score: float, label: str}` | photo-pixel xyxy, highest score first, all ≥ `threshold`; `[]` unless `ok` |
 | `latency_ms` | float \| null | inference time inside the inspector |
 
