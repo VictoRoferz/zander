@@ -22,6 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 import logging
 
 from models.schemas import CaptureMetadata
+from services.prediction_service import is_valid_capture_id
 from services.storage_service import storage_service
 
 logger = logging.getLogger("receiver.webhook")
@@ -109,6 +110,14 @@ async def annotation_created(request: Request, background: BackgroundTasks) -> d
             f"Webhook task {task_id} has no capture_id (meta or filename); ignoring"
         )
         return {"status": "ignored", "reason": "no capture_id"}
+    if not is_valid_capture_id(capture_id):
+        # The id becomes a file name under unlabeled/ and labeled/. The receiver's
+        # port is published, so never build a path from an unchecked one: e.g.
+        # "../unlabeled/<id>" would overwrite that capture's metadata sidecar.
+        logger.warning(
+            f"Webhook task {task_id} has an invalid capture_id {capture_id!r}; ignoring"
+        )
+        return {"status": "ignored", "reason": "invalid capture_id"}
 
     annotation_dict = payload.get("annotation") or {}
     background.add_task(_process_annotation, capture_id, annotation_dict)

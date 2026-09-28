@@ -595,6 +595,38 @@ def test_ingest_rejects_an_invalid_capture_id_before_any_work():
     assert storage_service.has_task_marker(good)
 
 
+def test_webhook_ignores_an_invalid_capture_id():
+    # The webhook builds unlabeled/ and labeled/ paths from the id it is sent; the
+    # receiver's port is published, so the id gets the same rule as /ingest.
+    good = uuid.uuid4().hex
+    _with_recorder(lambda rec: _ingest(good))
+    sidecar = storage_service.unlabeled_metadata_path(good)
+    sidecar_before = sidecar.read_bytes()
+    labeled_before = sorted(p.name for p in settings.labeled_dir.iterdir()) if settings.labeled_dir.exists() else []
+    annotation = {"id": 7, "result": [{"value": {"rectanglelabels": ["Brücke"]}}]}
+
+    for task in (
+        {"id": 1, "meta": {"capture_id": f"../unlabeled/{good}"}},  # would overwrite the sidecar
+        {"id": 2, "meta": {"capture_id": good + "\n"}},
+        {"id": 3, "meta": {}, "data": {"image": "/data/local-files/?d=unlabeled/a.b.jpg"}},
+    ):
+        r = client.post("/api/v1/webhook/annotation-created",
+                        json={"action": "ANNOTATION_CREATED", "task": task, "annotation": annotation})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"status": "ignored", "reason": "invalid capture_id"}, (task, r.json())
+    assert sidecar.read_bytes() == sidecar_before
+    now = sorted(p.name for p in settings.labeled_dir.iterdir()) if settings.labeled_dir.exists() else []
+    assert now == labeled_before, now
+
+    # A valid id still exports (TestClient runs the background task before returning).
+    r = client.post("/api/v1/webhook/annotation-created",
+                    json={"action": "ANNOTATION_CREATED", "task": {"id": 4, "meta": {"capture_id": good}},
+                          "annotation": annotation})
+    assert r.status_code == 200 and r.json()["status"] == "queued", r.text
+    assert storage_service.labeled_image_path(good).exists()
+    assert storage_service.labeled_annotation_path(good).exists()
+
+
 def test_ingest_does_no_inspector_work_inline():
     saved_http = prediction_service.http
     http = FakeHttp()
