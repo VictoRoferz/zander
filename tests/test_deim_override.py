@@ -637,6 +637,94 @@ def test_supervisor_mirrors_every_epoch_and_the_abort_hook():
     assert D.epochs_in_log(log) == 2
 
 
+# ------------------------------------------------------- process tree
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for(cond, timeout=10.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return cond()
+
+
+_TREE = """
+import subprocess, sys, time
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+open(sys.argv[1], "w").write(str(g.pid))
+if sys.argv[2] == "linger":
+    time.sleep(120)
+"""
+
+
+def test_the_whole_process_tree_is_stopped_and_stragglers_swept():
+    # DEIM's DataLoader workers outlive a killed trainer (blocked on a full
+    # result pipe) and keep matrix.py's log pipe open -> the matrix hangs.
+    if os.name != "posix":
+        print("   SKIP: POSIX process groups only")
+        return
+    d = _tmp()
+    script = d / "tree.py"
+    script.write_text(_TREE, encoding="utf-8")
+    pid_file = d / "g1"
+    proc = D.spawn_tree([sys.executable, str(script), str(pid_file), "linger"], dict(os.environ), d,
+                        stderr=__import__("subprocess").DEVNULL)  # the SIGINT tracebacks
+    assert _wait_for(lambda: pid_file.is_file() and pid_file.read_text().strip())
+    grandchild = int(pid_file.read_text())
+    assert os.getpgid(proc.pid) == proc.pid != os.getpgrp(), "own process group"
+    D.stop_tree(proc, grace_s=2.0)
+    assert proc.poll() is not None
+    assert _wait_for(lambda: not _alive(grandchild), 5.0), "the grandchild survived stop_tree"
+    # a subprocess that exits normally but leaves a child behind: swept by run_subprocess
+    pid_file2 = d / "g2"
+    rc = D.run_subprocess([sys.executable, str(script), str(pid_file2), "exit"], dict(os.environ), d, poll_s=0.05)
+    assert rc == 0
+    straggler = int(pid_file2.read_text())
+    assert _wait_for(lambda: not _alive(straggler), 5.0), "the straggler was not swept"
+
+
+def test_a_worker_takes_its_group_down_when_the_runner_dies():
+    if os.name != "posix":
+        print("   SKIP: POSIX process groups only")
+        return
+    d = _tmp()
+    (d / "worker.py").write_text(
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(ML)!r})\n"
+        "from train import deim_run as D\n"
+        "assert D.watch_parent(poll_s=0.1) is not None\n"
+        "open(sys.argv[1], 'w').write('started')\n"
+        "time.sleep(60)\n", encoding="utf-8")
+    (d / "runner.py").write_text(
+        "import os, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]], start_new_session=True)\n"
+        "open(sys.argv[3], 'w').write(str(child.pid))\n"
+        "import time\n"
+        "end = time.time() + 30\n"
+        "while not os.path.exists(sys.argv[2]) and time.time() < end:\n"
+        "    time.sleep(0.05)\n"
+        "os._exit(0)  # the runner dies without any cleanup\n", encoding="utf-8")
+    started, pid_file = d / "started", d / "pid"
+    subprocess_run = __import__("subprocess").run
+    out = subprocess_run([sys.executable, str(d / "runner.py"), str(d / "worker.py"), str(started), str(pid_file)],
+                         env=dict(os.environ), timeout=60)
+    assert out.returncode == 0 and started.is_file(), "the worker never started"
+    worker = int(pid_file.read_text())
+    assert _wait_for(lambda: not _alive(worker), 10.0), "an orphaned worker kept running"
+    assert D.watch_parent() is None, "a process that does not lead its own session is never guarded"
+
+
 # ------------------------------------------------------------- parity
 
 

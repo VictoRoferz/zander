@@ -81,7 +81,11 @@ EMA, optimizer and AMP scaler are restored; the LR schedule is a pure function
 of the iteration), finished -> export + bundle only, none -> fresh (an
 existing run_dir is moved aside, never deleted). A resumed run is
 statistically equivalent to an uninterrupted one, not bit-identical (no RNG
-state in DEIM checkpoints).
+state in DEIM checkpoints). Every DEIM subprocess leads its own process
+group: stopping a run (SIGINT -> SIGTERM -> SIGKILL, also on a SIGTERM from
+matrix.py) stops its DataLoader workers too — orphaned workers otherwise keep
+matrix.py's log pipe open forever — and a worker whose runner died takes its
+group down instead of training on unobserved.
 
 Environment (runtime knobs: recorded per attempt, NOT part of the config):
   ZANDER_WORKERS=<n>           dataloader workers (train + val)   (dispatch.py --workers)
@@ -94,6 +98,7 @@ Environment (runtime knobs: recorded per attempt, NOT part of the config):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import importlib.util
 import json
@@ -103,8 +108,10 @@ import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1087,14 +1094,73 @@ class Supervisor:
         return ABORT_EXIT_CODE if abort else None
 
 
-def _terminate(proc: subprocess.Popen) -> None:
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
+STOP_GRACE_S = 10.0  # SIGINT -> SIGTERM -> SIGKILL within ~20 s (matrix.py waits 30 s before its SIGKILL)
+
+
+def spawn_tree(cmd: list, env: dict, cwd: Path, **kwargs) -> subprocess.Popen:
+    """Start a DEIM subprocess as the leader of its OWN process group, so the
+    whole tree — incl. PyTorch DataLoader workers, which outlive a killed
+    trainer blocked on a full result pipe and keep matrix.py's log pipe open —
+    can be stopped together."""
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    return subprocess.Popen([str(c) for c in cmd], cwd=str(cwd), env=env, **kwargs)
+
+
+def _signal_tree(proc: subprocess.Popen, sig: int) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, sig)  # pgid == pid: spawn_tree made it a session leader
+        elif sig == getattr(signal, "SIGKILL", None):
             proc.kill()
-            proc.wait()
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass  # nobody left in the group
+
+
+def stop_tree(proc: subprocess.Popen, grace_s: float = STOP_GRACE_S) -> None:
+    """SIGINT first (DEIM unwinds and its DataLoader shuts its workers down),
+    then SIGTERM, then SIGKILL — to the whole group; stragglers are killed
+    even when the leader already exited."""
+    if os.name != "posix":
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return
+    for sig, wait in ((signal.SIGINT, grace_s), (signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+        if proc.poll() is not None:
+            break
+        _signal_tree(proc, sig)
+        try:
+            proc.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            pass
+    _signal_tree(proc, signal.SIGKILL)
+
+
+@contextlib.contextmanager
+def sigterm_raises():
+    """matrix.py stops a run with SIGTERM (Popen.terminate); Python's default
+    action would end this process WITHOUT cleanup and leave the trainer's
+    process group running on the GPU. Raise KeyboardInterrupt instead
+    (dispatch.py maps it to exit 130)."""
+    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    old = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, old)
 
 
 def run_subprocess(cmd: list, env: dict, cwd: Path, sup: Optional[Supervisor] = None,
@@ -1105,34 +1171,36 @@ def run_subprocess(cmd: list, env: dict, cwd: Path, sup: Optional[Supervisor] = 
     logger.info("$ " + " ".join(str(c) for c in cmd))
     sys.stdout.flush()
     sys.stderr.flush()
-    proc = subprocess.Popen([str(c) for c in cmd], cwd=str(cwd), env=env)
-    try:
-        while True:
-            rc = proc.poll()
-            if sup is not None and sup.observe() == ABORT_EXIT_CODE:
-                logger.warning(f"{U.ENV_ABORT}={sup.abort_after}: simulating a disconnect after epoch "
-                               f"{sup.seen} (trainer killed, exit {ABORT_EXIT_CODE})")
-                _terminate(proc)
-                for h in logging.getLogger().handlers:
-                    try:
-                        h.flush()
-                    except Exception:
-                        pass
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(ABORT_EXIT_CODE)
-            if rc is not None:
-                break
-            time.sleep(poll_s)
-        if sup is not None:
-            sup.observe()  # the last epoch may land between two polls
-            if sup.pending_ckpt:
-                sup.settle_s = 0.0
-                sup.mirror_now()
-        return rc
-    except BaseException:
-        _terminate(proc)
-        raise
+    with sigterm_raises():
+        proc = spawn_tree(cmd, env, cwd)
+        try:
+            while True:
+                rc = proc.poll()
+                if sup is not None and sup.observe() == ABORT_EXIT_CODE:
+                    logger.warning(f"{U.ENV_ABORT}={sup.abort_after}: simulating a disconnect after epoch "
+                                   f"{sup.seen} (trainer stopped, exit {ABORT_EXIT_CODE})")
+                    stop_tree(proc)
+                    for h in logging.getLogger().handlers:
+                        try:
+                            h.flush()
+                        except Exception:
+                            pass
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(ABORT_EXIT_CODE)
+                if rc is not None:
+                    break
+                time.sleep(poll_s)
+            _signal_tree(proc, signal.SIGKILL if os.name == "posix" else signal.SIGTERM)  # stragglers
+            if sup is not None:
+                sup.observe()  # the last epoch may land between two polls
+                if sup.pending_ckpt:
+                    sup.settle_s = 0.0
+                    sup.mirror_now()
+            return rc
+        except BaseException:
+            stop_tree(proc)
+            raise
 
 
 # ------------------------------------------------------ outputs + checks
@@ -1292,13 +1360,19 @@ def parity_images(layout: DatasetLayout, k: int = PARITY_TILES) -> list:
 
 
 def run_parity(deim_dir: Path, override: Path, checkpoint: Path, onnx_path: Path, images: list,
-               cwd: Path) -> dict:
-    out = subprocess.run([str(c) for c in parity_command(deim_dir, override, checkpoint, onnx_path, images)],
-                         cwd=str(cwd), env=subprocess_env(), capture_output=True, text=True)
-    for line in reversed(out.stdout.splitlines()):
+               cwd: Path, timeout_s: float = 1800.0) -> dict:
+    cmd = parity_command(deim_dir, override, checkpoint, onnx_path, images)
+    with sigterm_raises():
+        proc = spawn_tree(cmd, subprocess_env(), cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+        except BaseException:
+            stop_tree(proc)
+            raise
+    for line in reversed(stdout.splitlines()):
         if line.startswith(PARITY_MARKER):
             return json.loads(line[len(PARITY_MARKER):])
-    raise RuntimeError(f"parity worker failed ({out.returncode}): {(out.stderr or out.stdout)[-2000:]}")
+    raise RuntimeError(f"parity worker failed ({proc.returncode}): {(stderr or stdout)[-2000:]}")
 
 
 def _versions() -> dict:
@@ -1599,6 +1673,25 @@ def dry_run(config_path: Path, device: Optional[str] = None, overrides: Optional
 # sys.path first, so DEIM and its dependencies can never import our modules).
 
 
+def watch_parent(poll_s: float = 5.0) -> Optional[threading.Thread]:
+    """A worker leads its own process group (spawn_tree). If the runner dies
+    (Colab kill, OOM, SIGKILL from matrix.py), take the whole group down —
+    DataLoader workers included — instead of training on unobserved."""
+    if os.name != "posix" or os.getsid(0) != os.getpid():
+        return None  # not started by spawn_tree (e.g. by hand): nothing to guard
+    ppid = os.getppid()
+
+    def run() -> None:
+        while True:
+            time.sleep(poll_s)
+            if os.getppid() != ppid:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+
+    thread = threading.Thread(target=run, name="zander-parent-watch", daemon=True)
+    thread.start()
+    return thread
+
+
 def _enter_deim(deim_dir: str) -> None:
     sys.path[:] = [p for p in sys.path
                    if Path(p or ".").resolve() not in (ML_DIR.resolve(), _TRAIN_DIR.resolve())]
@@ -1743,6 +1836,7 @@ def _worker_main(argv: list) -> int:
     else:
         rest = []
     a = p.parse_args(argv)
+    watch_parent()
     if a._worker == "train":
         return _worker_train(a.deim_dir, rest)
     if a._worker == "export":
