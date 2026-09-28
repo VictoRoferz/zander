@@ -134,8 +134,9 @@ camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ─
   - *The images could not be rebuilt* → the containers run the images built before
     (after a code update: the old version). Get internet, run `update-zander.bat`.
   - *DEGRADED: inspector not running (build failed - needs internet once)* → the
-    inspector image was never built. Capture and labeling work; results show "none"
-    until you start Zander once with internet.
+    inspector image was never built. Capture and labeling work; the result panel says
+    "inspector unreachable" (retried automatically) until you start Zander once with
+    internet.
   - *The Docker containers did not start* → read the `docker compose` messages above
     it (a port in use, a broken `.env`, ...).
 - **Capture:** press the keypad button (F13) or the dashboard's **Capture** button.
