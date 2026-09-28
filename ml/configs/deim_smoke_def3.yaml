@@ -1,0 +1,20 @@
+# DEIM plumbing smoke (CPU, ~15-25 min on an M-series Mac): 2 epochs on ~1 % of
+# fold0 from RANDOM weights (no download) — validates clone -> dataset layout ->
+# override -> DEIM train.py -> mirror/resume -> export -> parity -> bundle, NOT
+# model quality (the name has no fold suffix, so it can never be pooled).
+#   python train/dispatch.py --config configs/deim_smoke_def3.yaml --device cpu
+# Needs DEIM's runtime deps (python train/deim_run.py --check-deps).
+name: deim_s_smoke_def3
+framework: deim
+model: deim_hgnetv2_s_random
+adapter: deim
+dataset_id: ds_v2_def3
+fold: fold0
+epochs: 2
+imgsz: 640
+batch: 4
+seed: 20260806
+final_weights: last
+extra:
+  fraction: 0.01
+  val_fraction: 0.01

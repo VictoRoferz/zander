@@ -1,0 +1,18 @@
+# Final retrain for deployment (split_v2), ONLY if the DEIM family won
+# choose-op/compare on the out-of-fold matrix: every dev photo
+# (dev_all_train = folds 0-2 + train_always), never test. Same recipe as
+# configs/matrix/deim_s_def3_fold*.yaml; its operating point comes from the fold
+# runs, not from this model. final_weights: last is the only choice for DEIM;
+# the "validation" view (fold0_val) lies inside dev_all_train, so DEIM's
+# per-epoch COCO numbers are only a learning-curve monitor.
+name: deim_s_def3_devall
+framework: deim
+model: deim_hgnetv2_s_coco
+adapter: deim
+dataset_id: ds_v2_def3
+fold: dev_all
+epochs: 80
+imgsz: 640
+batch: 16
+seed: 20260806
+final_weights: last

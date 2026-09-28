@@ -1,0 +1,20 @@
+# Phase-1 matrix, OPTIONAL Apache-2.0 challenger: D-FINE-S trained with DEIM v1
+# (pinned in train/deim_run.py), fine-tuned from DEIM's COCO checkpoint — same
+# frozen data (split_v2, 3 classes), same photo-level scorer as the YOLO runs.
+# Schedule, EMA, augmentation mirror and the no-selection policy: see
+# train/deim_run.py. epochs 80: DEIM converges fast and starts COCO-pretrained;
+# 189-216 it/epoch at batch 16 on the 3.0-3.5k fold tiles = 15-17k iterations.
+# batch 16: batch 32 (DEIM's COCO total batch) needs ~28 GiB of FP32
+# activations at the 800-px multi-scale maximum — too close to an L4's 24 GB;
+# the learning rate is scaled linearly (DEIM README).
+name: deim_s_def3_fold1
+framework: deim
+model: deim_hgnetv2_s_coco
+adapter: deim
+dataset_id: ds_v2_def3
+fold: fold1
+epochs: 80
+imgsz: 640
+batch: 16
+seed: 20260806
+final_weights: last
