@@ -1,30 +1,47 @@
 """
 Dashboard service (Mac/Windows).
 
-Standalone read-only UI for the camera pipeline:
+Standalone UI for the camera pipeline:
   - Login (own SQLite users; bcrypt passwords)
   - Counts + thumbnails of unlabeled and labeled captures
   - "Capture" button (proxies to camerapi with X-Triggered-By)
   - "Open Label Studio" button (link)
+  - Live camera panel: login-protected relay of camerapi's MJPEG preview
+    (GET /api/live.mjpg, GET /api/live/status)
+  - "Latest result" panel: the newest capture with its prediction
+    (GET /api/latest, GET /api/captures/{id}; docs/CONTRACTS.md section 5)
 
 The "labeled" view is read LIVE from the Label Studio REST API (LS is the
 single source of truth), so the dashboard always matches LS. "unlabeled" =
 images on disk that LS does not yet report as labeled. Thumbnails are served
 from the local image folder (the same files LS serves via local-files).
+Predictions are read-only here: the receiver writes
+DATA_ROOT/predictions/<id>.pred.json, and "pending" is derived, never stored.
+
+Concurrency: the Label Studio client uses blocking `requests`, and the data
+folder can be a slow bind mount (Docker on Windows), so every endpoint that
+touches Label Studio, SQLite or the data folder is a plain `def` and runs in
+the threadpool. The event loop stays free for the long-lived MJPEG relays,
+which share one httpx.AsyncClient.
 
 Cross-platform paths via pathlib. Reads ~/zander-data/ (override DATA_ROOT).
-Polls every 3s; no SSE in v1.
+The page polls; no SSE/WebSocket.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import re
+import stat
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import anyio
 import httpx
 import uvicorn
 from dotenv import load_dotenv
@@ -42,6 +59,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -49,6 +67,8 @@ from fastapi.templating import Jinja2Templates
 import auth
 import db
 from ls_client import LabelStudioUnavailable, LsClient
+
+SERVICE_VERSION = "2.1.0"
 
 # ---- Setup ----------------------------------------------------------------
 
@@ -71,11 +91,38 @@ def _data_root() -> Path:
     return Path.home() / "zander-data"
 
 
+def _env_float(name: str, default: float) -> float:
+    """A non-negative float from the environment; the default if unset or invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        LOG.warning(f"{name}={raw!r} is not a non-negative number; using {default}")
+        return default
+    return value
+
+
 DATA_ROOT = _data_root()
 UNLABELED_DIR = DATA_ROOT / "unlabeled"
 LABELED_DIR = DATA_ROOT / "labeled"
 UNLABELED_DIR.mkdir(parents=True, exist_ok=True)
 LABELED_DIR.mkdir(parents=True, exist_ok=True)
+
+# Prediction files are written by the receiver only (CONTRACTS section 2).
+# Read-only here, so the folder is never created by the dashboard.
+_PREDICTIONS_OVERRIDE = os.environ.get("PREDICTIONS_DIR", "").strip()
+PREDICTIONS_DIR = (
+    Path(_PREDICTIONS_OVERRIDE).expanduser()
+    if _PREDICTIONS_OVERRIDE
+    else DATA_ROOT / "predictions"
+)
+# A capture without a prediction file shows "pending" for this long after its
+# image landed in unlabeled/, then "none" (inspector off, down or too slow).
+PREDICTION_PENDING_TIMEOUT_S = _env_float("PREDICTION_PENDING_TIMEOUT_S", 60.0)
 
 LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://localhost:8081")
 # Browser-facing LS URL for the "Open Label Studio" link. Differs from
@@ -84,6 +131,11 @@ LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://localhost:8081")
 # (http://localhost:8081). Defaults to LABELSTUDIO_URL for the native setup.
 LABELSTUDIO_PUBLIC_URL = os.environ.get("LABELSTUDIO_PUBLIC_URL", LABELSTUDIO_URL)
 CAMERAPI_URL = os.environ.get("CAMERAPI_URL", "http://localhost:8001")
+# Shared secret for camerapi's live preview (sent as X-Preview-Token). Must be
+# the same value as camerapi's PREVIEW_TOKEN. Empty = rely on camerapi's
+# loopback rule, which only works when the dashboard runs natively on the
+# camera PC. The browser never sees it: the dashboard proxies the stream.
+PREVIEW_TOKEN = os.environ.get("PREVIEW_TOKEN", "").strip()
 
 # Label Studio API access (read-only) for the live labeled view.
 LABELSTUDIO_API_KEY = os.environ.get("LABELSTUDIO_API_KEY", "")
@@ -103,10 +155,39 @@ PORT = int(os.environ.get("PORT", "8003"))
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
+# Outbound HTTP (camerapi). One shared client; per-request timeouts below.
+HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
+CAPTURE_TIMEOUT = httpx.Timeout(60.0, connect=3.0)      # a cold Basler grab is slow
+LIVE_STATUS_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
+# camerapi re-sends a frame (or a placeholder) at least every 2 s, so 15 s of
+# silence means the upstream is stuck and the relay ends.
+LIVE_STREAM_TIMEOUT = httpx.Timeout(15.0, connect=3.0)
+
 # Collapse the 3 near-simultaneous poll endpoints (stats/unlabeled/labeled)
-# into a single LS pass per ~2s window.
+# into a single LS pass per ~2s window. The lock makes it one pass even when
+# the threadpool runs the three requests concurrently; the snapshot dict is
+# replaced as a whole (never mutated), so readers always see one generation.
 _LABELED_TTL = 2.0
+_labeled_lock = threading.Lock()
 _labeled_cache: dict[str, Any] = {"ts": -1e9, "items": [], "ids": set(), "ok": False}
+
+# Capture ids accepted by the capture endpoints (CONTRACTS section 5).
+_CAPTURE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PRED_STATUSES = ("ok", "no_model", "error")
+_EMPTY_LATEST: dict[str, Any] = {"capture": None, "state": "none", "prediction": None}
+
+
+def _new_http_client() -> httpx.AsyncClient:
+    """The shared outbound client (created in the lifespan; tests swap this factory)."""
+    return httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+
+
+def _is_local_url(url: str) -> bool:
+    try:
+        host = httpx.URL(url).host
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
 
 
 # ---- App ------------------------------------------------------------------
@@ -119,14 +200,32 @@ async def lifespan(app: FastAPI):
             "LABELSTUDIO_API_KEY not set — the labeled view will stay empty. "
             "Add it to the dashboard .env."
         )
+    if PREVIEW_TOKEN and not (PREVIEW_TOKEN.isascii() and PREVIEW_TOKEN.isprintable()):
+        LOG.warning(
+            "PREVIEW_TOKEN contains non-ASCII or control characters and cannot "
+            "be sent as a header; the live preview will fail. Use e.g. "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+    if not PREVIEW_TOKEN and not _is_local_url(CAMERAPI_URL):
+        LOG.warning(
+            "PREVIEW_TOKEN is empty but camerapi is not on localhost "
+            f"({CAMERAPI_URL}): camerapi will refuse the live preview. Set the "
+            "same PREVIEW_TOKEN for camerapi and the dashboard (deploy/.env)."
+        )
+    client = _new_http_client()
+    app.state.http = client
     LOG.info(
-        f"dashboard ready: data_root={DATA_ROOT} ls={LABELSTUDIO_URL} "
-        f"camerapi={CAMERAPI_URL}"
+        f"dashboard v{SERVICE_VERSION} ready: data_root={DATA_ROOT} "
+        f"predictions={PREDICTIONS_DIR} ls={LABELSTUDIO_URL} camerapi={CAMERAPI_URL} "
+        f"preview_token={'set' if PREVIEW_TOKEN else 'unset'}"
     )
-    yield
+    try:
+        yield
+    finally:
+        await client.aclose()
 
 
-app = FastAPI(title="zander-dashboard", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="zander-dashboard", version=SERVICE_VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -138,11 +237,12 @@ async def login_page(request: Request, error: Optional[str] = None) -> Any:
 
 
 @app.post("/login")
-async def login_submit(
+def login_submit(
     request: Request,
     email: str = Form(...),
     password: str = Form(...),
 ) -> Any:
+    # Plain def: bcrypt takes ~0.25 s of CPU and must not stall the event loop.
     if not auth.verify_password(email, password):
         return TEMPLATES.TemplateResponse(
             request,
@@ -167,7 +267,7 @@ async def login_submit(
 
 
 @app.post("/logout")
-async def logout(dashboard_session: Optional[str] = Cookie(default=None)) -> Any:
+def logout(dashboard_session: Optional[str] = Cookie(default=None)) -> Any:
     if dashboard_session:
         auth.logout(dashboard_session)
     redirect = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
@@ -178,7 +278,7 @@ async def logout(dashboard_session: Optional[str] = Cookie(default=None)) -> Any
 # ---- Dashboard home -------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def home(
+def home(
     request: Request,
     dashboard_session: Optional[str] = Cookie(default=None),
 ) -> Any:
@@ -188,14 +288,20 @@ async def home(
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
-        {"user_email": email, "labelstudio_url": LABELSTUDIO_PUBLIC_URL},
+        {
+            "user_email": email,
+            "labelstudio_url": LABELSTUDIO_PUBLIC_URL,
+            # Cache-buster for app.js/style.css after an upgrade.
+            "asset_version": SERVICE_VERSION,
+        },
     )
 
 
 # ---- Read-only data API (used by app.js) ---------------------------------
+# Plain `def` on purpose: Label Studio is queried with blocking `requests`.
 
 @app.get("/api/stats")
-async def stats(_: str = Depends(auth.current_user_email)) -> dict:
+def stats(_: str = Depends(auth.current_user_email)) -> dict:
     cache = _get_labeled_cached()
     labeled = len(cache["items"])
     unlabeled = len(_unlabeled_from_folder(cache["ids"]))
@@ -203,18 +309,18 @@ async def stats(_: str = Depends(auth.current_user_email)) -> dict:
 
 
 @app.get("/api/unlabeled")
-async def api_unlabeled(_: str = Depends(auth.current_user_email)) -> list[dict]:
+def api_unlabeled(_: str = Depends(auth.current_user_email)) -> list[dict]:
     cache = _get_labeled_cached()
     return _unlabeled_from_folder(cache["ids"])
 
 
 @app.get("/api/labeled")
-async def api_labeled(_: str = Depends(auth.current_user_email)) -> list[dict]:
+def api_labeled(_: str = Depends(auth.current_user_email)) -> list[dict]:
     return _get_labeled_cached()["items"]
 
 
 @app.get("/thumb/{kind}/{filename}")
-async def thumb(
+def thumb(
     kind: str,
     filename: str,
     _: str = Depends(auth.current_user_email),
@@ -236,12 +342,141 @@ async def thumb(
     raise HTTPException(status_code=404)
 
 
-# ---- Identity endpoint (used by camerapi for GPIO-button attribution) ----
+# ---- Latest capture + prediction (CONTRACTS section 5) --------------------
+
+@app.get("/api/latest")
+def api_latest(_: str = Depends(auth.current_user_email)) -> dict:
+    """The newest capture (by image mtime) with its prediction state."""
+    for _attempt in range(2):
+        capture_id = _newest_capture()
+        if capture_id is None:
+            break
+        try:
+            return _capture_view(capture_id)
+        except HTTPException as e:
+            if e.status_code != 404:
+                raise
+            # Deleted between the scan and the read: rescan once.
+            _capture_index.invalidate()
+    return dict(_EMPTY_LATEST)
+
+
+@app.get("/api/captures/{capture_id}")
+def api_capture(capture_id: str, _: str = Depends(auth.current_user_email)) -> dict:
+    return _capture_view(capture_id)
+
+
+# ---- Live preview relay (camerapi -> browser) ----------------------------
+
+@app.get("/api/live.mjpg")
+async def live_mjpg(request: Request, _: str = Depends(auth.current_user_email)) -> Any:
+    """
+    Relay camerapi's MJPEG preview to a logged-in browser, adding the token.
+
+    Errors: 404 preview disabled, 503 too many viewers, 502 camerapi
+    unreachable or token rejected (logged).
+    """
+    client: httpx.AsyncClient = request.app.state.http
+    url = _camerapi_url("/api/v1/preview/stream.mjpg")
+    # The bytes are relayed raw, so they must not arrive content-encoded.
+    headers = {**_preview_headers(), "Accept-Encoding": "identity"}
+    try:
+        upstream = await client.send(
+            client.build_request("GET", url, headers=headers, timeout=LIVE_STREAM_TIMEOUT),
+            stream=True,
+        )
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeEncodeError) as e:
+        LOG.warning(f"live relay: camerapi unreachable at {url}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail="camerapi unreachable")
+
+    code = upstream.status_code
+    content_type = upstream.headers.get("content-type", "")
+    if code != 200 or not content_type.lower().startswith("multipart/x-mixed-replace"):
+        await upstream.aclose()
+        if code == 404:
+            LOG.info("live relay: camerapi preview is disabled (404)")
+            raise HTTPException(status_code=404, detail="live preview disabled")
+        if code == 503:
+            LOG.info("live relay: camerapi has too many preview viewers (503)")
+            raise HTTPException(status_code=503, detail="too many preview viewers")
+        if code in (401, 403):
+            LOG.warning(
+                f"live relay: camerapi refused the preview (HTTP {code}); "
+                "PREVIEW_TOKEN must be the same for camerapi and the dashboard"
+            )
+            raise HTTPException(status_code=502, detail="camerapi refused the preview")
+        LOG.warning(f"live relay: unexpected camerapi answer HTTP {code} ({content_type!r})")
+        raise HTTPException(status_code=502, detail=f"camerapi answered HTTP {code}")
+
+    async def relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        except httpx.HTTPError as e:
+            # Read timeout / camerapi restart: end this response; the page
+            # reconnects via its status poll.
+            LOG.info(f"live relay: upstream ended: {type(e).__name__}")
+        finally:
+            # Starlette cancels this generator when the browser disconnects.
+            # Unshielded, the close would be cancelled halfway (httpx marks the
+            # response closed first, so no later close retries it) and the
+            # upstream connection would leak.
+            with anyio.CancelScope(shield=True):
+                await upstream.aclose()
+
+    return _RelayResponse(
+        upstream,
+        relay(),
+        media_type=content_type,
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/api/live/status")
+async def live_status(request: Request, _: str = Depends(auth.current_user_email)) -> dict:
+    """{"reachable", "error", ...camerapi preview status}; see CONTRACTS section 5."""
+    client: httpx.AsyncClient = request.app.state.http
+    url = _camerapi_url("/api/v1/preview/status")
+    try:
+        resp = await client.get(url, headers=_preview_headers(), timeout=LIVE_STATUS_TIMEOUT)
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeEncodeError) as e:
+        error = f"camerapi unreachable at {CAMERAPI_URL} ({type(e).__name__})"
+        _note_live_problem(error)
+        return {"reachable": False, "error": error, "state": "unreachable"}
+
+    code = resp.status_code
+    if code == 200:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            _note_live_problem(None)
+            return {**body, "reachable": True, "error": None}
+        error = "camerapi sent an invalid preview status"
+    elif code in (401, 403):
+        error = (
+            f"camerapi refused the preview (HTTP {code}): set the same "
+            "PREVIEW_TOKEN for camerapi and the dashboard"
+        )
+        _note_live_problem(error)
+        return {"reachable": True, "error": error, "state": "auth_error"}
+    elif code == 404:
+        error = "this camerapi version has no live preview"
+        _note_live_problem(error)
+        return {"reachable": True, "error": error, "state": "unsupported"}
+    else:
+        error = f"camerapi preview status answered HTTP {code}"
+    _note_live_problem(error)
+    return {"reachable": True, "error": error, "state": "error"}
+
+
+# ---- Identity endpoint (used by camerapi for USB-button attribution) -----
 
 @app.get("/api/current-user")
-async def current_user_endpoint() -> dict:
+def current_user_endpoint() -> dict:
     """
-    For camerapi to call when the GPIO button fires (no header to read).
+    For camerapi to call when the USB button fires (no header to read).
     Returns the email of whoever owns the most recently-active session,
     or null if nobody is logged in.
     """
@@ -251,15 +486,20 @@ async def current_user_endpoint() -> dict:
 # ---- Capture proxy (dashboard "Capture" button) --------------------------
 
 @app.post("/api/capture")
-async def capture_proxy(email: str = Depends(auth.current_user_email)) -> Any:
+async def capture_proxy(
+    request: Request,
+    email: str = Depends(auth.current_user_email),
+) -> Any:
     """
     Forward to camerapi with the user's email as X-Triggered-By.
     The dashboard owns the session, camerapi never sees credentials.
     """
-    url = f"{CAMERAPI_URL.rstrip('/')}/api/v1/capture"
+    client: httpx.AsyncClient = request.app.state.http
+    url = _camerapi_url("/api/v1/capture")
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, headers={"X-Triggered-By": email})
+        resp = await client.post(
+            url, headers={"X-Triggered-By": email}, timeout=CAPTURE_TIMEOUT
+        )
     except httpx.RequestError as e:
         LOG.warning(f"capture proxy: connection error {e}")
         raise HTTPException(status_code=502, detail=f"camerapi unreachable: {e}")
@@ -275,20 +515,32 @@ def _get_labeled_cached() -> dict:
     Build (and briefly cache) the labeled list + the set of labeled capture_ids
     from Label Studio. On LS failure, degrade gracefully: empty labeled list and
     empty labeled set (so everything on disk shows as unlabeled).
+
+    Single-flight: concurrent callers wait for one refresh instead of each
+    querying LS. The TTL window starts when the refresh ends, so a slow LS is
+    still asked at most once per window.
     """
-    now = time.monotonic()
-    if now - _labeled_cache["ts"] < _LABELED_TTL:
-        return _labeled_cache
-    try:
-        items, ids = _labeled_from_ls()
-        _labeled_cache.update(ts=now, items=items, ids=ids, ok=True)
-    except LabelStudioUnavailable as e:
-        LOG.warning(f"Label Studio unavailable: {e}")
-        _labeled_cache.update(ts=now, items=[], ids=set(), ok=False)
-    except Exception as e:
-        LOG.error(f"labeled-from-LS failed: {e}", exc_info=True)
-        _labeled_cache.update(ts=now, items=[], ids=set(), ok=False)
-    return _labeled_cache
+    global _labeled_cache
+    snapshot = _labeled_cache
+    if time.monotonic() - snapshot["ts"] < _LABELED_TTL:
+        return snapshot
+    with _labeled_lock:
+        snapshot = _labeled_cache  # another thread may have refreshed meanwhile
+        if time.monotonic() - snapshot["ts"] < _LABELED_TTL:
+            return snapshot
+        items: list[dict] = []
+        ids: set[str] = set()
+        ok = False
+        try:
+            items, ids = _labeled_from_ls()
+            ok = True
+        except LabelStudioUnavailable as e:
+            LOG.warning(f"Label Studio unavailable: {e}")
+        except Exception as e:
+            LOG.error(f"labeled-from-LS failed: {e}", exc_info=True)
+        snapshot = {"ts": time.monotonic(), "items": items, "ids": ids, "ok": ok}
+        _labeled_cache = snapshot
+        return snapshot
 
 
 def _labeled_from_ls() -> tuple[list[dict], set[str]]:
@@ -349,6 +601,251 @@ def _unlabeled_from_folder(labeled_ids: set[str]) -> list[dict]:
     return items
 
 
+# ---- Latest capture: index + view ------------------------------------------
+
+class _CaptureIndex:
+    """
+    Finds the newest capture in unlabeled/ (by image mtime) cheaply enough to
+    be polled every 750 ms.
+
+    A rescan happens when the directory's mtime_ns changes (a file was added,
+    replaced or removed) or after `ttl_s`, because a bind mount (Docker on
+    Windows) may not report directory mtimes reliably. Stats are slow on such
+    mounts, so a rescan only stats files it has not seen; known files keep
+    their first-seen mtime (a jpg is only rewritten when an ingest is retried)
+    until the full re-stat every `full_restat_s`. The pending age of a capture
+    never comes from here: _capture_view stats its image itself.
+    """
+
+    def __init__(self, directory: Path, ttl_s: float = 5.0, full_restat_s: float = 60.0) -> None:
+        self.directory = directory
+        self.ttl_s = ttl_s
+        self.full_restat_s = full_restat_s
+        self._lock = threading.Lock()
+        self._mtimes: dict[str, float] = {}
+        self._newest: Optional[str] = None
+        self._dir_mtime_ns: Optional[int] = None
+        self._scanned_at = -math.inf
+        self._full_at = -math.inf
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._dir_mtime_ns = None
+
+    def newest(self) -> Optional[str]:
+        try:
+            # Read before scanning: a file added during the scan changes the
+            # mtime again and triggers the next rescan.
+            dir_mtime_ns = os.stat(self.directory).st_mtime_ns
+        except OSError:
+            with self._lock:
+                self._mtimes, self._newest, self._dir_mtime_ns = {}, None, None
+            return None
+        with self._lock:
+            now = time.monotonic()
+            if dir_mtime_ns == self._dir_mtime_ns and now - self._scanned_at < self.ttl_s:
+                return self._newest
+            full = now - self._full_at >= self.full_restat_s
+            try:
+                self._rescan(full)
+            except OSError as e:
+                LOG.warning(f"scanning {self.directory} failed: {e}")
+                return self._newest
+            self._dir_mtime_ns = dir_mtime_ns
+            self._scanned_at = now
+            if full:
+                self._full_at = now
+            return self._newest
+
+    def _rescan(self, full: bool) -> None:
+        known = {} if full else self._mtimes
+        fresh: dict[str, float] = {}
+        with os.scandir(self.directory) as entries:
+            for entry in entries:
+                name = entry.name
+                # Skip temp files (".<name>.XXXX.tmp") and other artifacts.
+                if name.startswith(".") or not name.endswith(".jpg"):
+                    continue
+                capture_id = name[:-4]
+                if not _is_valid_capture_id(capture_id):
+                    continue
+                mtime = known.get(capture_id)
+                if mtime is None:
+                    try:
+                        st = entry.stat()
+                    except OSError:
+                        continue  # vanished between listing and stat
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    mtime = st.st_mtime
+                fresh[capture_id] = mtime
+        self._mtimes = fresh
+        # Ties (coarse mtimes) are broken by id so the answer is stable.
+        self._newest = max(fresh, key=lambda k: (fresh[k], k)) if fresh else None
+
+
+_capture_index = _CaptureIndex(UNLABELED_DIR)
+
+
+def _newest_capture() -> Optional[str]:
+    """capture_id of the newest image in unlabeled/, or None if there is none."""
+    return _capture_index.newest()
+
+
+def _is_valid_capture_id(value: str) -> bool:
+    # fullmatch, not ^...$: "$" would also accept a trailing newline.
+    return bool(_CAPTURE_ID_RE.fullmatch(value))
+
+
+def _capture_view(capture_id: str) -> dict:
+    """{capture, state, prediction} for one capture (CONTRACTS section 5)."""
+    if not _is_valid_capture_id(capture_id):
+        raise HTTPException(status_code=400, detail="invalid capture_id")
+    image = UNLABELED_DIR / f"{capture_id}.jpg"
+    try:
+        st = image.stat()
+    except OSError:
+        raise HTTPException(status_code=404, detail="unknown capture")
+    if not stat.S_ISREG(st.st_mode):
+        raise HTTPException(status_code=404, detail="unknown capture")
+
+    sidecar = _read_sidecar(UNLABELED_DIR / f"{capture_id}.json")
+    state, prediction, trusted = _load_prediction(capture_id, st.st_mtime)
+    width, height = _frame_size(prediction if trusted else None, sidecar)
+    return {
+        "capture": {
+            "capture_id": capture_id,
+            "captured_at": sidecar.get("captured_at"),
+            "triggered_by": sidecar.get("triggered_by"),
+            "source": sidecar.get("source"),
+            "image_url": f"/thumb/unlabeled/{capture_id}.jpg",
+            "width": width,
+            "height": height,
+        },
+        "state": state,
+        "prediction": prediction,
+    }
+
+
+def _load_prediction(capture_id: str, image_mtime: float) -> tuple[str, Optional[dict], bool]:
+    """
+    (state, prediction as stored or None, trusted) for one capture.
+
+    trusted = a readable schema-v1 document with a known status; only then
+    does the dashboard use its fields (image size). Anything else is state
+    "error": the page derives the message from the stored document
+    (schema_version > 1 = "unsupported"; null = unreadable).
+    """
+    path = PREDICTIONS_DIR / f"{capture_id}.pred.json"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        # No prediction (yet). abs(): an image "from the future" (clock skew
+        # between the writer and this process) must not stay pending forever.
+        age = time.time() - image_mtime
+        if abs(age) < PREDICTION_PENDING_TIMEOUT_S:
+            return "pending", None, False
+        return "none", None, False
+    except OSError as e:
+        _warn_once(f"{capture_id}:read", f"[{capture_id}] prediction file unreadable: {e}")
+        return "error", None, False
+
+    try:
+        # NaN/Infinity are not JSON; map them to null so the answer can be
+        # serialized (Starlette rejects NaN).
+        doc = json.loads(raw.decode("utf-8"), parse_constant=lambda _name: None)
+    except (UnicodeDecodeError, ValueError) as e:
+        _warn_once(f"{capture_id}:json", f"[{capture_id}] prediction file is not valid JSON: {e}")
+        return "error", None, False
+    if not isinstance(doc, dict):
+        _warn_once(f"{capture_id}:shape", f"[{capture_id}] prediction file is not a JSON object")
+        return "error", None, False
+
+    version = doc.get("schema_version")
+    if not _is_int(version) or version < 1:
+        _warn_once(f"{capture_id}:version", f"[{capture_id}] prediction has no valid schema_version")
+        return "error", doc, False
+    if version > 1:
+        _warn_once(
+            f"{capture_id}:unsupported",
+            f"[{capture_id}] unsupported prediction schema_version {version} "
+            "(this dashboard reads version 1)",
+        )
+        return "error", doc, False
+    status_value = doc.get("status")
+    if status_value not in _PRED_STATUSES:
+        _warn_once(
+            f"{capture_id}:status",
+            f"[{capture_id}] prediction has an invalid status {str(status_value)[:40]!r}",
+        )
+        return "error", doc, False
+    return status_value, doc, True
+
+
+def _frame_size(prediction: Optional[dict], sidecar: dict) -> tuple[Optional[int], Optional[int]]:
+    """
+    The photo's pixel frame: the prediction's image_width/image_height (the
+    frame its boxes are in), else the capture sidecar. Taken as a pair so
+    width and height never come from different sources.
+    """
+    pairs = []
+    if prediction is not None:
+        pairs.append((prediction.get("image_width"), prediction.get("image_height")))
+    pairs.append((sidecar.get("width"), sidecar.get("height")))
+    for w, h in pairs:
+        w, h = _positive_int(w), _positive_int(h)
+        if w and h:
+            return w, h
+    return None, None
+
+
+# ---- Live preview helpers ---------------------------------------------------
+
+class _RelayResponse(StreamingResponse):
+    """
+    A StreamingResponse that always closes the upstream camerapi response:
+    when the stream ends, when the browser disconnects, and also when the
+    relay generator never started (browser gone before the first byte, or an
+    ASGI >= 2.4 server raising ClientDisconnect out of __call__, where
+    Starlette neither runs background tasks nor closes the generator).
+    A second aclose() is a no-op.
+    """
+
+    def __init__(self, upstream: httpx.Response, content: Any, **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._upstream = upstream
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self._upstream.aclose()
+
+
+def _camerapi_url(path: str) -> str:
+    return f"{CAMERAPI_URL.rstrip('/')}{path}"
+
+
+def _preview_headers() -> dict[str, str]:
+    return {"X-Preview-Token": PREVIEW_TOKEN} if PREVIEW_TOKEN else {}
+
+
+_live_problem: Optional[str] = None  # last logged preview problem (event loop only)
+
+
+def _note_live_problem(problem: Optional[str]) -> None:
+    """Log a live-preview problem when it starts or changes, not on every poll."""
+    global _live_problem
+    if problem == _live_problem:
+        return
+    if problem is None:
+        LOG.info("live preview: camerapi preview status OK")
+    else:
+        LOG.warning(f"live preview: {problem}")
+    _live_problem = problem
+
+
 # ---- Helpers --------------------------------------------------------------
 
 def _task_capture_id(task: dict) -> Optional[str]:
@@ -394,9 +891,37 @@ def _extract_overall_quality(results: Any) -> Optional[str]:
 
 def _read_sidecar(path: Path) -> dict:
     try:
-        return json.loads(path.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        data = json.loads(path.read_text("utf-8"), parse_constant=lambda _name: None)
+    except (OSError, ValueError, UnicodeDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if _is_int(value):
+        return value if value > 0 else None
+    if isinstance(value, float) and value.is_integer() and value > 0:
+        return int(value)
+    return None
+
+
+_warned: dict[str, None] = {}  # insertion-ordered set of logged keys (bounded)
+_warned_lock = threading.Lock()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Log a per-capture problem once, not on every poll of the page."""
+    with _warned_lock:
+        if key in _warned:
+            return
+        _warned[key] = None
+        if len(_warned) > 512:
+            _warned.pop(next(iter(_warned)))
+    LOG.warning(message)
 
 
 def _safe_json(resp: httpx.Response) -> Any:
@@ -409,5 +934,14 @@ def _safe_json(resp: httpx.Response) -> Any:
 # ---- Entrypoint -----------------------------------------------------------
 
 if __name__ == "__main__":
-    LOG.info(f"Starting dashboard on {HOST}:{PORT}")
-    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="info")
+    LOG.info(f"Starting dashboard v{SERVICE_VERSION} on {HOST}:{PORT}")
+    # A short graceful-shutdown timeout: open MJPEG relays never finish on
+    # their own, so without it Ctrl-C / docker stop would hang on them.
+    uvicorn.run(
+        "main:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        log_level="info",
+        timeout_graceful_shutdown=3,
+    )
