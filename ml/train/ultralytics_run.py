@@ -121,8 +121,13 @@ def run(config_path: Path, device: str | None = None) -> Path:
     from ultralytics import YOLO
     from ultralytics import settings as yolo_settings
 
+    # mlflow=False: Ultralytics' auto-callback would log every run into a
+    # second store at <git root>/runs/mlflow — the registry (import-run) is
+    # the only writer of ml_data/mlruns.
     try:
-        yolo_settings.update({"sync": False, "weights_dir": str(settings.pretrained_dir)})
+        yolo_settings.update(
+            {"sync": False, "mlflow": False, "weights_dir": str(settings.pretrained_dir)}
+        )
     except Exception:  # settings schema varies across versions — non-fatal
         pass
 
