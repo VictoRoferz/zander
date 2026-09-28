@@ -1,0 +1,46 @@
+# Pre-registered verifier configuration (see verifier/PREREGISTRATION.md).
+# Changing any value after the first real run makes that run exploratory:
+# the exit report records this file's sha256 and every CLI override.
+name: mnv3s_2crop
+model:
+  backbone: mobilenet_v3_small       # torchvision, shared by both crops
+  pretrained: imagenet1k_v1          # falls back to random init if the download fails (reported)
+  embed_dim: 128                     # Linear 1152 -> 128 -> Hardswish -> Dropout -> Linear 128 -> C
+  dropout: 0.2
+candidates:
+  top_k: 50                          # per photo, by detector score
+  candidate_floor: 0.001             # the detector conf floor the fold runs used
+  iou_positive: 0.3                  # same-class IoU >= 0.3 -> label 1
+  ignore_band: [0.1, 0.3]            # best same-class IoU in [0.1, 0.3) -> label -1 (ignored)
+  min_pos_per_class: 30              # fewer positive OOF candidates -> passthrough class
+  smoke_inject_gt: true              # ONLY with --allow-non-oof: see mine.py
+augment:
+  jitter: 8                          # same (dx, dy) in [-8, 8]^2 for both crops
+  d4: true                           # 8 dihedral flips/rotations
+  brightness: 0.2                    # photometric params are shared by both crops
+  contrast: 0.2
+  saturation: 0.3
+  hue: 0.02
+train:
+  epochs: 15                         # fixed, no early stopping (no selection on scored folds)
+  batch_size: 256
+  lr_head: 1.0e-3
+  lr_backbone: 3.0e-4
+  weight_decay: 1.0e-4
+  schedule: cosine
+  positive_share: 0.25               # balanced sampler: 25 % positives per epoch
+  freeze_bn: true                    # BN running stats stay ImageNet (two crop sizes share them)
+  seed: 20260928
+stacker:
+  C: 1.0                             # L2 on standardised coefficients, intercept unpenalised
+  hi_passthrough: auto               # auto | null | a detector score
+  hi_min_pos: 5
+exit:
+  target_sensitivity: 0.95           # the choose-op rule for the cross-fitted detector threshold
+  fa_reduction: 0.30                 # secondary endpoint: >= 30 % fewer NAL false-alarm boxes
+  latency_verifier_p50_ms: 200       # 50 candidates, dev Mac, ORT CPU
+  latency_total_p50_s: 1.0           # detector + verifier(50)
+  latency_photos: 20
+  latency_warmup: 2
+  bootstrap_n: 1000
+  bootstrap_seed: 0
