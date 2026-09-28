@@ -78,10 +78,24 @@ SERVICE_VERSION = "2.1.0"
 load_dotenv()
 
 LOG = logging.getLogger("dashboard")
+
+
+def _log_level(name: str) -> Optional[int]:
+    """LOG_LEVEL as a logging level, case-insensitively; None for a name that
+    is no level. logging.basicConfig raises ValueError for "debug", which
+    crashed the dashboard at import (a restart loop in Docker)."""
+    level = getattr(logging, str(name).strip().upper(), None)
+    return level if isinstance(level, int) else None
+
+
+_LOG_LEVEL_ENV = os.environ.get("LOG_LEVEL", "INFO")
+LOG_LEVEL = _log_level(_LOG_LEVEL_ENV)
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
+    level=logging.INFO if LOG_LEVEL is None else LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+if LOG_LEVEL is None:
+    LOG.warning(f"LOG_LEVEL={_LOG_LEVEL_ENV!a} is not a log level; using INFO")
 
 
 def _data_root() -> Path:

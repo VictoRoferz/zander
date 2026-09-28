@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI
@@ -34,11 +35,23 @@ from services.labelstudio_service import labelstudio_service
 from services.prediction_service import prediction_service
 from services.storage_service import storage_service
 
+
+def _log_level(name: str) -> Optional[int]:
+    """LOG_LEVEL as a logging level, case-insensitively (camerapi's rule); None
+    for a name that is no level. logging.basicConfig raises ValueError for
+    "debug", which crashed the receiver at import (a restart loop in Docker)."""
+    level = getattr(logging, str(name).strip().upper(), None)
+    return level if isinstance(level, int) else None
+
+
+LOG_LEVEL = _log_level(settings.log_level)
 logging.basicConfig(
-    level=settings.log_level,
+    level=logging.INFO if LOG_LEVEL is None else LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 LOG = logging.getLogger("receiver")
+if LOG_LEVEL is None:
+    LOG.warning(f"LOG_LEVEL={settings.log_level!a} is not a log level; using INFO")
 
 
 @asynccontextmanager
@@ -129,5 +142,5 @@ if __name__ == "__main__":
         host=settings.host,
         port=settings.port,
         reload=False,
-        log_level=settings.log_level.lower(),
+        log_level=logging.INFO if LOG_LEVEL is None else LOG_LEVEL,
     )

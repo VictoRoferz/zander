@@ -17,9 +17,11 @@ Run from the repo root (no pytest needed):
 import contextlib
 import inspect
 import json
+import logging
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -398,6 +400,22 @@ def test_labeled_cache_single_flight():
         dash._labeled_from_ls = original
 
 
+def test_log_level_is_case_insensitive():
+    assert dash._log_level("debug") == logging.DEBUG
+    assert dash._log_level(" Warning ") == logging.WARNING
+    assert dash._log_level("bogus") is None and dash._log_level("basic_format") is None
+    # The real failure mode: logging.basicConfig("debug") crashed the import.
+    for value, warns in (("debug", False), ("bogus", True)):
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", "import main"],
+            cwd=TMP, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "LOG_LEVEL": value, "PYTHONPATH": str(ROOT / "dashboard"),
+                 "DATA_ROOT": str(TMP / "log-level")},
+        )
+        assert proc.returncode == 0, (value, proc.stderr[-800:])
+        assert ("is not a log level; using INFO" in proc.stderr) is warns, (value, proc.stderr[-800:])
+
+
 def test_polled_endpoints_run_in_the_threadpool():
     # Blocking Label Studio / disk / bcrypt work must not run on the event loop.
     for fn in (dash.stats, dash.api_unlabeled, dash.api_labeled, dash.api_latest,
@@ -614,6 +632,7 @@ TESTS = [
     test_nan_in_prediction_is_serializable,
     test_width_height_precedence,
     test_labeled_cache_single_flight,
+    test_log_level_is_case_insensitive,
     test_polled_endpoints_run_in_the_threadpool,
     test_http_requires_login,
     test_http_latest_and_captures,   # needs "http-latest" to be the newest capture

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -492,6 +493,23 @@ def test_detect_is_serialized_across_threads():
     assert not errors, errors
     assert FakeTiledDetector.max_active == 1, FakeTiledDetector.max_active
     assert elapsed >= 0.14, f"3 x 50 ms detect ran in {elapsed:.3f}s, so not serialized"
+
+
+# ---- Startup -------------------------------------------------------------------------
+def test_log_level_is_case_insensitive():
+    assert main._log_level("debug") == logging.DEBUG
+    assert main._log_level(" Warning ") == logging.WARNING
+    assert main._log_level("bogus") is None and main._log_level("basic_format") is None
+    # The real failure mode: INSPECTOR_LOG_LEVEL=debug -> logging.basicConfig("debug")
+    # raised ValueError at import, and Docker restarted the container forever.
+    for value, warns in (("debug", False), ("bogus", True)):
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", "import main"],
+            cwd=TMP, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "LOG_LEVEL": value, "PYTHONPATH": str(ROOT / "inspector")},
+        )
+        assert proc.returncode == 0, (value, proc.stderr[-800:])
+        assert ("is not a log level; using INFO" in proc.stderr) is warns, (value, proc.stderr[-800:])
 
 
 # ---- HTTP ----------------------------------------------------------------------------

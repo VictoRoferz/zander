@@ -11,8 +11,10 @@ Studio is patched out. The app's lifespan is NOT run (TestClient without
 """
 import hashlib
 import json
+import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -538,6 +540,23 @@ def test_ingest_does_no_inspector_work_inline():
         assert prediction_service.queue_depth() == depth + 1
     finally:
         prediction_service.http = saved_http
+
+
+def test_log_level_is_case_insensitive():
+    assert main._log_level("debug") == logging.DEBUG
+    assert main._log_level(" Warning ") == logging.WARNING
+    assert main._log_level("INFO") == logging.INFO
+    assert main._log_level("bogus") is None and main._log_level("basic_format") is None
+    # The real failure mode: logging.basicConfig("debug") crashed the import.
+    for value, warns in (("debug", False), ("bogus", True)):
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", "import main"],
+            cwd=TMP, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "LOG_LEVEL": value, "PYTHONPATH": str(ROOT / "receiver"),
+                 "DATA_ROOT": str(TMP / "log-level")},
+        )
+        assert proc.returncode == 0, (value, proc.stderr[-800:])
+        assert ("is not a log level; using INFO" in proc.stderr) is warns, (value, proc.stderr[-800:])
 
 
 def test_status_reports_predictions():
