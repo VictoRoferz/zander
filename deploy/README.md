@@ -19,10 +19,10 @@ dashboard "Capture" ─┘                                    dashboard (Docker,
    Settings → Resources → File Sharing, make sure the drive holding this repo is shared.
 2. Install **Python 3.11** (check "Add to PATH") and **Git**, then:
    ```
-   git clone <repo-url>
+   git clone https://github.com/VictoRoferz/zander.git
    cd zander
-   git checkout cv-project-on-pc
    ```
+   This checks out `main`, the production branch.
 3. Configure Docker — usually nothing to change:
    ```
    cd deploy
