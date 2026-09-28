@@ -34,6 +34,8 @@ logger = setup_logger(__name__, level=settings.log_level)
 class SpoolUploader:
     def __init__(self) -> None:
         self._stop = threading.Event()
+        # Set by kick() (new capture spooled) and stop(): ends the poll wait early.
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # Per-capture_id next-eligible-attempt (monotonic) + current backoff.
         # In-memory only; reset on process restart (fine — we just retry sooner).
@@ -54,19 +56,28 @@ class SpoolUploader:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         if self._thread:
             self._thread.join(timeout=5)
         logger.info("Spool uploader stopped")
+
+    def kick(self) -> None:
+        """A capture was just spooled: scan now instead of at the next poll.
+        Per-entry backoff still applies; safe to call when not running."""
+        self._wake.set()
 
     # ---- Loop -----------------------------------------------------------
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            # Clear BEFORE draining: a kick() that lands mid-drain makes the
+            # wait below return at once, so no new capture waits a full poll.
+            self._wake.clear()
             try:
                 self._drain_once()
             except Exception as e:
                 logger.error(f"Uploader loop error: {e}", exc_info=True)
-            self._stop.wait(settings.upload_poll_interval)
+            self._wake.wait(settings.upload_poll_interval)
 
     def _drain_once(self) -> None:
         now = time.monotonic()
