@@ -69,7 +69,7 @@ import auth
 import db
 from ls_client import LabelStudioUnavailable, LsClient
 
-SERVICE_VERSION = "2.1.0"
+SERVICE_VERSION = "2.2.0"
 
 # ---- Setup ----------------------------------------------------------------
 

@@ -23,7 +23,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "zander-receiver"
-    service_version: str = "2.1.0"
+    service_version: str = "2.2.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"
