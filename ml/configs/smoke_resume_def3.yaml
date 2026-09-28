@@ -1,0 +1,21 @@
+# Resume smoke (CPU, ~10 min): 2 epochs on 2 % of fold0 — validates the
+# mirror/resume/skip plumbing of train/matrix.py, NOT model quality:
+#   ZANDER_ABORT_AFTER_EPOCH=1 python train/matrix.py --configs configs/smoke_resume_def3.yaml \
+#       --drive <tmp>/drive --device cpu --max-attempts 1   # dies after epoch 1 (mirror written)
+#   python train/matrix.py ... (same, no env var)           # resumes epoch 2 -> bundle, 2 attempts
+#   python train/matrix.py ... (same)                       # skipped (bundle + .sha256 on the drive)
+# (With the default --max-attempts 2 the first command already resumes in its retry.)
+name: yolo11n_smoke_resume_def3
+model: yolo11n.pt
+adapter: ultralytics
+dataset_id: ds_v2_def3
+fold: fold0
+epochs: 2
+imgsz: 640
+batch: 8
+seed: 20260806
+extra:
+  fraction: 0.02
+  val: false
+  plots: false
+  workers: 2

@@ -4,7 +4,9 @@
 # torch / torchvision are DELIBERATELY ABSENT: Colab preinstalls a
 # CUDA-matched torch and forcing a pin there means a multi-GB reinstall plus
 # CUDA-mismatch risk. For local CPU-only smoke runs use requirements-cpu.txt,
-# which pins a torch-cpu pair and then includes this file.
+# which pins a torch-cpu pair and then includes this file. Colab installs
+# requirements-colab.txt instead (training + export only, no numpy/Pillow/
+# OpenCV pins that would fight its preinstalled stack).
 #
 # DEIM's dependencies are installed from the pinned DEIM repo inside Colab
 # only (see train/deim_run.py) — they never enter this file.
@@ -24,8 +26,10 @@ python-dotenv==1.0.1
 # Training (Ultralytics uses whatever torch is already present)
 ultralytics==8.4.115
 
-# Export / CPU inference / eval
+# Export / CPU inference / eval (onnxslim: Ultralytics' ONNX simplifier —
+# without it the export silently falls back to an unsimplified graph)
 onnx==1.17.0
+onnxslim==0.1.95
 onnxruntime==1.20.1
 
 # Experiment tracking (local file store only; used as a viewer over run_dir bundles)

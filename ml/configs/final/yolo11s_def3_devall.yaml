@@ -1,0 +1,19 @@
+# Final retrain for deployment (split_v2): train on every dev photo
+# (dev_all_train = folds 0-2 + train_always), never on test. Run it only for
+# the family that won choose-op/compare on the out-of-fold matrix — its
+# operating point comes from the fold runs, not from this model.
+# final_weights: last is mandatory here (the runner refuses best): the
+# "validation" view (fold0_val) is inside dev_all_train, so it is only a
+# learning-curve monitor; extra.val false skips it except on the last epoch.
+name: yolo11s_def3_devall
+model: yolo11s.pt
+adapter: ultralytics
+dataset_id: ds_v2_def3
+fold: dev_all
+epochs: 120
+imgsz: 640
+batch: 16
+seed: 20260806
+final_weights: last
+extra:
+  val: false
