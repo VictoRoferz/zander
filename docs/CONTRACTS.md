@@ -213,6 +213,8 @@ inspector/.env
   - `last.pt` (or `best.pt`)
   - `metrics.json`, `pip-freeze.txt`, `meta.json`
   - `LICENSE_DEIM` for DEIM bundles
+  - `args.yaml` (the trainer's resolved arguments)
+  - `<zip>.sha256` next to the zip uses `sha256sum` format (`<hex>  <name>`); readers take the first token.
 - `meta.json` = all v1 keys plus:
   - `bundle_version: 2`, `family`, `weights: "last"|"best"`, `epochs`, `epochs_completed`, `train_seconds`
   - `attempts: [{gpu, started, seconds, resumed}]`, `config_sha256`, `overrides`
@@ -290,9 +292,11 @@ inspector/.env
 `MyDrive/ZanderML/`:
 - `ds_v2_{def3,nal1}_tiles.zip`: input.
 - `bundles/<run>_bundle.zip` plus `.sha256`: the "finished" marker.
-- `mirror/<run>/{last.pt, results.csv, args.yaml}`: for resume; deleted once the bundle is safe.
+- `mirror/<run>/{last.pt, results.csv, args.yaml, zander_run.json}` (+ `best.pt` only when `final_weights: best`): for resume; `zander_run.json` holds the attempt log and the config sha (a checkpoint trained under a different config is never resumed). Copied at most every 300 s (`ZANDER_MIRROR_INTERVAL_S`) and always at the final epoch; deleted once the bundle is safe.
 - `logs/<run>.log`.
-- `matrix_log.jsonl`.
+- `matrix_log.jsonl` (one line per start, interruption and result).
+
+`train/dispatch.py` exit codes: 0 ok, 1 failure (retried by the matrix), 2 config/data error (not retried), 130 interrupted.
 
 ## 9. Tests
 
