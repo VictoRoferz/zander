@@ -41,7 +41,7 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 
 **Inspector behaviour:**
 - **The card is authoritative.** When a card exists, `ADAPTER`, `CONFIDENCE_THRESHOLD` and `CLASS_NAMES` from the environment are ignored, with a WARNING.
-- **No card:** the legacy env settings are used, with a WARNING; `threshold_source = "env"` or `"default"`. If `REQUIRE_CARD=true`, the inspector refuses to load instead.
+- **No card:** the legacy env settings are used, with a WARNING; `threshold_source = "env"` or `"default"`. If `REQUIRE_CARD=true`, the inspector refuses to load instead. Compose sets `REQUIRE_CARD=true` (production); native dev keeps it false.
 - **Refuses to load** (the service stays up, `/inspect` returns 503, and `/status.load_error` explains why) when:
   - the card is invalid;
   - the sha doesn't match;
@@ -183,7 +183,7 @@ Log strings stay ASCII (Windows cp1252 consoles).
 - New `inspector` service:
   - `build: {context: .., dockerfile: inspector/Dockerfile}`, `container_name: zander-inspector`
   - ports `127.0.0.1:8004:8004`
-  - env `DATA_ROOT=/data`, `MODEL_PATH=/data/models/detector.onnx`, `ORT_THREADS=${INSPECTOR_ORT_THREADS:-0}`
+  - env `DATA_ROOT=/data`, `MODEL_PATH=/data/models/detector.onnx`, `REQUIRE_CARD=${INSPECTOR_REQUIRE_CARD:-true}` (production fails closed without a card), `ORT_THREADS=${INSPECTOR_ORT_THREADS:-0}`
   - volume `${DATA_DIR:-./data}:/data:ro`
   - `restart: unless-stopped`
   - healthcheck: curl `/api/v1/health`

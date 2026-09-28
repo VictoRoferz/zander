@@ -102,6 +102,8 @@ services:
     environment:
       DATA_ROOT: /data
       MODEL_PATH: /data/models/detector.onnx  # + detector.json next to it
+      # Fail closed in production: no detector.json card -> no model (503), never a default threshold.
+      REQUIRE_CARD: ${INSPECTOR_REQUIRE_CARD:-true}
       ORT_THREADS: ${INSPECTOR_ORT_THREADS:-0}
       LOG_LEVEL: ${INSPECTOR_LOG_LEVEL:-INFO}
     volumes:
