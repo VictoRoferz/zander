@@ -8,6 +8,13 @@ Priority order:
   1. Basler GigE camera via pypylon (if available + use_camera=true)
   2. OpenCV VideoCapture fallback (if pypylon missing / Basler fails)
   3. sample.jpg fallback (if camera disabled or everything fails)
+
+This is THE capture path while LIVE_PREVIEW_ENABLED=false (the default).
+With the live preview on, services/live_camera.py owns the camera instead and
+reuses this class only through a private instance (open_pylon / reset_pylon).
+
+Routes call capture_frame() from the threadpool, so the keypad and the
+dashboard can race: every camera access here is serialized by self._lock.
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -78,6 +86,12 @@ class CameraService:
         self._tl_factory: Any = None
         self._camera: Any = None
         self._converter: Any = None
+        # Transport profile of the open camera ("ethernet" | "wifi"), else None.
+        self.profile_label: Optional[str] = None
+
+        # Serializes all camera access (capture + status probes). Routes run
+        # in the threadpool, so two triggers can arrive at the same time.
+        self._lock = threading.Lock()
 
         logger.info(
             f"CameraService initialized: use_camera={self.use_camera}, "
@@ -99,15 +113,16 @@ class CameraService:
         Raises:
             RuntimeError if no frame can be obtained (including fallback).
         """
-        if self.use_camera:
-            try:
-                return self._capture_from_live_camera()
-            except Exception as e:
-                logger.warning(
-                    f"Live camera capture failed ({e}); falling back to sample image"
-                )
+        with self._lock:
+            if self.use_camera:
+                try:
+                    return self._capture_from_live_camera()
+                except Exception as e:
+                    logger.warning(
+                        f"Live camera capture failed ({e}); falling back to sample image"
+                    )
 
-        return self._load_fallback()
+            return self.load_fallback()
 
     def get_status(self) -> dict[str, Any]:
         """Summary for /api/v1/status — does not actually capture."""
@@ -118,6 +133,19 @@ class CameraService:
             "fallback_available": self.fallback_path.exists(),
         }
 
+        # A capture holds the lock for up to 3 x 30 s; never make /status wait
+        # for it (and never probe the camera while it is grabbing).
+        if not self._lock.acquire(timeout=0.5):
+            status["camera_busy"] = True
+            return status
+        try:
+            self._probe_camera(status)
+        finally:
+            self._lock.release()
+        return status
+
+    def _probe_camera(self, status: dict[str, Any]) -> None:
+        """Fill the availability fields of get_status (caller holds the lock)."""
         if self.use_camera and PYPYLON_AVAILABLE:
             try:
                 tl_factory = pylon.TlFactory.GetInstance()
@@ -137,8 +165,6 @@ class CameraService:
         else:
             status["camera_available"] = False
 
-        return status
-
     # ---- Live camera path --------------------------------------------
 
     def _capture_from_live_camera(self) -> tuple[np.ndarray, dict[str, Any]]:
@@ -148,11 +174,44 @@ class CameraService:
 
     # ---- Basler / pypylon --------------------------------------------
 
+    def open_pylon(self) -> tuple[Any, Any]:
+        """
+        Open (or reuse) the Basler camera and return (camera, converter).
+
+        Used by the live camera owner (services/live_camera.py) on its own
+        private CameraService instance. Raises on failure with no half-open
+        handle left behind, so the next call retries from scratch.
+        """
+        self._init_pylon()
+        return self._camera, self._converter
+
+    def reset_pylon(self) -> None:
+        """
+        Release the camera handle (best effort) so the next open starts clean.
+        Used after a device loss: a removed GigE device stays unusable until
+        it is destroyed and re-created.
+        """
+        camera = self._camera
+        self._camera = None
+        self._converter = None
+        self.profile_label = None
+        if camera is None:
+            return
+        for name in ("StopGrabbing", "Close", "DestroyDevice"):
+            try:
+                getattr(camera, name)()
+            except Exception as e:
+                logger.debug(f"reset_pylon: {name} failed: {e}")
+
     def _init_pylon(self) -> None:
         """
         Lazy init of pylon factory, camera, format converter, and a tuned
         acquisition profile (Ethernet vs WiFi). Called once; camera stays
         open for subsequent grabs.
+
+        Any failure after the InstantCamera exists closes and drops it before
+        re-raising. (A half-open handle used to stick: the next call returned
+        early with a camera that had never been opened.)
         """
         if self._camera is not None:
             return
@@ -174,32 +233,37 @@ class CameraService:
         logger.info(f"Transport profile: {profile['label']}")
 
         self._camera = pylon.InstantCamera(self._tl_factory.CreateDevice(device))
-
-        self._converter = pylon.ImageFormatConverter()
-        self._converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-        self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-
-        self._camera.Open()
-
-        # BayerRG8: 1 byte/pixel over the wire; debayer to BGR8 on CPU.
-        self._try_set(
-            lambda: self._camera.PixelFormat.SetValue("BayerRG8"),
-            "PixelFormat=BayerRG8",
-        )
-
-        # Max resolution for PCB inspection.
         try:
-            max_w = self._camera.Width.GetMax()
-            max_h = self._camera.Height.GetMax()
-            self._camera.Width.SetValue(max_w)
-            self._camera.Height.SetValue(max_h)
-            logger.info(f"Set camera to max resolution: {max_w}x{max_h}")
+            self._converter = pylon.ImageFormatConverter()
+            self._converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+            self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+            self._camera.Open()
+
+            # BayerRG8: 1 byte/pixel over the wire; debayer to BGR8 on CPU.
+            self._try_set(
+                lambda: self._camera.PixelFormat.SetValue("BayerRG8"),
+                "PixelFormat=BayerRG8",
+            )
+
+            # Max resolution for PCB inspection.
+            try:
+                max_w = self._camera.Width.GetMax()
+                max_h = self._camera.Height.GetMax()
+                self._camera.Width.SetValue(max_w)
+                self._camera.Height.SetValue(max_h)
+                logger.info(f"Set camera to max resolution: {max_w}x{max_h}")
+            except Exception as e:
+                logger.warning(f"Could not set max resolution: {e}")
+
+            # Apply the chosen profile.
+            self._apply_profile(profile)
         except Exception as e:
-            logger.warning(f"Could not set max resolution: {e}")
+            logger.warning(f"Basler init failed ({e}); releasing the camera handle")
+            self.reset_pylon()
+            raise
 
-        # Apply the chosen profile.
-        self._apply_profile(profile)
-
+        self.profile_label = profile["label"]
         logger.info(
             f"Camera configured for single-shot capture ({profile['label']} profile)"
         )
@@ -361,10 +425,12 @@ class CameraService:
         last_error: Optional[str] = None
         for attempt in range(1, max_attempts + 1):
             logger.info(f"GrabOne attempt {attempt}/{max_attempts} (30s timeout)...")
-            grab_result = self._camera.GrabOne(
-                30000, pylon.TimeoutHandling_ThrowException
-            )
+            grab_result = None
             try:
+                # Inside the try: a timeout used to escape the retry loop.
+                grab_result = self._camera.GrabOne(
+                    30000, pylon.TimeoutHandling_ThrowException
+                )
                 if grab_result.GrabSucceeded():
                     image = self._converter.Convert(grab_result)
                     frame = image.GetArray()
@@ -374,10 +440,35 @@ class CameraService:
                 logger.warning(
                     f"Grab attempt {attempt}/{max_attempts} failed: {last_error}"
                 )
+            except pylon.TimeoutException as e:
+                last_error = f"timeout: {e}"
+                logger.warning(f"Grab attempt {attempt}/{max_attempts} timed out: {e}")
+            except Exception:
+                self._reset_if_removed()
+                raise
             finally:
-                grab_result.Release()
+                if grab_result is not None:
+                    grab_result.Release()
 
+        self._reset_if_removed()
         raise RuntimeError(f"Basler grab failed after {max_attempts} attempts: {last_error}")
+
+    def _reset_if_removed(self) -> None:
+        """
+        Drop the handle if pylon flagged the device as removed (cable pulled,
+        heartbeat timeout), so the next capture re-opens the camera instead of
+        failing on a dead handle until camerapi restarts.
+        """
+        camera = self._camera
+        if camera is None:
+            return
+        try:
+            removed = bool(camera.IsCameraDeviceRemoved())
+        except Exception:
+            removed = False
+        if removed:
+            logger.warning("Basler device was removed; the next capture re-opens it")
+            self.reset_pylon()
 
     # ---- OpenCV fallback ---------------------------------------------
 
@@ -401,7 +492,8 @@ class CameraService:
 
     # ---- sample.jpg fallback -----------------------------------------
 
-    def _load_fallback(self) -> tuple[np.ndarray, dict[str, Any]]:
+    def load_fallback(self) -> tuple[np.ndarray, dict[str, Any]]:
+        """sample.jpg as (frame, source_info). File I/O only, never the camera."""
         if not self.fallback_path.exists():
             self._create_test_image()
 

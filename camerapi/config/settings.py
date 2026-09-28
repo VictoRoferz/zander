@@ -12,13 +12,14 @@ Settings are validated at startup via Pydantic.
 """
 from pathlib import Path
 from typing import Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "camera-service"
-    service_version: str = "3.0.0"
+    service_version: str = "3.1.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"
@@ -35,6 +36,29 @@ class Settings(BaseSettings):
     # on Linux it checks the route to the camera's IP (eth* vs wl*).
     # Override to "ethernet" or "wifi" to force a profile (debugging / odd networks).
     camera_transport: str = "auto"
+
+    # ---- Live preview (docs/CONTRACTS.md section 4) ----
+    # Off by default: every capture then uses the one-shot GrabOne path exactly
+    # as before. On: one camera-owner thread holds the camera, streams a small
+    # MJPEG preview while someone watches, and serves each capture by stopping
+    # the stream and grabbing a fresh full-resolution frame.
+    live_preview_enabled: bool = False
+    # Shared secret the dashboard sends as X-Preview-Token (must equal the one
+    # in deploy\.env). Empty = only loopback requests to localhost are allowed.
+    preview_token: str = ""
+    preview_fps: float = Field(default=5.0, gt=0, le=60)
+    preview_max_width: int = Field(default=1280, ge=160, le=8192)
+    preview_jpeg_quality: int = Field(default=70, ge=10, le=100)
+    # The stream keeps running this long after the last viewer leaves, so a
+    # page reload re-attaches instantly.
+    preview_idle_stop_s: float = Field(default=10.0, ge=0)
+    preview_max_clients: int = Field(default=8, ge=1, le=256)
+    camera_reconnect_max_backoff_s: float = Field(default=30.0, gt=0)
+    # Per-GrabOne-attempt timeout in live mode (3 attempts per capture).
+    live_grab_timeout_ms: int = Field(default=5000, ge=100)
+    # A capture request waits this long for the camera owner, then falls back
+    # to sample.jpg (as a failed legacy grab does).
+    live_capture_timeout_s: float = Field(default=20.0, gt=0)
 
     # ---- Local spool ----
     # Captures land here first; the background uploader ships them to the
