@@ -49,6 +49,7 @@ sys.path.insert(0, str(ROOT / "receiver"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
+import services.prediction_service as prediction_service_module  # noqa: E402
 from config.settings import settings  # noqa: E402
 from services.labelstudio_service import labelstudio_service  # noqa: E402
 from services.prediction_service import PredictionService, prediction_service  # noqa: E402
@@ -329,10 +330,17 @@ def test_unexpected_exception_is_recorded_not_raised():
 def test_invalid_capture_id_is_rejected_without_io():
     http = FakeHttp()
     svc = PredictionService(http=http)
-    for bad in ("../escape", "a b", "", "x" * 65, "a.b"):
-        assert svc.process_one(bad) == "invalid"
-        assert svc.enqueue(bad) is False
+    for bad in ("../escape", "a b", "", "x" * 65, "a.b", "abc\n", "abc\r\n", None, 42):
+        assert svc.process_one(bad) == "invalid", repr(bad)
+        assert svc.enqueue(bad) is False, repr(bad)
     assert not http.calls
+
+
+def test_capture_id_rule_is_a_fullmatch():
+    # re.match with "$" accepts a trailing newline; the rule must not.
+    assert prediction_service_module.is_valid_capture_id("abc\n") is False
+    assert prediction_service_module.is_valid_capture_id(uuid.uuid4().hex) is True  # camerapi's ids
+    assert prediction_service_module.is_valid_capture_id("x" * 64) is True
 
 
 def test_disabled_does_nothing():
@@ -486,6 +494,37 @@ def test_rejected_ingest_does_not_enqueue():
     _with_recorder(run)
 
 
+def test_ingest_rejects_an_invalid_capture_id_before_any_work():
+    touched = []
+    storage_service.has_task_marker = lambda cid: touched.append(("marker", cid)) or False
+    storage_service.save_unlabeled = lambda cid, *a, **k: touched.append(("save", cid))
+    labelstudio_service.ensure_initialized = lambda: touched.append(("ls", None)) or True
+    before = sorted(p.name for p in settings.unlabeled_dir.iterdir())
+
+    def run(rec):
+        for bad in ("abc\n", "../escape", "..\\escape", "a b", "x" * 65, "a.b", ""):
+            r = _ingest(bad)
+            assert r.status_code == 422, (repr(bad), r.status_code, r.text)
+        assert rec.calls == [] and touched == [], (rec.calls, touched)
+
+    try:
+        _with_recorder(run)
+    finally:
+        del storage_service.has_task_marker, storage_service.save_unlabeled
+        labelstudio_service.ensure_initialized = lambda: True
+    assert sorted(p.name for p in settings.unlabeled_dir.iterdir()) == before
+
+    good = uuid.uuid4().hex  # the id format camerapi sends
+
+    def accepted(rec):
+        r = _ingest(good)
+        assert r.status_code == 200, r.text
+        assert [c[0] for c in rec.calls] == [good], rec.calls
+
+    _with_recorder(accepted)
+    assert storage_service.has_task_marker(good)
+
+
 def test_ingest_does_no_inspector_work_inline():
     saved_http = prediction_service.http
     http = FakeHttp()
@@ -521,6 +560,7 @@ def test_predict_endpoint():
         assert rec.calls == [(capture_id, True, False)]
         assert client.post(f"/api/v1/predict/{uuid.uuid4()}").status_code == 404
         assert client.post("/api/v1/predict/bad.id").status_code == 422
+        assert client.post(f"/api/v1/predict/{capture_id}%0A").status_code == 422
 
     _with_recorder(run)
 

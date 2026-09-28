@@ -536,6 +536,11 @@ def test_http_inspect_422_cases():
     assert code == 422, (code, body)
     code, body = _request("POST", "/api/v1/inspect", fields={"capture_id": "../etc"})
     assert code == 422 and body["detail"] == "invalid capture_id", (code, body)
+    # fullmatch, not re.match: "$" alone would accept a trailing newline
+    code, body = _request("POST", "/api/v1/inspect", fields={"capture_id": "abc\n"})
+    assert code == 422 and body["detail"] == "invalid capture_id", (code, body)
+    code, body = _post_file(_jpeg(), capture_id="abc\n")  # an upload does not excuse a bad id
+    assert code == 422 and body["detail"] == "invalid capture_id", (code, body)
     code, body = _request("POST", "/api/v1/inspect", fields={"other": "x"})
     assert code == 422, (code, body)
 

@@ -31,8 +31,9 @@ logger = logging.getLogger("inspector.api")
 
 router = APIRouter(prefix="/api/v1", tags=["inspect"])
 
-# Same id rule as the dashboard: safe as a file name on every OS.
-CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Same id rule as the dashboard and the receiver: safe as a file name on every
+# OS. Always fullmatch: with re.match, "$" also accepts a trailing newline.
+CAPTURE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _no_model() -> HTTPException:
@@ -52,7 +53,7 @@ async def inspect(
         raise HTTPException(
             status_code=422, detail="provide a file upload or a capture_id"
         )
-    if capture_id and not CAPTURE_ID_RE.match(capture_id):
+    if capture_id and not CAPTURE_ID_RE.fullmatch(capture_id):
         raise HTTPException(status_code=422, detail="invalid capture_id")
 
     if file is not None:

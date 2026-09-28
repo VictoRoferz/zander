@@ -41,13 +41,16 @@ from services.storage_service import storage_service
 
 logger = logging.getLogger("receiver.predictions")
 
-# Same id rule as the dashboard and the inspector: safe as a file name on every OS.
+# Same id rule as the dashboard and the inspector: safe as a file name on every OS
+# (camerapi's ids are uuid4 hex, 32 characters). Anchored because FastAPI's
+# `pattern=` (pydantic) searches; checked here with fullmatch, because re's "$"
+# also matches before a trailing newline ("abc\n" passes re.match).
 CAPTURE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 _CAPTURE_ID_RE = re.compile(CAPTURE_ID_PATTERN)
 
 
 def is_valid_capture_id(capture_id: Any) -> bool:
-    return isinstance(capture_id, str) and bool(_CAPTURE_ID_RE.match(capture_id))
+    return isinstance(capture_id, str) and _CAPTURE_ID_RE.fullmatch(capture_id) is not None
 
 
 def _utc_now() -> str:

@@ -11,8 +11,9 @@ lets a re-send short-circuit to a 200 without creating a duplicate task.
 
 Status contract (drives the Pi's retry policy):
   200 → stored + LS task created (or already existed). Pi deletes the spool entry.
-  422 → bad payload (unparseable metadata / empty image / sha mismatch). Poison;
-        the Pi parks it in spool/failed/.
+  422 → bad payload (invalid capture_id / unparseable metadata / empty image /
+        sha mismatch). Poison; the Pi parks it in spool/failed/. The capture_id
+        is checked before anything else: it names the files on disk.
   503 → Label Studio not reachable. Pi keeps the entry and retries later.
 
 Predictions (docs/CONTRACTS.md section 6): once the capture is stored and its
@@ -29,7 +30,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from models.schemas import CaptureMetadata
 from services.labelstudio_service import labelstudio_service
-from services.prediction_service import prediction_service
+from services.prediction_service import CAPTURE_ID_PATTERN, prediction_service
 from services.storage_service import storage_service
 
 logger = logging.getLogger("receiver.ingest")
@@ -49,7 +50,10 @@ def _queue_prediction(capture_id: str, only_if_missing: bool = False) -> None:
 
 @router.post("/ingest")
 async def ingest(
-    capture_id: str = Form(...),
+    # Validated by FastAPI before this body runs (422, a validation error), so an
+    # id like "../x" or "abc\n" never reaches a file path. Same rule as the
+    # dashboard and the inspector; camerapi sends uuid4 hex (32 characters).
+    capture_id: str = Form(..., pattern=CAPTURE_ID_PATTERN),
     metadata_json: str = Form(...),
     file: UploadFile = File(...),
 ) -> dict:

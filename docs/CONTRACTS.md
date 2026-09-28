@@ -157,6 +157,7 @@ Log strings stay ASCII (Windows cp1252 consoles).
 
 ## 6. Receiver prediction hook (`:8002`)
 
+- **Capture ids:** every service accepts only a *full* match of `[A-Za-z0-9_-]{1,64}` (never `re.match`, whose `$` also accepts a trailing newline); camerapi sends uuid4 hex. `POST /api/v1/ingest` rejects any other id with 422 (poison for the spool) before it touches the disk.
 - **Env:**
   - `INSPECTOR_URL` (`""` turns predictions off; compose sets `http://inspector:8004`; `launch.py` injects `http://localhost:8004` only when it started the inspector itself).
   - `INSPECTOR_TIMEOUT` (`60`), `INSPECTOR_STATUS_TIMEOUT` (`5`), `PREDICTION_QUEUE_MAX` (`1000`).
