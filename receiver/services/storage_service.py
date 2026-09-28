@@ -121,6 +121,13 @@ class StorageService:
     def write_task_marker(self, capture_id: str, task_id: Any) -> None:
         _atomic_write_bytes(self.task_marker_path(capture_id), str(task_id).encode("utf-8"))
 
+    def task_marker_ids(self) -> list[str]:
+        """capture_ids that have a task marker, i.e. fully ingested captures."""
+        try:
+            return [path.stem for path in self.unlabeled_dir.glob("*.task")]
+        except FileNotFoundError:
+            return []
+
     # ---- Unlabeled ------------------------------------------------------
 
     def save_unlabeled(

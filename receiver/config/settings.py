@@ -15,6 +15,8 @@ ingested capture is queued for the inspector and the result is written to
 data_root/predictions/<id>.pred.json. Empty INSPECTOR_URL = predictions off.
 """
 from pathlib import Path
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,7 +45,16 @@ class Settings(BaseSettings):
     inspector_url: str = ""
     inspector_timeout: float = 60.0  # one /inspect call (a full photo on CPU)
     inspector_status_timeout: float = 5.0  # the /status pre-check
+    # Bound on new captures waiting for the worker, and separately on the
+    # backfill a rescan queues (newest first).
     prediction_queue_max: int = 1000
+    # Transient failures are retried: a silent inspector is probed again after
+    # PREDICTION_RETRY_INITIAL_S, doubling to PREDICTION_RETRY_MAX_S; a photo
+    # whose /inspect fails (timeout, 5xx) backs off the same way, at most
+    # PREDICTION_RETRY_MAX_ATTEMPTS attempts.
+    prediction_retry_initial_s: float = Field(default=2.0, gt=0)
+    prediction_retry_max_s: float = Field(default=60.0, gt=0)
+    prediction_retry_max_attempts: int = Field(default=8, ge=1)
 
     # ---- Logging ----
     log_level: str = "INFO"

@@ -5,13 +5,16 @@ Runs on the laptop next to Label Studio. Responsibilities:
   POST /api/v1/ingest                     — intake a capture from the Pi:
                                             store it + create the LS task
   POST /api/v1/webhook/annotation-created — LS callback: export labeled data
+  POST /api/v1/predict/rescan             — queue every capture still without a result
   POST /api/v1/predict/{capture_id}       — re-queue one capture for the inspector
   GET  /api/v1/status                     — paths, counts, LS + prediction health
   GET  /api/v1/health                     — liveness
 
 Predictions: with INSPECTOR_URL set, a background worker (started in the
 lifespan) sends every ingested capture to the inspector and writes
-data_root/predictions/<id>.pred.json (docs/CONTRACTS.md sections 2 and 6).
+data_root/predictions/<id>.pred.json (docs/CONTRACTS.md sections 2 and 6),
+retrying while the inspector restarts. At startup a background rescan
+re-queues captures that still need a prediction (the queue lives in memory).
 
 Label Studio reads images straight from data_root via local-files serving, so
 the receiver owns LS project + local-storage setup. The dashboard reads LS
@@ -62,6 +65,9 @@ async def lifespan(app: FastAPI):
     )
     # First: independent of Label Studio, whose init below may retry for a while.
     prediction_service.start()
+    # The queue is in memory: re-queue what a restart dropped (and no_model
+    # results, so a newly deployed model classifies older captures).
+    prediction_service.start_rescan()
     # Bring Label Studio up if we can, but DON'T crash if it isn't ready yet —
     # /ingest lazily re-initializes and returns 503 until LS is reachable, so
     # the Pi's spool just retries. This is strictly safer than dropping tasks.
@@ -110,6 +116,8 @@ async def status() -> dict:
             "enabled": prediction_service.enabled,
             "inspector_url": settings.inspector_url or None,
             "queue_depth": prediction_service.queue_depth(),
+            "retrying": prediction_service.retrying(),
+            "backfill": prediction_service.backfill_depth(),
             "count": storage_service.count_predictions(),
         },
     }
@@ -128,6 +136,7 @@ async def root() -> dict:
             "ingest": "POST /api/v1/ingest",
             "webhook": "POST /api/v1/webhook/annotation-created",
             "predict": "POST /api/v1/predict/{capture_id}?force=false",
+            "rescan": "POST /api/v1/predict/rescan",
             "status": "GET /api/v1/status",
             "health": "GET /api/v1/health",
         },

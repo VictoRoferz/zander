@@ -112,8 +112,8 @@ registration) and of the on-disk store.
 | `api/webhooks.py` | `POST /api/v1/webhook/annotation-created`: on each submitted annotation, write the durable training export `labeled/<id>.jpg` + merged `.json` |
 | `services/labelstudio_service.py` | LS client: get-or-create the project (labeling config applied **only at creation**), register the local-files storage at `unlabeled/`, create one task per capture (`data.image = /data/local-files/?d=<relpath>` — kept POSIX via `as_posix()` on all platforms) |
 | `services/storage_service.py` | Atomic writes; files are written world-readable (0644) so the non-root Label Studio container can serve them; prediction files under `predictions/` |
-| `services/prediction_service.py` | One worker thread + bounded queue: asks the inspector about each new capture and writes `predictions/<id>.pred.json` (`ok` / `no_model` / `error`; never downgrades an `ok`) |
-| `api/predictions.py` | `POST /api/v1/predict/{capture_id}?force=false` — re-queue one capture (e.g. after deploying the first model) |
+| `services/prediction_service.py` | One worker thread + bounded queue: asks the inspector about each new capture and writes `predictions/<id>.pred.json` (`ok` / `no_model` / `error`; never downgrades an `ok`). Retries while the inspector restarts or fails; at startup re-queues captures still without a result (newest first) |
+| `api/predictions.py` | `POST /api/v1/predict/rescan` — queue every capture still without a result (e.g. after deploying a model); `POST /api/v1/predict/{capture_id}?force=false` — re-queue one capture |
 
 ### `inspector/` — defect detector (Windows PC, Docker `:8004`)
 
@@ -193,7 +193,9 @@ button listener). One-time bootstrap after the first start:
 5. Give the camera NIC a static IP on the camera subnet (`192.168.177.x`).
 6. Deploy a model (once one is trained): copy `detector.onnx` + `detector.json`
    (from `ml/`'s `cli.py export`) into `deploy/data/models/`, then
-   `docker compose restart inspector`.
+   `docker compose restart inspector` and
+   `curl -X POST http://localhost:8002/api/v1/predict/rescan` (classifies the older
+   captures).
 7. Live view (optional): put the same random `PREVIEW_TOKEN` in `deploy/.env` and
    `camerapi/.env`, set `LIVE_PREVIEW_ENABLED=true` in `camerapi/.env`, run
    `docker compose up -d` and restart the camera stack.

@@ -98,8 +98,15 @@ camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ─
     ```
     `model_loaded: true` and `threshold_source: detector.json` mean it is live. Without
     a valid card the inspector refuses the model (`REQUIRE_CARD=true`) and the dashboard
-    shows "No model loaded". Captures taken before the model arrived keep that state;
-    re-classify one with `curl -X POST http://localhost:8002/api/v1/predict/<capture_id>`.
+    shows "No model loaded". Then classify the captures taken while no model was loaded
+    (they say "No model loaded"):
+    ```
+    curl -X POST http://localhost:8002/api/v1/predict/rescan
+    ```
+    It answers `{"queued": n}` and works through them newest first, always after new
+    captures (restarting the receiver does the same). Captures that arrived while the
+    inspector was restarting are retried automatically. Re-classify a single capture with
+    `curl -X POST http://localhost:8002/api/v1/predict/<capture_id>`.
 
 ### Enable the live camera view (optional)
 
@@ -213,9 +220,15 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
   `load_error` names the reason (no `detector.onnx`/`detector.json` in
   `deploy\data\models\`, card sha mismatch, class-count mismatch). Fix, then
   `docker compose restart inspector`.
-- **Result panel shows an error** (`inspector unreachable`, `HTTP 500 …`) →
-  `docker compose logs -f inspector`; the capture itself is safe in Label Studio.
-  Re-run one: `curl -X POST http://localhost:8002/api/v1/predict/<id>?force=true`.
+- **Result panel shows an error** (`inspector unreachable`, `HTTP 500 …`) → the
+  receiver retries on its own: `inspector unreachable` until the inspector answers
+  (checked every 2 s, backing off to 60 s), a timeout or `HTTP 5xx` a few times per
+  capture. If it stays, `docker compose logs -f inspector` (not running at all?
+  `docker compose ps`); the capture itself is safe in Label Studio. Re-run one:
+  `curl -X POST http://localhost:8002/api/v1/predict/<id>?force=true`; everything that
+  still lacks a result: `curl -X POST http://localhost:8002/api/v1/predict/rescan`.
+  `curl http://localhost:8002/api/v1/status` → `predictions` shows how many wait
+  (`queue_depth`, `retrying`, `backfill`).
 - **Live panel "offline" / "auth_error"** → the camera stack isn't running, or the two
   `PREVIEW_TOKEN` values differ (`deploy\.env` vs `camerapi\.env`); after fixing,
   `docker compose up -d` and restart the camera stack.
