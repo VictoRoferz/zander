@@ -117,7 +117,8 @@ def find_inspector_python(env: dict) -> tuple[Optional[str], str]:
     INSPECTOR_PYTHON wins when set (no silent fallback if it is broken);
     otherwise ml/.venv. Either must import the inference stack.
     """
-    explicit = (env.get("INSPECTOR_PYTHON") or "").strip()
+    # Quotes survive a Windows `set INSPECTOR_PYTHON="C:\...\python.exe"`.
+    explicit = (env.get("INSPECTOR_PYTHON") or "").strip().strip('"')
     if explicit:
         candidate, origin = explicit, "INSPECTOR_PYTHON"
     else:
@@ -127,7 +128,7 @@ def find_inspector_python(env: dict) -> tuple[Optional[str], str]:
     try:
         probe = subprocess.run(
             [candidate, "-c", INSPECTOR_IMPORT_CHECK],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, errors="replace", timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, f"{origin} interpreter {candidate} is not runnable ({type(e).__name__})"
