@@ -441,8 +441,13 @@ class CameraService:
                     f"Grab attempt {attempt}/{max_attempts} failed: {last_error}"
                 )
             except pylon.TimeoutException as e:
+                # A timeout means the image stream is not arriving (e.g. the
+                # Windows-firewall case). Retrying would multiply the 30 s wait
+                # past the keypad (40 s) and dashboard (60 s) request timeouts,
+                # so fail over after one attempt, exactly as before.
                 last_error = f"timeout: {e}"
                 logger.warning(f"Grab attempt {attempt}/{max_attempts} timed out: {e}")
+                break
             except Exception:
                 self._reset_if_removed()
                 raise

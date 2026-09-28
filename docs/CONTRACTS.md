@@ -118,7 +118,7 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
 - `PREVIEW_TOKEN` is set and the `X-Preview-Token` header equals it (`hmac.compare_digest`); or
 - `PREVIEW_TOKEN` is empty, the peer address is loopback, and the `Host` header is `localhost`, `127.0.0.1` or `[::1]`.
 
-Otherwise the answer is 401 (token missing or wrong) or 403 (not local and no token configured). Production uses the token, because Docker→host traffic is not guaranteed to arrive as loopback. The browser never sees the token: the dashboard proxies the stream.
+Otherwise the answer is 401 (token missing or wrong) or 403 (not local and no token configured). Additionally, with an empty token a request whose `Origin` names a non-local host gets 403 (camerapi allows CORS from `*`, so without this any web page open on the PC could read the camera with `fetch()`). Production uses the token, because Docker→host traffic is not guaranteed to arrive as loopback. The browser never sees the token: the dashboard proxies the stream.
 
 **Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`.
 

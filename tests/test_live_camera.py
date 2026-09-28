@@ -802,16 +802,19 @@ def test_legacy_init_failure_releases_the_handle_and_retries():
     assert svc.profile_label == "ethernet"
 
 
-def test_legacy_grab_timeout_is_retried_with_the_same_grab_call():
+def test_legacy_grab_timeout_falls_back_after_one_attempt():
+    # Flag-off behaviour must stay as before: one 30 s GrabOne, then sample.jpg.
+    # Retrying timeouts would push a blocked stream past the keypad (40 s) and
+    # dashboard (60 s) request timeouts.
     fake.reset(devices=1)
     svc = _legacy()
     svc.capture_frame()
     camera = fake.last_camera()
     camera.grabone_timeouts = 2
     frame, info = svc.capture_frame()
-    assert info["source"] == "basler", info
+    assert info["source"] == "fallback", info
     grabs = fake.calls(camera, "GrabOne")
-    assert len(grabs) == 1 + 3
+    assert len(grabs) == 1 + 1, grabs
     assert all(c[2] == (30000, fake.TimeoutHandling_ThrowException) for c in grabs)
     assert "StartGrabbing" not in fake.methods(camera)  # never streams
 
