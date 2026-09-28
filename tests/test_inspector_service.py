@@ -512,6 +512,25 @@ def test_log_level_is_case_insensitive():
         assert ("is not a log level; using INFO" in proc.stderr) is warns, (value, proc.stderr[-800:])
 
 
+def test_ml_is_appended_to_sys_path_not_prepended():
+    # inspector/config and ml/config are both namespace packages with a
+    # settings.py: with ml/ in front, a (re-)import of config.settings after
+    # detector_service resolved to the ML toolchain's settings.
+    ml_dir, inspector_dir = str(ROOT / "ml"), str(ROOT / "inspector")
+    assert sys.path.index(ml_dir) > sys.path.index(inspector_dir), sys.path[:4]
+    probe = (
+        "import sys, services.detector_service; "
+        "[sys.modules.pop(m) for m in list(sys.modules) if m == 'config' or m.startswith('config.')]; "
+        "import config.settings as s; print(s.__file__)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", probe], cwd=TMP, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONPATH": inspector_dir},
+    )
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert Path(proc.stdout.strip()) == ROOT / "inspector" / "config" / "settings.py", proc.stdout
+
+
 # ---- HTTP ----------------------------------------------------------------------------
 def test_http_status_and_health_without_model():
     _reset()

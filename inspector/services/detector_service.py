@@ -43,10 +43,16 @@ from config.settings import (
 )
 
 # Make the shared inference core importable (repo layout or Docker layout).
+# APPENDED, never inserted in front: ml/ has its own `config` namespace package
+# (ml/config/settings.py) and so does the inspector (config/settings.py). With
+# ml/ first, `config.settings` would resolve to the ML toolchain's settings
+# whenever it was imported after this line; last on the path, ml/ only supplies
+# `infer`, which nothing else provides.
 _here = Path(__file__).resolve()
 for candidate in (_here.parents[2] / "ml", _here.parents[1] / "ml"):
     if (candidate / "infer").is_dir():
-        sys.path.insert(0, str(candidate))
+        if str(candidate) not in sys.path:
+            sys.path.append(str(candidate))
         break
 
 from infer.detector_card import (  # noqa: E402
