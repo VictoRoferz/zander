@@ -28,33 +28,158 @@ pip install -r requirements-cpu.txt     # local (CPU torch pins + everything)
 # Colab installs requirements.txt and uses its preinstalled CUDA torch.
 ```
 
-## The flow
+## Runbook: Mac → Drive → Colab → Mac → inspector
+
+Every command runs from `ml/` (`cd ml`); `python cli.py <cmd> --help` has all
+options. `<F>` is a **family** = `<arch>_<schema>` (e.g. `yolo26n_def3`); its
+runs are `<F>_fold0..2` (one model per validation fold) and `<F>_devall` (the
+final retrain on all dev folds). Eval runs are named `<F>_fold<k>` on a model's
+own fold and `<bundle_run>__<bucket>` otherwise (`docs/CONTRACTS.md` §8).
+
+**1 · Data (Mac, once per label snapshot)**
 
 ```bash
-cd ml                                   # every command runs from here
-
 python cli.py attributes                # audit -> committed photo_attributes_v1.csv
 python cli.py ingest                    # photos + Aug-17 labels + attributes -> manifest (+gates)
-python cli.py split                     # board-aware groups + frozen split_v2
+python cli.py split                     # board-aware groups + frozen split_v2 (refuses to overwrite)
 python cli.py tile --schema def3 --zip  # tiles + offline augmentation + COCO + YOLO view + Colab zip
 python cli.py tile --schema nal1 --zip
 python cli.py qa --schema def3          # eyeball augmented training tiles (boxes on the defects?)
 python cli.py report --schema def3      # committed dataset card -> reports/dataset_card.md
-
-# training (Colab: notebooks/colab_train.ipynb; local smoke: --device cpu):
-python cli.py train --config configs/matrix/yolo26n_def3_fold0.yaml
-
-# bring a Colab bundle home and register it:
-python cli.py import-run ../ml_data/run_dirs/yolo26n_def3_fold0_bundle.zip
-mlflow ui --backend-store-uri file:../ml_data/mlruns
-
-# photo-level evaluation (each fold model on ITS fold), then freeze the threshold:
-python cli.py eval --model <bundle>/model.onnx --schema def3 --bucket fold0 --run-name y26n_def3_f0
-python cli.py choose-op y26n_def3_f0 y26n_def3_f1 y26n_def3_f2       # -> operating_point_*.json
-python cli.py compare y26n_def3_f0 y11s_def3_f0                       # paired, board-cluster bootstrap
-# final model only, once: --operating-point is mandatory for test / probe_xprod / future
-python cli.py eval --model final.onnx --schema def3 --bucket test --operating-point <op.json>
 ```
+
+**2 · Drive.** Upload the two tile zips to `MyDrive/ZanderML/` as
+`ds_v2_def3_tiles.zip` / `ds_v2_nal1_tiles.zip` (company photos — supervisor OK
+first). Drive layout: `docs/CONTRACTS.md` §8.5.
+
+**3 · Colab (GPU) — the training matrix.** Open `notebooks/colab_train.ipynb`
+from the pushed branch and follow **`notebooks/README.md`** (GPU choice, matrix
+cell, resume after a disconnect, timings). Every finished run lands as
+`MyDrive/ZanderML/bundles/<run>_bundle.zip` (+ `.sha256`, the "finished"
+marker). A local CPU smoke run uses the same entry point:
+`python cli.py train --config configs/smoke_def3.yaml --device cpu`
+(`--set KEY=VALUE` overrides, `--mirror-dir` for resume).
+
+**4 · Mac — score every fold model on its own fold**
+
+```bash
+# bundles downloaded to ml_data/run_dirs/ (or point --bundles at the Drive folder)
+python cli.py eval-matrix --bundles "../ml_data/run_dirs/*_bundle.zip"
+mlflow ui --backend-store-uri file:../ml_data/mlruns   # experiment "zander-v2"
+```
+
+Per bundle: import into `ml_data/bundles/<run>/` + MLflow (verifies the
+`.sha256` marker; a different bundle under an existing run name needs
+`import-run --force`, which archives the old one), evaluate `<F>_fold<k>` with
+the adapter/schema from `meta.json`, log the headline numbers into the bundle's
+MLflow run (`log-eval`). Finished runs are skipped on a rerun; dev_all bundles
+are skipped (no out-of-fold bucket); a failing bundle is reported and the
+matrix goes on. Galleries are off (`--gallery` to turn on).
+
+**5 · Freeze one operating point per family**
+
+```bash
+python cli.py choose-op --family yolo26n_def3   # -> ml_data/eval/operating_point_def3_yolo26n_def3.json (+ .md)
+```
+
+t* = the highest threshold with pooled out-of-fold photo sensitivity ≥ 0.95.
+Refused unless the three runs are three **distinct** fold models, each scored
+on its own fold, with equivalent training configs (arch, dataset_id, epochs,
+imgsz, batch, augment, final_weights, dataset fingerprint); smoke runs need
+`--allow-smoke`. The file is frozen: `--force` archives it to `ml_data/eval/archive/`.
+
+**6 · Rank and gate (paired decisions, never overlapping CIs)**
+
+```bash
+python cli.py summary                                            # -> reports/model_selection_v2.md + ml_data/eval/summary_v2.json
+python cli.py compare yolo26n_def3 yolo11s_def3 --class NAL                  # G1: top-1 vs top-2
+python cli.py compare yolo26n_def3 yolo26n_nal1 --class NAL --margin 0.05    # NAL gate
+```
+
+`summary` pools each complete family's fold runs, scores them at the family's
+frozen operating point (self-tuned and flagged ⚠ if `choose-op` has not run),
+ranks the def3 families by pooled NAL recall @ 0.5 FPPI, and runs G1 and the
+NAL gate itself. **G1:** a winner needs a paired CI excluding 0, otherwise the
+faster/simpler model wins. **NAL gate:** def3 must be non-inferior to nal1 on
+NAL recall within 0.05 (CI lower bound of def3 − nal1 > −0.05). `compare`
+takes eval runs or families (pooled over `<F>_fold0..2`); `--class` accepts a
+name, short name (NAL/Brücke/Fahne), run A's class index, or `any`; escapes use
+each side's frozen operating point (`n/a` without one).
+
+**7 · Colab — retrain the winner** on all dev folds with its
+`configs/final/<F>_devall.yaml` (notebook FINAL cell) → `<F>_devall_bundle.zip`.
+
+**8 · Mac — probe and the one-shot test**
+
+```bash
+python cli.py import-run ../ml_data/run_dirs/yolo26n_def3_devall_bundle.zip
+OP=../ml_data/eval/operating_point_def3_yolo26n_def3.json
+python cli.py eval --model ../ml_data/bundles/yolo26n_def3_devall/model.onnx --bucket probe_xprod --operating-point $OP
+python cli.py eval --model ../ml_data/bundles/yolo26n_def3_devall/model.onnx --bucket test --operating-point $OP
+git add reports/test_ledger.csv       # the look is recorded — commit it
+```
+
+**9 · Export** (the only way a model reaches production)
+
+```bash
+python cli.py export --bundle ../ml_data/bundles/yolo26n_def3_devall --operating-point $OP
+# -> ml_data/exports/detector.onnx + detector.json (docs/CONTRACTS.md §1)
+```
+
+Checks before writing: bundle meta vs operating point (schema, classes, split,
+tiler, family, config equivalence with the op's fold bundles); the bundle is
+the dev_all retrain (`--allow-fold-model` records an exception); a test eval of
+exactly this model at exactly this operating point exists (`--no-test-eval`
+records null); **parity** — the deployed pipeline (`conf_floor = t`) reproduces
+the evaluated verdicts on the 5 photos nearest the threshold, zero mismatches.
+`--force` archives an existing export to `exports/archive/<timestamp>/`.
+
+**10 · Inspector.** Copy `detector.onnx` **and** `detector.json` to
+`DATA_ROOT/models/` (Windows: `deploy\data\models\`; the container reads
+`MODEL_PATH=/data/models/detector.onnx`) and restart the inspector;
+`GET :8004/api/v1/status` shows the card. The card is authoritative:
+threshold, adapter and class names come from it, not from the environment.
+
+**Crop verifier (optional second stage, offline prototype):** `python cli.py
+verifier ...` — see **`verifier/README.md`**.
+
+### Honesty guards (enforced in code, `eval/run_eval.py`)
+
+- `eval` refuses, before any photo is read: an unknown bucket; a schema,
+  adapter or split_id that differs from the bundle's `meta.json` (never
+  overridable); a fold bucket scored by a model that trained on it (another
+  fold's model, or a dev_all model); a model without `meta.json`; a non-dev_all
+  model on `test`. `--allow-foreign-fold` overrides the last three for
+  diagnostics only — the run is stamped `guard_overridden` and never recorded.
+- `test`, `probe_xprod` and `future` need `--operating-point`; `probe_xprod`
+  never includes test photos.
+- **Test ledger** (`reports/test_ledger.csv`, committed): every model/operating
+  point pair evaluated on `test`. Re-running the same pair is fine; any other
+  pair is a second look and needs `--second-look "<reason>"` (recorded).
+- `reports/results_v2.csv` gets one row per honest eval (never smoke or
+  overridden runs). Smoke rows are never committed — `git checkout --
+  reports/results_v2.csv` after experiments.
+
+### Commands
+
+| command | does |
+|---|---|
+| `train` | one run config → bundle zip (`train/dispatch.py`; Colab or `--device cpu`) |
+| `import-run` | bundle zip/dir → `ml_data/bundles/<run>/` + MLflow run (idempotent; `--force`) |
+| `eval-matrix` | import + score every fold bundle on its own fold + log to MLflow |
+| `eval` | one model on one bucket → `ml_data/eval/<run>/{metrics.json, predictions.json, report.md, gallery.html}` |
+| `log-eval` | an eval run's headline numbers → its bundle's MLflow run |
+| `choose-op` | a family's pooled OOF runs → frozen `operating_point_<schema>_<family>.json` |
+| `compare` | paired comparison of two runs or families (`--class`, `--margin`) |
+| `summary` | pooled OOF table, ranking, G1, NAL gate → `reports/model_selection_v2.md` |
+| `export` | verified `detector.onnx` + `detector.json` for the inspector |
+| `latency` | tiled-inference latency bench on this host |
+| `verifier` | crop-verifier prototype (arguments go to `verifier/cli.py`) |
+
+Eval artefacts: `predictions.json` v2 adds `format_version`, `source{…}`
+(model sha256, bundle run, fold, adapter, conf floor) and per-photo
+`width`/`height`, and stores scores at full precision — a threshold frozen
+from them is exactly reproducible by the deployed detector. v1 files still load.
 
 ## Data (snapshot v2, 2026-09-28)
 
@@ -111,12 +236,13 @@ Ablations (`cli.py tile` flags `--no-d4`, `--ct-p`, `--no-handheld-cap`,
    for literature comparison only.
 
 Operating point: highest t with pooled out-of-fold photo sensitivity ≥ 0.95
-(`choose-op`), frozen into `operating_point_*.json`; the inspector's
-`CONFIDENCE_THRESHOLD` must be set to it. Selection: rank by NAL recall @ 0.5
-FPPI across folds; a winner must beat the runner-up with a paired CI excluding 0
+(`choose-op`), frozen into `operating_point_<schema>_<family>.json`; `export`
+writes it into `detector.json`, which the inspector reads (no manual
+`CONFIDENCE_THRESHOLD`). Selection: rank by pooled NAL recall @ 0.5 FPPI
+(`summary`); a winner must beat the runner-up with a paired CI excluding 0
 (`compare`), otherwise the faster model wins. Results: `reports/results_v2.csv`
 (one row per eval; rows are only comparable with equal split_id, snapshot_id,
-tiler_version and dataset fingerprint).
+tiler_version and dataset fingerprint) and `reports/model_selection_v2.md`.
 
 ## Candidates
 
