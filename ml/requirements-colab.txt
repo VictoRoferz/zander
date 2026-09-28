@@ -1,0 +1,19 @@
+# Colab training runtime — notebooks/colab_train.ipynb installs ONLY this file.
+#
+# Colab preinstalls a CUDA-matched torch/torchvision plus numpy, Pillow,
+# OpenCV and tqdm; pinning those here would force multi-GB reinstalls and
+# ABI mismatches (the old notebook installed requirements.txt and downgraded
+# numpy to 1.26.4 underneath Colab's stack). So: only what the training +
+# export path adds on top, pinned where it matters for reproducibility.
+# pip-freeze.txt in every bundle records the full environment that trained it.
+#
+# Not here on purpose: mlflow (local registry only), onnxruntime (the Mac-side
+# evaluation/inspector needs it, the Colab export does not), pycocotools/
+# imagehash (dataset building happens on the Mac).
+ultralytics==8.4.115
+onnx==1.17.0
+onnxslim==0.1.95
+pydantic-settings==2.6.1
+PyYAML==6.0.2
+python-dotenv
+tqdm
