@@ -52,6 +52,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
 import services.prediction_service as prediction_service_module  # noqa: E402
+import services.storage_service as storage_module  # noqa: E402
 from config.settings import settings  # noqa: E402
 from services.labelstudio_service import labelstudio_service  # noqa: E402
 from services.prediction_service import PredictionService, prediction_service  # noqa: E402
@@ -343,6 +344,62 @@ def test_capture_id_rule_is_a_fullmatch():
     assert prediction_service_module.is_valid_capture_id("abc\n") is False
     assert prediction_service_module.is_valid_capture_id(uuid.uuid4().hex) is True  # camerapi's ids
     assert prediction_service_module.is_valid_capture_id("x" * 64) is True
+
+
+class LockedReplace:
+    """os.replace stand-in: the first `times` calls fail like Windows does while
+    another process has the target open (WinError 32 is a PermissionError)."""
+
+    def __init__(self, times):
+        self.times = times
+        self.calls = []
+        self.real = os.replace
+
+    def __call__(self, src, dst):
+        self.calls.append(str(dst))
+        if len(self.calls) <= self.times:
+            raise PermissionError(13, "The process cannot access the file because it is "
+                                      "being used by another process", str(dst))
+        return self.real(src, dst)
+
+    def __enter__(self):
+        self.saved_retries = storage_module._REPLACE_RETRIES
+        os.replace = self
+        return self
+
+    def __exit__(self, *exc):
+        os.replace = self.real
+        storage_module._REPLACE_RETRIES = self.saved_retries
+        return False
+
+
+def test_prediction_write_survives_a_briefly_locked_file():
+    # Windows: the dashboard reading the old pred.json made os.replace fail, and
+    # process_one then recorded an error doc instead of the ok result.
+    capture_id = _capture()
+    http = FakeHttp(inspect=FakeResponse(200, inspect_body(capture_id)))
+    with LockedReplace(times=2) as locked:
+        storage_module._REPLACE_RETRIES = 5  # the Windows setting
+        assert PredictionService(http=http).process_one(capture_id) == "ok"
+    assert len(locked.calls) == 3, locked.calls
+    assert all(c.endswith(f"{capture_id}.pred.json") for c in locked.calls)
+    assert _pred(capture_id)["status"] == "ok"
+
+
+def test_atomic_write_gives_up_on_a_lasting_lock_and_cleans_up():
+    target = TMP / "atomic" / "x.bin"
+    for retries in (5, 0):  # the Windows setting, then the POSIX one
+        with LockedReplace(times=10**6) as locked:
+            storage_module._REPLACE_RETRIES = retries
+            try:
+                storage_module._atomic_write_bytes(target, b"data")
+                raise AssertionError("expected PermissionError")
+            except PermissionError:
+                pass
+        assert len(locked.calls) == retries + 1, (retries, locked.calls)
+        assert not [p for p in target.parent.iterdir() if p.name.endswith(".tmp")], "temp file left"
+    # Only Windows retries; POSIX keeps its single attempt.
+    assert storage_module._REPLACE_RETRIES == (5 if os.name == "nt" else 0)
 
 
 def test_disabled_does_nothing():

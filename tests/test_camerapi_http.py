@@ -236,6 +236,50 @@ def test_flag_on_capture_goes_through_the_owner():
         assert r.status_code == 200 and r.json()["source"] == "fallback"
 
 
+def test_spool_write_survives_a_briefly_locked_file():
+    # Windows: os.replace onto a file another process has open raises
+    # PermissionError (WinError 32) for a moment; the capture must still spool.
+    import services.storage_service as ss
+
+    real, calls = os.replace, []
+
+    def locked(times):
+        def replace(src, dst):
+            calls.append(str(dst))
+            if len(calls) <= times:
+                raise PermissionError(13, "being used by another process", str(dst))
+            return real(src, dst)
+        return replace
+
+    saved = ss._REPLACE_RETRIES
+    try:
+        ss._REPLACE_RETRIES = 5  # the Windows setting
+        os.replace = locked(times=1)
+        with configured(live_preview_enabled=False):
+            r = client.post("/api/v1/capture")
+        assert r.status_code == 202, r.text
+        _spooled(r.json()["capture_id"])
+        assert len(calls) == 3, calls  # the image (locked once, then ok) + its sidecar
+
+        # A lock that never goes away: the error surfaces, no temp file is left.
+        target = DATA_ROOT / "atomic" / "x.bin"
+        for retries in (5, 0):  # Windows, then POSIX
+            calls.clear()
+            ss._REPLACE_RETRIES = retries
+            os.replace = locked(times=10**6)
+            try:
+                ss._atomic_write_bytes(target, b"data")
+                raise AssertionError("expected PermissionError")
+            except PermissionError:
+                pass
+            assert len(calls) == retries + 1, (retries, calls)
+            assert not [p for p in target.parent.iterdir() if p.name.endswith(".tmp")]
+    finally:
+        os.replace = real
+        ss._REPLACE_RETRIES = saved
+    assert ss._REPLACE_RETRIES == (5 if os.name == "nt" else 0)  # POSIX: one attempt
+
+
 def test_root_lists_the_preview_endpoints():
     body = client.get("/").json()
     assert body["endpoints"]["preview_stream"] == "GET /api/v1/preview/stream.mjpg"

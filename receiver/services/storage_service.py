@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -28,6 +29,26 @@ from config.settings import settings
 from models.schemas import CaptureMetadata
 
 logger = logging.getLogger("receiver.storage")
+
+# Windows refuses os.replace onto a file another process holds open
+# (PermissionError, WinError 5 / 32) until that reader closes it: the dashboard
+# reading the previous pred.json, an antivirus scan. Retry briefly there. POSIX
+# renames over open files, so it tries exactly once (behaviour unchanged).
+# Keep in sync with camerapi/services/storage_service.py.
+_REPLACE_RETRIES = 5 if os.name == "nt" else 0
+_REPLACE_RETRY_S = 0.05
+
+
+def _replace(src: str, dst: Path) -> None:
+    """os.replace, retried while Windows reports the target as in use."""
+    for attempt in range(_REPLACE_RETRIES + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt >= _REPLACE_RETRIES:
+                raise
+            time.sleep(_REPLACE_RETRY_S)
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -45,7 +66,7 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
         # writes as root but Label Studio reads as a different (non-root) user,
         # so it must be world-readable or LS fails with "error opening file".
         os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, target)
+        _replace(tmp_name, target)
     except Exception:
         try:
             os.unlink(tmp_name)
