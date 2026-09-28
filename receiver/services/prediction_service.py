@@ -84,9 +84,9 @@ class PredictionService:
     def __init__(self, http: Any = None, queue_max: Optional[int] = None) -> None:
         # Anything with requests' get/post signature; the module by default.
         self.http = http if http is not None else requests
-        self._queue: "queue.Queue[str]" = queue.Queue(
-            maxsize=queue_max if queue_max is not None else settings.prediction_queue_max
-        )
+        limit = queue_max if queue_max is not None else settings.prediction_queue_max
+        # queue.Queue treats maxsize <= 0 as unbounded; the queue must stay bounded.
+        self._queue: "queue.Queue[str]" = queue.Queue(maxsize=max(1, int(limit)))
         self._pending: dict[str, bool] = {}  # queued capture_id -> force
         self._pending_lock = threading.Lock()
         self._stop = threading.Event()

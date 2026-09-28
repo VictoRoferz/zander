@@ -359,6 +359,8 @@ def test_enqueue_dedupes_and_is_bounded():
     assert svc.enqueue(b) is True
     assert svc.enqueue(c) is False  # full
     assert svc.queue_depth() == 2
+    tiny = PredictionService(http=FakeHttp(), queue_max=0)  # 0 must not mean unbounded
+    assert tiny.enqueue(a) is True and tiny.enqueue(b) is False
 
 
 def test_worker_drains_the_queue_and_honours_a_force_upgrade():
