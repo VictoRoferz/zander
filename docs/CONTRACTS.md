@@ -260,6 +260,7 @@ inspector/.env
   - Constants: `WINDOW=160, SMALL=64, LARGE=128, SCALE_REF=48, JITTER=8`.
   - `s = max(1, max(w,h)/48)`. Cut a square of side `round(160·s)` centred on the box, from the full-resolution RGB photo. Reflect-pad only the overhang. Resize to 160 (PIL bilinear) only if `s > 1`.
   - `large = win[16:144,16:144]`, `small = win[48:112,48:112]`. Training shifts both crops by the same `(dx,dy)` in [−8,8]².
+  - A box centre outside the photo is clamped into it; `seam_margin` clips the box to the photo first.
 - **`verifier.onnx`:**
   - Inputs `crop_small` float32 [N,3,64,64] and `crop_large` float32 [N,3,128,128]. RGB, 0..1; ImageNet normalisation is inside the graph.
   - Outputs `logits` [N,C] and `embedding` [N,128].
@@ -286,6 +287,7 @@ inspector/.env
 - **Plug-in point:** `TiledDetector(conf_floor=0.001).detect(rgb)` → `verifier.rescore(rgb, det)` → `photo_verdict(threshold=t*)`.
 - **Working files** (internal to WP-verifier), in `ml_data/verifier/<vrun>/`: `candidates.json`, `windows.npy` (+ index), `oof_scores.json`, `verifier.onnx`, `stacker.json`, `exit_report.{md,json}`, `train_log.json`.
 - **Entry point:** `verifier.cli.main(argv: list[str]) -> int`; module CLI `python verifier/cli.py`.
+- **Test policy:** a cascade test evaluation requires `stacker.json.exit.decision == "ship"`; its ledger key is `sha256("cascade:<detector sha>:<stacker sha>")`, so evaluating the cascade after the detector's own test look counts as a second look and needs `--second-look "<reason>"`. `stacker.json.exit` is null until the exit rule has run.
 
 ### 8.5 Colab and Drive layout
 
