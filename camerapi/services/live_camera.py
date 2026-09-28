@@ -461,6 +461,10 @@ class LiveCamera:
         self._slow_link = False
         self._fps_ema = 0.0
         self._last_frame_t: Optional[float] = None
+        # When the running stream started: with _last_frame_t still None it
+        # tells "no frame yet" (e.g. the Windows firewall drops the camera's
+        # UDP stream) from "just started" (status "stream_age_s").
+        self._stream_started_t: Optional[float] = None
         self._frame_w: Optional[int] = None
         self._frame_h: Optional[int] = None
         self._frames_incomplete = 0
@@ -645,9 +649,12 @@ class LiveCamera:
     def status(self) -> dict[str, Any]:
         """The CONTRACTS section 4 preview status (also /status "live")."""
         preview = self._preview
+        now = time.monotonic()
         last = self._last_frame_t
-        age = None if last is None else round(time.monotonic() - last, 2)
+        age = None if last is None else round(now - last, 2)
         live = self._state == "streaming" and age is not None and age < 2.0
+        started = self._stream_started_t
+        streaming = self._state == "streaming" and started is not None
         return {
             "enabled": True,
             "state": self._state,
@@ -660,6 +667,7 @@ class LiveCamera:
             "clients": self._client_count(),
             "frame_seq": preview.seq if preview is not None else 0,
             "last_frame_age_s": age,
+            "stream_age_s": round(now - started, 2) if streaming else None,
             "frames_incomplete": self._frames_incomplete,
             "reconnects": self._reconnects,
             "last_error": self._last_error,
@@ -682,6 +690,7 @@ class LiveCamera:
             "clients": 0,
             "frame_seq": 0,
             "last_frame_age_s": None,
+            "stream_age_s": None,
             "frames_incomplete": 0,
             "reconnects": 0,
             "last_error": None,
@@ -772,6 +781,7 @@ class LiveCamera:
                         source.start_stream()
                         streaming = True
                         self._fps_ema, self._last_frame_t = 0.0, None
+                        self._stream_started_t = time.monotonic()
                     elif streaming and not want:
                         source.stop_stream()
                         streaming = False

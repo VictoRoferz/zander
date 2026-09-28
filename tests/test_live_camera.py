@@ -102,6 +102,7 @@ class ScriptedSource:
         self.lose_always = False   # every read_stream raises SourceLost (flapping)
         self.grab_delay = 0.0
         self.grab_error = None
+        self.no_frames = False     # read_stream times out forever (firewall case)
         self.frames_incomplete = 0
         self.last_error = None
         self.last_streamed = 0     # stamp of the last frame read_stream returned
@@ -132,6 +133,11 @@ class ScriptedSource:
         if self.lose_on_read or self.lose_always:
             self.lose_on_read = False
             raise SourceLost("fake cable pulled")
+        if self.no_frames:  # like BaslerSource when no packet ever arrives
+            time.sleep(min(timeout_s, 0.02))
+            self.frames_incomplete += 1
+            self.last_error = f"no frame within {timeout_s:.1f} s"
+            return None
         time.sleep(0.002)
         frame, n = fake.next_frame(640, 480)
         self.last_streamed = n
@@ -236,6 +242,33 @@ def test_one_client_gets_downscaled_jpegs_at_the_target_rate():
         assert wait_until(lambda: cam.state == "idle", timeout=2.0), cam.state
         assert "stop_stream" in src.calls
         assert cam.status()["fps_measured"] == 0.0
+
+
+def test_stream_without_frames_reports_its_age():
+    # The Windows-firewall case: the stream runs, but no frame ever arrives.
+    # last_frame_age_s stays null, so the dashboard needs stream_age_s to tell
+    # "no frame for N s" from "just started".
+    src = ScriptedSource()
+    src.no_frames = True
+    with running(src) as cam:
+        assert wait_until(lambda: cam.state == "idle")
+        cam.add_client()
+        try:
+            assert wait_until(lambda: cam.state == "streaming")
+            time.sleep(0.3)
+            st = cam.status()
+            assert st["state"] == "streaming" and st["last_frame_age_s"] is None, st
+            assert st["fps_measured"] == 0.0 and st["frame_seq"] >= 0
+            assert isinstance(st["stream_age_s"], float) and st["stream_age_s"] >= 0.25, st
+            assert st["frames_incomplete"] > 0 and "no frame within" in st["last_error"], st
+            src.no_frames = False  # frames arrive (the firewall rule was added)
+            assert wait_until(lambda: cam.status()["last_frame_age_s"] is not None)
+            st = cam.status()
+            assert st["stream_age_s"] >= 0.3 and st["last_frame_age_s"] < 1.0, st
+        finally:
+            cam.remove_client()
+        assert wait_until(lambda: cam.state == "idle", timeout=2.0)
+        assert cam.status()["stream_age_s"] is None  # only reported while streaming
 
 
 def test_idle_grace_keeps_the_stream_warm_but_encodes_nothing():
@@ -544,13 +577,14 @@ def test_stop_is_fast_and_closes_the_source():
 def test_status_shapes_match_the_contract():
     keys = {"enabled", "state", "source", "camera_model", "camera_serial", "profile",
             "fps_target", "fps_measured", "clients", "frame_seq", "last_frame_age_s",
-            "frames_incomplete", "reconnects", "last_error", "preview_width",
-            "preview_height", "boot_id"}
+            "stream_age_s", "frames_incomplete", "reconnects", "last_error",
+            "preview_width", "preview_height", "boot_id"}
     cam = LiveCamera(source_factory=ScriptedSource)
     assert set(cam.status()) == keys
     off = cam.disabled_status()
     assert set(off) == keys and off["enabled"] is False and off["state"] == "disabled"
-    assert cam.status()["state"] == "stopped"
+    assert off["stream_age_s"] is None
+    assert cam.status()["state"] == "stopped" and cam.status()["stream_age_s"] is None
 
 
 # ---- MJPEG generator (api/preview.py) ------------------------------------------------

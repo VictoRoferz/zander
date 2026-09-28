@@ -61,8 +61,8 @@ from services.live_camera import live_camera  # noqa: E402
 AUTH = {"X-Preview-Token": TOKEN}
 STATUS_KEYS = {"enabled", "state", "source", "camera_model", "camera_serial", "profile",
                "fps_target", "fps_measured", "clients", "frame_seq", "last_frame_age_s",
-               "frames_incomplete", "reconnects", "last_error", "preview_width",
-               "preview_height", "boot_id"}
+               "stream_age_s", "frames_incomplete", "reconnects", "last_error",
+               "preview_width", "preview_height", "boot_id"}
 
 client = TestClient(main.app)  # peer "testclient", Host "testserver"
 local = TestClient(main.app, base_url="http://localhost", client=("127.0.0.1", 50000))

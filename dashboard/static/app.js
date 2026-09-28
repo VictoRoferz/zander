@@ -7,7 +7,9 @@
 //             login-protected MJPEG relay /api/live.mjpg only while camerapi
 //             reports the preview enabled and reachable. The stream is dropped
 //             while the tab is hidden: it holds one of the browser's ~6
-//             connections per host for as long as it runs.
+//             connections per host for as long as it runs. The chip says LIVE
+//             only once camerapi has a frame; "streaming" without one after
+//             NO_FRAME_GRACE_S shows "no frames" (the Windows-firewall case).
 //   * latest: /api/latest every 3 s (10 s hidden), every 750 ms while the
 //             prediction is pending or our own capture is on its way. The
 //             result panel is re-rendered only when capture/state/prediction
@@ -31,6 +33,7 @@ const CROP_BOX_FACTOR = 3;              // crop side = max(96, 3 x the box's lon
 const STREAM_BACKOFF_MAX_MS = 30000;
 const STREAM_CONNECT_GRACE_MS = 4000;   // not every browser fires "load" for MJPEG
 const STALL_AGE_S = 10;                 // "streaming" but no new frame for this long
+const NO_FRAME_GRACE_S = 5;             // "streaming" but still no first frame after this long
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XLINK_NS = "http://www.w3.org/1999/xlink";
 const BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
@@ -248,10 +251,34 @@ const live = {
   failures: 0,         // consecutive stream errors (backoff exponent)
   retryAt: 0,          // no reattach before this time (ms since epoch)
   connectTimer: null,
+  noFramesShown: false, // the overlay currently shows the no-frames message
+  prevIncomplete: null, // {bootId, count} from the last status (old camerapi fallback)
 };
 
+// Frames stopped after the stream had delivered some.
 function isStalled(s) {
   return s.state === "streaming" && isNum(s.last_frame_age_s) && s.last_frame_age_s > STALL_AGE_S;
+}
+
+// camerapi streams, but not one frame arrived since the stream started. On
+// the Windows PC that is the firewall dropping the camera's UDP stream (or a
+// cable problem): camerapi then reports last_frame_age_s null and fps 0 while
+// "streaming", which used to show a green LIVE chip.
+function noFramesYet(s) {
+  if (s.state !== "streaming" || isNum(s.last_frame_age_s)) return false;
+  if (isNum(s.stream_age_s)) return s.stream_age_s > NO_FRAME_GRACE_S;
+  // camerapi without stream_age_s: incomplete frames piling up says the same.
+  const prev = live.prevIncomplete;
+  return Boolean(prev && prev.bootId === s.boot_id && isNum(s.frames_incomplete)
+    && s.frames_incomplete > prev.count);
+}
+
+function noFramesMessage(s) {
+  return {
+    title: "No frames from the camera",
+    detail: "Check the camera cable and the Windows firewall rule (allow python.exe inbound, Private)."
+      + (s.last_error ? ` ${s.last_error}` : ""),
+  };
 }
 
 function setLiveOverlay(msg) {
@@ -300,13 +327,17 @@ function blockerMessage(s, stalled) {
   return { title: "Live preview unavailable", detail: s.error || s.state };
 }
 
-function renderLiveChip(s, stalled) {
+function renderLiveChip(s, stalled, noFrames) {
   let text;
   let cls = "chip chip-off";
   if (s.state === "dashboard_unreachable" || !s.reachable) {
     text = "offline";
     cls = "chip chip-error";
-  } else if (s.state === "streaming" && !stalled) {
+  } else if (noFrames) {
+    text = "no frames";
+    cls = "chip chip-warn";
+  } else if (s.state === "streaming" && !stalled && isNum(s.last_frame_age_s)) {
+    // LIVE only once a frame has actually arrived.
     text = isNum(s.fps_measured) && s.fps_measured > 0 ? `LIVE · ${s.fps_measured.toFixed(1)} fps` : "LIVE";
     cls = "chip chip-live";
   } else if (stalled) {
@@ -320,8 +351,8 @@ function renderLiveChip(s, stalled) {
     cls = "chip chip-error";
   } else if (s.enabled !== true || s.state === "disabled") {
     text = "off";
-  } else if (s.state === "starting" || s.state === "idle") {
-    text = "starting";
+  } else if (s.state === "starting" || s.state === "idle" || s.state === "streaming") {
+    text = "starting";   // "streaming": waiting for the first frame (within the grace)
   } else {
     text = truncate(s.state || "unknown", 24);
   }
@@ -348,10 +379,11 @@ function attachStream() {
   live.attached = true;
   live.gotFrame = false;
   img.hidden = false;
+  live.noFramesShown = false;
   setLiveOverlay({ title: "Connecting…" });
   clearTimeout(live.connectTimer);
   live.connectTimer = setTimeout(() => {
-    if (live.attached) setLiveOverlay(null);
+    if (live.attached && !live.noFramesShown) setLiveOverlay(null);
   }, STREAM_CONNECT_GRACE_MS);
   // A fresh URL forces a new request (and aborts the previous one).
   img.src = `/api/live.mjpg?t=${Date.now()}`;
@@ -373,7 +405,9 @@ function onLiveLoad() {
   live.gotFrame = true;
   live.failures = 0;
   clearTimeout(live.connectTimer);
-  setLiveOverlay(null);
+  // (The first part may be camerapi's "Waiting for camera" placeholder: a
+  // no-frames message stays until the status reports a real frame.)
+  if (!live.noFramesShown) setLiveOverlay(null);
   livePoller.run();   // frames flow: refresh the chip now, not in up to 5 s
 }
 
@@ -383,21 +417,26 @@ function onLiveError() {
   const delay = Math.min(STREAM_BACKOFF_MAX_MS, 1000 * 2 ** Math.min(live.failures, 5));
   live.retryAt = Date.now() + delay;
   detachStream();
+  live.noFramesShown = false;
   setLiveOverlay({ title: "Stream interrupted", detail: `Retrying in ${Math.round(delay / 1000)} s…` });
   setTimeout(() => livePoller.run(), delay + 50);
 }
 
 function applyLiveStatus(s) {
   const stalled = isStalled(s);
+  const noFrames = noFramesYet(s);   // before prevIncomplete is updated
+  live.prevIncomplete = isNum(s.frames_incomplete) && s.boot_id
+    ? { bootId: s.boot_id, count: s.frames_incomplete } : null;
   const usable = Boolean(s.reachable) && s.enabled === true && !NO_STREAM_STATES.has(s.state) && !stalled;
   const bootChanged = Boolean(s.boot_id && live.bootId && s.boot_id !== live.bootId);
   if (s.boot_id) live.bootId = s.boot_id;
   const recovered = usable && !live.usable;
   live.usable = usable;
-  renderLiveChip(s, stalled);
+  renderLiveChip(s, stalled, noFrames);
   renderLiveDetail(s);
 
   if (!usable) {
+    live.noFramesShown = false;
     detachStream();
     setLiveOverlay(blockerMessage(s, stalled));
     return;
@@ -418,6 +457,16 @@ function applyLiveStatus(s) {
   const orphaned = live.attached && live.gotFrame && s.state === "idle";
   if (Date.now() < live.retryAt) return;   // backing off after a stream error
   if (!live.attached || bootChanged || recovered || orphaned) attachStream();
+  // No frame yet: unlike a stall, keep the stream attached (camerapi keeps
+  // grabbing, and the first real frame shows the moment the cause is fixed)
+  // and say why nothing moves.
+  if (noFrames) {
+    setLiveOverlay(noFramesMessage(s));
+    live.noFramesShown = true;
+  } else if (live.noFramesShown) {
+    live.noFramesShown = false;
+    setLiveOverlay(null);
+  }
 }
 
 async function pollLiveStatus() {

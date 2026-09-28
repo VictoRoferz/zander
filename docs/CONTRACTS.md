@@ -108,8 +108,9 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
   - Each part: `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: N\r\n\r\n<jpeg>\r\n`.
   - The last frame, or a placeholder, is re-sent at least every 2 s.
 - `GET /api/v1/preview/frame.jpg`: one fresh preview JPEG. Waits up to 3 s and starts the stream if it is idle. `Cache-Control: no-store`.
-- `GET /api/v1/preview/status`: returns `enabled, state, source, camera_model, camera_serial, profile, fps_target, fps_measured, clients, frame_seq, last_frame_age_s, frames_incomplete, reconnects, last_error, preview_width, preview_height, boot_id`.
+- `GET /api/v1/preview/status`: returns `enabled, state, source, camera_model, camera_serial, profile, fps_target, fps_measured, clients, frame_seq, last_frame_age_s, stream_age_s, frames_incomplete, reconnects, last_error, preview_width, preview_height, boot_id`.
   - `state` is one of `disabled`, `starting`, `idle`, `streaming`, `reconnecting`, `unavailable` (Wi-Fi profile), `stopped`.
+  - `stream_age_s`: seconds since the running stream started; null unless `state` is `streaming`. `streaming` with `last_frame_age_s: null` and a growing `stream_age_s` = no frame ever arrived (e.g. the Windows firewall drops the camera's UDP stream); the dashboard shows "no frames" after 5 s instead of LIVE.
   - When disabled it returns 200 with `enabled:false`.
 - Stream and frame return 404 when the preview is disabled, and 503 when `PREVIEW_MAX_CLIENTS` is reached.
 - `GET /api/v1/status` gains a `live` block with the same fields as preview status.
