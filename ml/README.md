@@ -248,8 +248,12 @@ tiler_version and dataset fingerprint) and `reports/model_selection_v2.md`.
 
 YOLO26n / YOLO26s / YOLO11s (Ultralytics, AGPL-3.0) — `configs/matrix/*_def3_fold*.yaml`,
 plus `yolo26n_nal1_fold*` as the NAL-only comparison. D-FINE-S trained with
-**DEIM v1** (Apache-2.0, pinned `09d35d5`; `train/deim_run.py --schema def3`) —
-**not DEIMv2** (non-commercial licence since 2026-08-24).
+**DEIM v1** (Apache-2.0, pinned `09d35d5`) — `configs/matrix/deim_s_def3_fold*.yaml`,
+run like any config (`python train/dispatch.py --config configs/matrix/deim_s_def3_fold0.yaml`,
+or the notebook's optional `DEIM_MATRIX`; plan with `python train/deim_run.py --config … --dry-run`) —
+**not DEIMv2** (non-commercial licence since 2026-08-24). DEIM-S measured ≈60 ms per tile
+(≈1.2–1.35 s per photo) on the Mac CPU, over the 1 s budget: if it wins on accuracy,
+DEIM-N is the next candidate.
 
 ## History
 

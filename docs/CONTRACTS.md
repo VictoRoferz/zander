@@ -226,6 +226,8 @@ inspector/.env
   - Readers treat a missing `bundle_version` as 1 and derive `family` from `run_name`.
 - **Entry point:** `train.dispatch.run(config_path: Path, device: str|None = None, overrides: dict|None = None, mirror_dir: Path|None = None) -> Path` returns the bundle zip. Module CLIs: `python train/dispatch.py`, `python train/matrix.py`.
 - **DEIM:** `train.deim_run.run_from_config(config_path, device=None, overrides=None, mirror_dir=None) -> Path` returns the same bundle format.
+  - DEIM bundles differ in these details: an extra `deim_override.yml`; `last.pt` is DEIM's checkpoint stripped to its EMA weights; `metrics.json` holds DEIM's log rows; the ONNX opset is **16** (hard-coded by DEIM); layout `deim` (outputs `labels, boxes, scores`, top 300).
+  - DEIM configs: `framework: deim`, `model:` names an init from `deim_run.MODELS` (COCO checkpoint, sha256 pinned on first use); `deterministic` and `export` keys are not accepted; `final_weights` must be `last`. DEIM's stage-2 reload of the best-on-val checkpoint is disabled (`collate_fn.stop_epoch = E`).
 
 ### 8.2 Eval runs, `predictions.json` v2, frozen eval API
 
@@ -295,6 +297,7 @@ inspector/.env
 - `ds_v2_{def3,nal1}_tiles.zip`: input.
 - `bundles/<run>_bundle.zip` plus `.sha256`: the "finished" marker.
 - `mirror/<run>/{last.pt, results.csv, args.yaml, zander_run.json}` (+ `best.pt` only when `final_weights: best`): for resume; `zander_run.json` holds the attempt log and the config sha (a checkpoint trained under a different config is never resumed). Copied at most every 300 s (`ZANDER_MIRROR_INTERVAL_S`) and always at the final epoch; deleted once the bundle is safe.
+- For DEIM runs the mirror holds `{last.pt (DEIM's full checkpoint), log.txt, zander_run.json}`.
 - `logs/<run>.log`.
 - `matrix_log.jsonl` (one line per start, interruption and result).
 
