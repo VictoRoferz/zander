@@ -17,7 +17,8 @@ Behaviour mirrors the parts of pypylon camerapi uses:
   - StartGrabbing/StopGrabbing/IsGrabbing/RetrieveResult/GrabOne,
     IsCameraDeviceRemoved, Open/Close/DestroyDevice
   - GrabOne while grabbing raises (as pylon does), so tests can prove the
-    stream is stopped first
+    stream is stopped first; a GrabOne whose frame takes longer than its
+    timeout (grab_delay) waits the timeout and raises TimeoutException
   - every frame is stamped with a global, increasing counter at pixel [0, 0]
     (read it back with read_stamp)
   - CALLS records (camera_id, method, args) for ordering checks
@@ -115,7 +116,8 @@ def reset(devices: int = 1, **config: Any) -> None:
     """Fresh state: `devices` cameras on the network, knobs for new cameras.
 
     Knobs: frame_rate_node ("AcquisitionFrameRate" | "AcquisitionFrameRateAbs"
-    | None), fail_open (an exception for Open()), width, height.
+    | None), fail_open (an exception for Open()), open_gate (a threading.Event
+    Open() waits for, at most 5 s), width, height.
     """
     CALLS.clear()
     CAMERAS.clear()
@@ -310,6 +312,9 @@ class InstantCamera:
     # -- lifecycle
     def Open(self) -> None:
         self._log("Open")
+        gate = CONFIG.get("open_gate")
+        if gate is not None:
+            gate.wait(5.0)
         if self.fail_open is not None:
             raise self.fail_open
         self.__dict__["opened"] = True
@@ -386,6 +391,11 @@ class InstantCamera:
             self.__dict__["grabone_timeouts"] -= 1
             raise TimeoutException(f"GrabOne timed out after {timeout_ms} ms")
         if self.grab_delay:
+            if self.grab_delay * 1000.0 > timeout_ms:
+                # The frame needs longer than the timeout (e.g. ~8 s over the
+                # 2 Mbit/s WiFi profile): pylon gives up after the timeout.
+                time.sleep(timeout_ms / 1000.0)
+                raise TimeoutException(f"GrabOne timed out after {timeout_ms} ms")
             time.sleep(self.grab_delay)
         return GrabResult(frame=self._frame())
 

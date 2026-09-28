@@ -120,7 +120,7 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
 
 Otherwise the answer is 401 (token missing or wrong) or 403 (not local and no token configured). Additionally, with an empty token a request whose `Origin` names a non-local host gets 403 (camerapi allows CORS from `*`, so without this any web page open on the PC could read the camera with `fetch()`). Production uses the token, because Docker→host traffic is not guaranteed to arrive as loopback. The browser never sees the token: the dashboard proxies the stream.
 
-**Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`.
+**Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`. On the Wi-Fi profile (state `unavailable`, a full frame takes ~8 s) a capture makes **one** `GrabOne` of 30 s, as the one-shot path does, instead of 3 × `LIVE_GRAB_TIMEOUT_MS`, and the caller waits at least 35 s instead of `LIVE_CAPTURE_TIMEOUT_S` (still below the keypad's 40 s request timeout).
 
 **Env vars:**
 

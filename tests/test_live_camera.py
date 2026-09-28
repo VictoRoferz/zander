@@ -424,18 +424,62 @@ def test_unexpected_grab_error_falls_back_and_reconnects():
 
 
 def test_wifi_profile_is_unavailable_but_captures_work():
-    src = ScriptedSource(streamable=False)
-    with running(src) as cam:
-        assert wait_until(lambda: cam.state == "unavailable"), cam.state
-        cam.add_client()
+    # WiFi transport profile (2 Mbit/s): a full frame takes ~8 s, longer than a
+    # LIVE_GRAB_TIMEOUT_MS attempt (5 s) and than LIVE_CAPTURE_TIMEOUT_S would
+    # allow for three of them. Scaled down: 200 ms attempts (this file's
+    # LIVE_GRAB_TIMEOUT_MS), a 0.3 s caller budget, and a fake GrabOne that
+    # needs 0.5 s and, like pylon, times out after its timeout. The capture
+    # must still be the camera's photo, not sample.jpg.
+    fake.reset(devices=1)
+    with setting("camera_transport", "wifi"), setting("live_capture_timeout_s", 0.3):
+        cam = LiveCamera(source_factory=BaslerSource)
+        cam.start()
         try:
-            assert wait_until(lambda: cam.latest_preview() is not None)
-            assert decode(cam.latest_preview().jpeg) is not None  # the placeholder
-            assert cam.capture_frame()[1]["source"] == "basler"
-            time.sleep(0.1)
-            assert "start_stream" not in src.calls
+            assert wait_until(lambda: cam.state == "unavailable"), cam.state
+            camera = fake.last_camera()
+            cam.add_client()
+            try:
+                assert wait_until(lambda: cam.latest_preview() is not None)
+                assert decode(cam.latest_preview().jpeg) is not None  # the placeholder
+                camera.grab_delay = 0.5
+                frame, info = cam.capture_frame()
+                assert info["source"] == "basler", info
+                assert frame.shape == (48, 64, 3)
+                grabs = fake.calls(camera, "GrabOne")
+                # ONE attempt with the one-shot path's 30 s budget
+                assert [g[2][0] for g in grabs] == [30000], grabs
+                assert "StartGrabbing" not in fake.methods(camera)  # never streams on WiFi
+                assert cam.status()["profile"] == "wifi" and cam.state == "unavailable"
+            finally:
+                cam.remove_client()
         finally:
-            cam.remove_client()
+            cam.stop()
+
+
+def test_wifi_capture_queued_before_the_camera_opened_gets_the_longer_budget():
+    # The first capture after a (re)connect: the caller starts waiting with the
+    # normal budget; the owner then opens the camera onto the WiFi profile, and
+    # the caller must keep waiting for the (slow) grab instead of giving up.
+    gate = threading.Event()
+    fake.reset(devices=1, open_gate=gate)
+    with setting("camera_transport", "wifi"), setting("live_capture_timeout_s", 0.3):
+        cam = LiveCamera(source_factory=BaslerSource)
+        cam.start()
+        try:
+            assert wait_until(lambda: fake.CAMERAS and fake.methods(fake.last_camera()))
+            camera = fake.last_camera()  # Open() is blocked on the gate
+            camera.grab_delay = 0.5
+            results = []
+            caller = threading.Thread(target=lambda: results.append(cam.capture_frame()))
+            caller.start()
+            time.sleep(0.1)
+            gate.set()
+            caller.join(10)
+            assert results, "capture did not return"
+            assert results[0][1]["source"] == "basler", results[0][1]
+        finally:
+            gate.set()
+            cam.stop()
 
 
 def test_sample_source_overlays_the_preview_but_never_the_capture():
