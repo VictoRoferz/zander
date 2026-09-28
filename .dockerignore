@@ -1,0 +1,6 @@
+*
+!inspector/
+!ml/infer/
+**/__pycache__
+**/*.pyc
+inspector/.env

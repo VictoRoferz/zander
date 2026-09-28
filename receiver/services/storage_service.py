@@ -11,6 +11,9 @@ Layout under data_root:
   unlabeled/<id>.task   idempotency marker — holds the created LS task id
   labeled/<id>.jpg      durable labeled export (training dataset)
   labeled/<id>.json     merged metadata + LS annotation
+  predictions/<id>.pred.json  model prediction (pred.json v1, docs/CONTRACTS.md
+                        section 2); own folder so no *.jpg / <id>.json glob and
+                        no LS storage ever sees it
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from config.settings import settings
 from models.schemas import CaptureMetadata
@@ -57,9 +60,10 @@ class StorageService:
     def __init__(self) -> None:
         self.unlabeled_dir: Path = settings.unlabeled_dir
         self.labeled_dir: Path = settings.labeled_dir
+        self.predictions_dir: Path = settings.predictions_dir
         logger.info(
             f"StorageService initialized: unlabeled={self.unlabeled_dir}, "
-            f"labeled={self.labeled_dir}"
+            f"labeled={self.labeled_dir}, predictions={self.predictions_dir}"
         )
 
     # ---- Paths ----------------------------------------------------------
@@ -78,6 +82,9 @@ class StorageService:
 
     def labeled_annotation_path(self, capture_id: str) -> Path:
         return self.labeled_dir / f"{capture_id}.json"
+
+    def prediction_path(self, capture_id: str) -> Path:
+        return self.predictions_dir / f"{capture_id}.pred.json"
 
     # ---- Idempotency marker --------------------------------------------
 
@@ -140,6 +147,38 @@ class StorageService:
         logger.info(f"Saved labeled export {capture_id}")
         return self.labeled_image_path(capture_id), self.labeled_annotation_path(capture_id)
 
+    # ---- Predictions ----------------------------------------------------
+
+    def has_prediction(self, capture_id: str) -> bool:
+        return self.prediction_path(capture_id).exists()
+
+    def read_prediction(self, capture_id: str) -> Optional[dict[str, Any]]:
+        """The stored pred.json, or None if absent/unreadable (bad JSON is logged)."""
+        path = self.prediction_path(capture_id)
+        try:
+            text = path.read_text("utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            logger.warning(f"[{capture_id}] prediction unreadable: {e}")
+            return None
+        try:
+            doc = json.loads(text)
+        except ValueError as e:
+            logger.warning(f"[{capture_id}] prediction is not valid JSON: {e}")
+            return None
+        if not isinstance(doc, dict):
+            logger.warning(f"[{capture_id}] prediction is not a JSON object")
+            return None
+        return doc
+
+    def write_prediction(self, capture_id: str, doc: Mapping[str, Any]) -> Path:
+        """Atomic write (temp -> fsync -> 0644 -> os.replace), UTF-8, not ASCII-escaped."""
+        path = self.prediction_path(capture_id)
+        data = json.dumps(dict(doc), indent=2, ensure_ascii=False) + "\n"
+        _atomic_write_bytes(path, data.encode("utf-8"))
+        return path
+
     # ---- Counts (for /status) ------------------------------------------
 
     def count_unlabeled(self) -> int:
@@ -151,6 +190,12 @@ class StorageService:
     def count_labeled(self) -> int:
         try:
             return sum(1 for _ in self.labeled_dir.glob("*.jpg"))
+        except FileNotFoundError:
+            return 0
+
+    def count_predictions(self) -> int:
+        try:
+            return sum(1 for _ in self.predictions_dir.glob("*.pred.json"))
         except FileNotFoundError:
             return 0
 

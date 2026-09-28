@@ -2,10 +2,12 @@
 """
 One-command launcher (Windows + macOS).
 
-Modes (all tear everything down together when any child exits or on Ctrl-C):
-  python scripts/launch.py                # hub trio: Label Studio :8081,
-                                          # receiver :8002, dashboard :8003
-  python scripts/launch.py --with-camera  # hub trio + camerapi :8001 +
+Modes (all tear everything down together when a critical child exits or on
+Ctrl-C; the optional inspector never does, see below):
+  python scripts/launch.py                # hub: Label Studio :8081,
+                                          # receiver :8002, dashboard :8003,
+                                          # + the inspector :8004 (optional)
+  python scripts/launch.py --with-camera  # hub + camerapi :8001 +
                                           # USB button listener (macOS dev:
                                           # everything native in one command)
   python scripts/launch.py --camera-only  # camerapi + listener only — the
@@ -15,15 +17,27 @@ Modes (all tear everything down together when any child exits or on Ctrl-C):
   --no-listener                           # skip the USB button listener
                                           # (dashboard-button-only, or run a
                                           # stdin-mode listener separately)
+  --no-inspector                          # hub modes: don't start the inspector
   --pid-file PATH                         # write this process's PID (used by
                                           # deploy/stop-zander.bat)
   --log-file PATH                         # additionally append all child
                                           # output here (diagnosable when the
                                           # console window is minimized/lost)
 
+The inspector (defect detection, docs/CONTRACTS.md section 7) is a
+NON-critical child: it needs the ML inference stack (onnxruntime), which the
+service venv does not carry, so it runs under INSPECTOR_PYTHON or else
+ml/.venv's interpreter, verified with `-c "import onnxruntime, PIL, fastapi"`.
+If neither works it is skipped ("inspector skipped: ..."); if it exits later
+that is logged once and the hub keeps running (new captures then get an
+"error" prediction instead of a verdict). Only when the launcher started it
+does the receiver get INSPECTOR_URL=http://localhost:8004, and only if
+INSPECTOR_URL is not already set (environment or receiver/.env), so an
+explicit empty value still turns predictions off.
+
 DATA_ROOT defaults to ~/zander-data (override via the DATA_ROOT env var). It
 is forced to be identical for Label Studio's local-files document root and
-for the hub services, so LS, the receiver, and the dashboard all agree on
+for the hub services (receiver, dashboard, inspector), so they all agree on
 where images live. camerapi deliberately does NOT get this injection — its
 spool location comes from camerapi/.env (real env vars would override it
 under pydantic-settings).
@@ -35,9 +49,12 @@ First-run bootstrap (manual, once):
   3. Create a dashboard login:  python dashboard/manage_users.py add you@x "You"
   4. Restart this launcher.
 
-Each service reads its own .env (receiver/camerapi via pydantic-settings,
-dashboard via python-dotenv); the launcher only injects DATA_ROOT + the LS
-local-files vars for the hub services.
+Each service reads its own .env (receiver/camerapi/inspector via
+pydantic-settings, dashboard via python-dotenv); the launcher only injects
+DATA_ROOT + the LS local-files vars for the hub services, and INSPECTOR_URL
+for the receiver as described above.
+
+Log lines stay ASCII: Windows consoles default to cp1252.
 """
 from __future__ import annotations
 
@@ -50,19 +67,30 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Iterable, Optional
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # zander/
 RECEIVER_DIR = ROOT / "receiver"
 DASHBOARD_DIR = ROOT / "dashboard"
 CAMERAPI_DIR = ROOT / "camerapi"
+INSPECTOR_DIR = ROOT / "inspector"
 
-# (name, started Popen) — populated as services come up.
-PROCS: list[tuple[str, subprocess.Popen]] = []
+INSPECTOR_URL = "http://localhost:8004"
+INSPECTOR_IMPORT_CHECK = "import onnxruntime, PIL, fastapi"
+
+# (name, started Popen, critical) — populated as services come up. A critical
+# child exiting stops everything; a non-critical one is only logged.
+PROCS: list[tuple[str, subprocess.Popen, bool]] = []
 
 # Optional tee target for all child output (--log-file).
 LOG_FH = None
 LOG_LOCK = threading.Lock()
+
+
+def _ascii(text: object) -> str:
+    """Console-safe text (paths may hold characters cp1252 cannot print)."""
+    return str(text).encode("ascii", "replace").decode("ascii")
 
 
 def data_root() -> Path:
@@ -75,6 +103,85 @@ def label_studio_args() -> list[str]:
     if exe:
         return [exe, "start", "--host", "0.0.0.0", "--port", "8081"]
     return [sys.executable, "-m", "label_studio", "start", "--host", "0.0.0.0", "--port", "8081"]
+
+
+def ml_venv_python() -> Path:
+    if sys.platform == "win32":
+        return ROOT / "ml" / ".venv" / "Scripts" / "python.exe"
+    return ROOT / "ml" / ".venv" / "bin" / "python"
+
+
+def find_inspector_python(env: dict) -> tuple[Optional[str], str]:
+    """(interpreter, description) for the inspector; interpreter None = skip it.
+
+    INSPECTOR_PYTHON wins when set (no silent fallback if it is broken);
+    otherwise ml/.venv. Either must import the inference stack.
+    """
+    # Quotes survive a Windows `set INSPECTOR_PYTHON="C:\...\python.exe"`.
+    explicit = (env.get("INSPECTOR_PYTHON") or "").strip().strip('"')
+    if explicit:
+        candidate, origin = explicit, "INSPECTOR_PYTHON"
+    else:
+        candidate, origin = str(ml_venv_python()), "ml/.venv"
+        if not Path(candidate).exists():
+            return None, f"no ml/.venv interpreter at {candidate} (or set INSPECTOR_PYTHON)"
+    try:
+        probe = subprocess.run(
+            [candidate, "-c", INSPECTOR_IMPORT_CHECK],
+            capture_output=True, text=True, errors="replace", timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"{origin} interpreter {candidate} is not runnable ({type(e).__name__})"
+    if probe.returncode != 0:
+        lines = (probe.stderr or "").strip().splitlines()
+        reason = lines[-1] if lines else f"exit code {probe.returncode}"
+        return None, f"{origin} interpreter {candidate} lacks the inspector deps ({reason})"
+    return candidate, f"{origin} interpreter {candidate}"
+
+
+def dotenv_defines(path: Path, key: str) -> bool:
+    """True if the .env file at `path` assigns `key` (uncommented, any case)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, sep, _ = line.partition("=")
+        if sep and name.strip().upper() == key.upper():
+            return True
+    return False
+
+
+def inspector_url_configured(env: dict, receiver_env_file: Optional[Path] = None) -> bool:
+    """INSPECTOR_URL already set where the receiver would read it (env or .env)."""
+    env_file = receiver_env_file if receiver_env_file is not None else RECEIVER_DIR / ".env"
+    return any(k.upper() == "INSPECTOR_URL" for k in env) or dotenv_defines(
+        env_file, "INSPECTOR_URL"
+    )
+
+
+def first_critical_exit(
+    procs: Iterable[tuple[str, subprocess.Popen, bool]], reported: set[str]
+) -> Optional[tuple[str, int]]:
+    """(name, exit code) of the first critical child that has exited, else None.
+
+    Non-critical children that exited are logged once (their names collect in
+    `reported`) and never stop the rest.
+    """
+    for name, proc, critical in procs:
+        code = proc.poll()
+        if code is None:
+            continue
+        if critical:
+            return name, code
+        if name not in reported:
+            reported.add(name)
+            print(f"\n[launch] {name} exited with code {code}; it is optional, "
+                  "the rest keeps running.")
+    return None
 
 
 def _pump(name: str, proc: subprocess.Popen) -> None:
@@ -96,7 +203,7 @@ def _pump(name: str, proc: subprocess.Popen) -> None:
 SHIELD_CHILDREN = False
 
 
-def start(name: str, args: list[str], cwd: Path, env: dict) -> subprocess.Popen:
+def start(name: str, args: list[str], cwd: Path, env: dict, critical: bool = True) -> subprocess.Popen:
     kwargs = {}
     if SHIELD_CHILDREN and sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -109,27 +216,27 @@ def start(name: str, args: list[str], cwd: Path, env: dict) -> subprocess.Popen:
         text=True,
         bufsize=1,
         # Children run with PYTHONUTF8=1, so decode their output as UTF-8
-        # regardless of the console's locale (else â€”-style mojibake).
+        # regardless of the console's locale (else mojibake).
         encoding="utf-8",
         errors="replace",
         **kwargs,
     )
-    PROCS.append((name, proc))
+    PROCS.append((name, proc, critical))
     threading.Thread(target=_pump, args=(name, proc), daemon=True).start()
     return proc
 
 
 def shutdown() -> None:
-    for name, proc in PROCS:
+    for name, proc, _critical in PROCS:
         if proc.poll() is None:
-            print(f"[launch] stopping {name}…")
+            print(f"[launch] stopping {name}...")
             proc.terminate()
     deadline = time.time() + 8
-    for name, proc in PROCS:
+    for name, proc, _critical in PROCS:
         try:
             proc.wait(timeout=max(0.0, deadline - time.time()))
         except subprocess.TimeoutExpired:
-            print(f"[launch] killing {name}…")
+            print(f"[launch] killing {name}...")
             proc.kill()
 
 
@@ -137,11 +244,13 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Start the zander services together.")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--with-camera", action="store_true",
-                      help="hub trio + camerapi + USB button listener")
+                      help="hub + camerapi + USB button listener")
     mode.add_argument("--camera-only", action="store_true",
                       help="camerapi + USB button listener only (alongside the Docker hub)")
     ap.add_argument("--no-listener", action="store_true",
                     help="skip the USB button listener in the camera modes")
+    ap.add_argument("--no-inspector", action="store_true",
+                    help="hub modes: do not start the (optional) inspector")
     ap.add_argument("--pid-file", type=Path, default=None,
                     help="write this launcher's PID here (deleted on exit)")
     ap.add_argument("--log-file", type=Path, default=None,
@@ -193,10 +302,11 @@ def main() -> int:
 
     try:
         starting = []
+        inspector_python: Optional[str] = None
         if hub:
             root = data_root()
-            (root / "unlabeled").mkdir(parents=True, exist_ok=True)
-            (root / "labeled").mkdir(parents=True, exist_ok=True)
+            for sub in ("unlabeled", "labeled", "predictions"):
+                (root / sub).mkdir(parents=True, exist_ok=True)
 
             hub_env = base_env.copy()
             hub_env["DATA_ROOT"] = str(root)
@@ -204,16 +314,35 @@ def main() -> int:
             ls_env["LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED"] = "true"
             ls_env["LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT"] = str(root)
 
-            print(f"[launch] DATA_ROOT = {root}")
+            print(f"[launch] DATA_ROOT = {_ascii(root)}")
             starting.append("Label Studio (8081), receiver (8002), dashboard (8003)")
+            if args.no_inspector:
+                print("[launch] inspector disabled (--no-inspector)")
+            else:
+                inspector_python, how = find_inspector_python(base_env)
+                if inspector_python is None:
+                    print(f"[launch] inspector skipped: {_ascii(how)}")
+                else:
+                    print(f"[launch] inspector runs on the {_ascii(how)}")
+                    starting.append("inspector (8004, optional)")
         if camera:
             starting.append("camerapi (8001)" + ("" if args.no_listener else " + USB button listener"))
-        print(f"[launch] starting {'; '.join(starting)}…")
+        print(f"[launch] starting {'; '.join(starting)}...")
         print("[launch] press Ctrl-C to stop everything.\n")
 
         if hub:
             start("label-studio", label_studio_args(), ROOT, ls_env)
-            start("receiver", [sys.executable, "main.py"], RECEIVER_DIR, hub_env)
+            receiver_env = hub_env.copy()
+            if inspector_python is not None:
+                # Non-critical: without it the hub still ingests and labels.
+                start("inspector", [inspector_python, "main.py"], INSPECTOR_DIR, hub_env,
+                      critical=False)
+                if inspector_url_configured(base_env):
+                    print("[launch] receiver keeps its own INSPECTOR_URL setting")
+                else:
+                    receiver_env["INSPECTOR_URL"] = INSPECTOR_URL
+                    print(f"[launch] receiver: INSPECTOR_URL={INSPECTOR_URL}")
+            start("receiver", [sys.executable, "main.py"], RECEIVER_DIR, receiver_env)
             start("dashboard", [sys.executable, "main.py"], DASHBOARD_DIR, hub_env)
         if camera:
             # No DATA_ROOT injection: camerapi's transient spool root comes from
@@ -227,13 +356,14 @@ def main() -> int:
                     base_env,
                 )
 
+        reported: set[str] = set()
         try:
             while True:
-                for name, proc in PROCS:
-                    code = proc.poll()
-                    if code is not None:
-                        print(f"\n[launch] {name} exited with code {code}; stopping the rest.")
-                        return 1
+                exited = first_critical_exit(PROCS, reported)
+                if exited is not None:
+                    name, code = exited
+                    print(f"\n[launch] {name} exited with code {code}; stopping the rest.")
+                    return 1
                 time.sleep(0.5)
         except KeyboardInterrupt:
             print("\n[launch] Ctrl-C received.")
