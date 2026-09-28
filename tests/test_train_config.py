@@ -177,7 +177,8 @@ def test_every_committed_config_resolves():
         if parsed is not None:
             assert parsed.fold == eff["fold"], path
             assert eff["dataset_id"].endswith("_" + parsed.schema), path
-    finals = sorted((ML / "configs" / "final").glob("*_devall.yaml"))
+    finals = sorted(p for p in (ML / "configs" / "final").glob("*_devall.yaml")
+                    if not p.name.startswith("deim_"))  # DEIM: tests/test_deim_override.py
     assert [p.stem for p in finals] == [
         "yolo11s_def3_devall", "yolo26n_def3_devall", "yolo26n_nal1_devall", "yolo26s_def3_devall"]
     for p in finals:
@@ -197,7 +198,8 @@ def test_matrix_and_final_names_follow_the_contract():
             assert parsed is not None, f"{path.name}: name {eff['name']!r} breaks the naming contract"
             assert path.stem == eff["name"], f"{path.name}: file name != run name"
             assert parsed.fold == eff["fold"] and eff["dataset_id"] == f"ds_v2_{parsed.schema}", path
-            assert eff["model"] == f"{parsed.arch}.pt", path
+            if eff["framework"] == "ultralytics":  # DEIM names its init in train/deim_run.MODELS
+                assert eff["model"] == f"{parsed.arch}.pt", path
 
 
 # choose-op / export compare these across the models of one family (WP-eval).
@@ -209,6 +211,8 @@ def test_fold_models_of_a_family_are_equivalent():
     fams: dict = {}
     for path in sorted((ML / "configs" / "matrix").glob("*.yaml")):
         eff = dispatch.resolve(path)
+        if eff["framework"] != "ultralytics":  # DEIM's fold equivalence: tests/test_deim_override.py
+            continue
         fams.setdefault(B.family_of(eff["name"]), []).append(eff)
     assert sorted(fams) == ["yolo11s_def3", "yolo26n_def3", "yolo26n_nal1", "yolo26s_def3"]
     for fam, effs in fams.items():
