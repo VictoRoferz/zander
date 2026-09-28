@@ -1,7 +1,7 @@
 # Zander — single-PC deployment
 
 The whole system runs on **one Windows PC**: Label Studio + `receiver` +
-`dashboard` in Docker, plus the **native camera stack** — `camerapi` with the
+`dashboard` + `inspector` (the defect detector) in Docker, plus the **native camera stack** — `camerapi` with the
 Basler GigE camera direct-attached, and the USB button listener. (Native because a
 container can neither discover a GigE camera on a host NIC nor hook USB keyboard
 input.)
@@ -9,6 +9,8 @@ input.)
 ```
 USB keypad (F13) ─▶ camerapi (native, :8001) ──upload──▶ receiver (Docker, :8002) ──creates tasks──▶ Label Studio (Docker, :8081)
 dashboard "Capture" ─┘                                    dashboard (Docker, :8003) ──live-reads─────▶ Label Studio
+receiver ──after each ingest──▶ inspector (Docker, 127.0.0.1:8004) ──▶ data\predictions\<id>.pred.json ──▶ dashboard result panel
+camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ──▶ browser live panel
 ```
 
 ---
@@ -81,8 +83,34 @@ dashboard "Capture" ─┘                                    dashboard (Docker,
 11. ```
     powershell -ExecutionPolicy Bypass -File install-shortcut.ps1
     ```
-    Drops a **Zander** icon on the Desktop. Double-clicking it starts the three
+    Drops a **Zander** icon on the Desktop. Double-clicking it starts the four
     containers **and** the camera stack, then opens the dashboard.
+
+### Deploy a trained model (whenever a new one is exported)
+
+12. On the training machine, `python cli.py export …` (see `ml/README.md`) writes
+    `ml_data/exports/detector.onnx` + `detector.json` (the card: classes, frozen
+    threshold, provenance). Copy **both** files to `deploy\data\models\` on this PC
+    (create the folder the first time), then:
+    ```
+    docker compose restart inspector
+    curl http://localhost:8004/api/v1/status
+    ```
+    `model_loaded: true` and `threshold_source: detector.json` mean it is live. Without
+    a valid card the inspector refuses the model (`REQUIRE_CARD=true`) and the dashboard
+    shows "No model loaded". Captures taken before the model arrived keep that state;
+    re-classify one with `curl -X POST http://localhost:8002/api/v1/predict/<capture_id>`.
+
+### Enable the live camera view (optional)
+
+13. Pick a random token (e.g. `python -c "import secrets; print(secrets.token_urlsafe(24))"`)
+    and put the **same** value in `deploy\.env` → `PREVIEW_TOKEN=` and in
+    `camerapi\.env` → `PREVIEW_TOKEN=`. In `camerapi\.env` also set
+    `LIVE_PREVIEW_ENABLED=true`. Then `docker compose up -d` and restart the camera
+    stack (`stop-zander.bat`, `start-zander.bat`). The dashboard's live panel shows the
+    camera at ~5 fps (`PREVIEW_FPS`). With the flag off (default) captures work exactly
+    as before; with it on, a capture briefly stops the stream and grabs the first frame
+    after the key press.
 
 ---
 
@@ -96,12 +124,18 @@ dashboard "Capture" ─┘                                    dashboard (Docker,
 - **Logs:** containers → `docker compose logs -f receiver` (or `dashboard`,
   `labelstudio`); camera stack → the "Zander Camera" window or `deploy\camera-stack.log`.
 - **Status:** `docker compose ps`; camera + spool depth →
-  `curl http://localhost:8001/api/v1/status`.
+  `curl http://localhost:8001/api/v1/status`; model → `curl http://localhost:8004/api/v1/status`.
+- **After pulling code changes:** `docker compose up -d --build` once (the first build of
+  the inspector image needs internet), then restart the camera stack.
+- **Result view:** after each capture the dashboard shows the photo large with the
+  model's boxes, the verdict (iO/NiO) and the defect classes (about 2–3 s after the key
+  press). It is advisory until the model has passed its test evaluation.
 
 ### Data & persistence
 
 - Images + the dashboard's user DB live in `deploy\data\` (host folder, `DATA_DIR`
-  in `.env`) — the canonical store.
+  in `.env`) — the canonical store. `predictions\` holds one result file per capture;
+  `models\` holds the deployed detector and its card.
 - camerapi's `%USERPROFILE%\zander-data\spool\` holds only not-yet-acknowledged
   captures (normally empty; it drains the moment the receiver is up).
 - Label Studio's projects/annotations live in the `zander_ls_internal` Docker
@@ -130,9 +164,12 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
 ## Configuration reference
 
 - `deploy\.env` — Docker side: `LABELSTUDIO_API_KEY`, `DATA_DIR`, `LAPTOP_HOST`,
-  LS admin credentials, `LS_IMAGE_TAG`. After editing: `docker compose up -d` again.
+  LS admin credentials, `LS_IMAGE_TAG`, `PREVIEW_TOKEN`, optional
+  `INSPECTOR_REQUIRE_CARD` (default true), `INSPECTOR_ORT_THREADS`. After editing:
+  `docker compose up -d` again.
 - `camerapi\.env` — camera stack: `CAMERA_TRANSPORT=ethernet`, `USE_CAMERA`,
   `INGEST_URL`/`DASHBOARD_URL` (localhost defaults are right for this setup),
+  `LIVE_PREVIEW_ENABLED`, `PREVIEW_TOKEN` (same as `deploy\.env`), `PREVIEW_FPS`,
   button keys (`BUTTON_CAPTURE_KEY`, …). Restart the camera stack after editing.
 - The dashboard container reaches native camerapi at `host.docker.internal:8001`
   (Docker Desktop built-in; on plain Linux Docker you would add
@@ -145,6 +182,13 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
    logs `ingested ok` → tile appears under "Unlabeled" → task in Label Studio.
 3. Label it in LS (bounding boxes), pick `iO`/`NiO`, **Submit** → tile moves to
    "Labeled" with the quality badge.
+4. With a model deployed: the dashboard's result panel shows the capture with boxes,
+   verdict and classes within a few seconds (`deploy\data\predictions\<id>.pred.json`
+   exists with `"status": "ok"`).
+5. With the live view enabled: the live panel runs at ~5 fps;
+   `curl http://localhost:8001/api/v1/preview/status -H "X-Preview-Token: <token>"`
+   shows `frames_incomplete` staying near 0. From another machine on the LAN,
+   `curl http://<pc>:8001/api/v1/preview/frame.jpg` must answer **401**.
 
 ## Troubleshooting
 
@@ -165,6 +209,19 @@ from an activated `.venv`), run `deploy\setup-camera.bat` for the camera deps, t
   Desktop, or `LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT` ≠ the mounted `/data`.
 - **Label Studio version** → pin `LS_IMAGE_TAG` in `.env` to the version you
   validated; avoid `latest` in production.
+- **Result panel says "No model loaded"** → `curl http://localhost:8004/api/v1/status`:
+  `load_error` names the reason (no `detector.onnx`/`detector.json` in
+  `deploy\data\models\`, card sha mismatch, class-count mismatch). Fix, then
+  `docker compose restart inspector`.
+- **Result panel shows an error** (`inspector unreachable`, `HTTP 500 …`) →
+  `docker compose logs -f inspector`; the capture itself is safe in Label Studio.
+  Re-run one: `curl -X POST http://localhost:8002/api/v1/predict/<id>?force=true`.
+- **Live panel "offline" / "auth_error"** → the camera stack isn't running, or the two
+  `PREVIEW_TOKEN` values differ (`deploy\.env` vs `camerapi\.env`); after fixing,
+  `docker compose up -d` and restart the camera stack.
+- **Live view stutters / low fps** → check `frames_incomplete` in
+  `/api/v1/preview/status`; lower `PREVIEW_FPS` (the full 5 MP frames need ~200 Mbit/s at
+  5 fps), or give the inspector fewer threads (`INSPECTOR_ORT_THREADS=4`).
 
 ## macOS dev
 
