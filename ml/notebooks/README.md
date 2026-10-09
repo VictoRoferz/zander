@@ -50,7 +50,7 @@ The notebook creates `bundles/`, `mirror/`, `logs/` and `matrix_log.jsonl` next 
 1. In the **Parameters** cell, add `MATRIX = MATRIX[:1]` below the list. That trains only `yolo26n_def3_fold0`.
 2. Choose **Runtime → Run all** and accept the Drive permission prompt.
 3. The first cells check the GPU, mount Drive, clone the branch (printing the git sha), and assert that `ml/datasets/split_v2.json` exists, so that v1 code is refused.
-4. They then install `requirements-colab.txt`, unpack the zips and rebuild the views.
+4. They then install `requirements-colab.txt` and import it (a failed install stops Run all here), unpack the zips and rebuild the views. A failed rebuild stops Run all too, before the fingerprint check.
 5. Setup takes about 5 min. Then watch the epoch time in the output.
    - On an L4 a 120-epoch fold run should take about **50–90 min**: n-scale at the low end, s-scale at the high end.
    - nal1 runs take about **35 % longer**, because their views are larger.
@@ -137,6 +137,8 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 | symptom | meaning / fix |
 |---|---|
 | `has no ml/datasets/split_v2.json` | `BRANCH` points at v1 code; use the v2 branch |
+| `requirements-colab.txt did not install on Python 3.x` | A pinned package has no wheel for Colab's Python version. pip's output above names it; widen that pin in `ml/requirements-colab.txt` (the onnx comment there says how) and push |
+| `rebuilding the YOLO view failed` | `cli.py tile --no-images` failed on Colab; its output is printed above. Usually the branch lacks the committed manifest/split, or a dependency is missing |
 | `fingerprint mismatch` | The zip and the branch were built from different data or code. Rebuild the zips from the pushed commit |
 | `missing .../ds_v2_*_tiles.zip` | Upload the zip to `MyDrive/ZanderML/` without renaming it |
 | `WARNING ... config_sha256 differs` | A finished bundle was trained with a different effective config (an edited config or `EXTRA_SET`). It is **kept, never overwritten**. Delete the bundle and its `.sha256` on Drive to retrain |

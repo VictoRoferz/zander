@@ -7,9 +7,16 @@ matrix is never run with check=True, and the v2 guard is present.
 Run: ml/.venv/bin/python -B tests/test_notebook.py
 """
 import ast
+import io
 import json
+import os
 import re
+import shutil
 import sys
+import tempfile
+import types
+import zipfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -135,6 +142,108 @@ def test_session_ends_with_a_drive_flush():
     md = "\n".join(_src(c) for c in _nb()["cells"] if c["cell_type"] == "markdown")
     assert "deleted once a bundle is safe" not in md and "deletes the run's mirror" not in md
     assert "later" in md and "flush_and_unmount" in RUNBOOK.read_text(encoding="utf-8")
+
+
+def _cell(cell_id: str) -> str:
+    return _src({c["id"]: c for c in _nb()["cells"]}[cell_id])
+
+
+def test_colab_pins_have_wheels_for_current_pythons():
+    # T3: onnx==1.17.0 has wheels for cp38-cp312 only; 1.19.1 has cp310-cp313 manylinux wheels
+    from packaging.requirements import Requirement
+
+    reqs = {}
+    for line in (ML / "requirements-colab.txt").read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            r = Requirement(line)
+            reqs[r.name] = r.specifier
+    assert reqs["onnx"].contains("1.19.1"), reqs["onnx"]
+    assert not reqs["onnx"].contains("1.20.0"), "keep the onnx line the verified ultralytics/ORT combo"
+    assert str(reqs["ultralytics"]) == "==8.4.115"
+
+
+def test_a_failed_install_stops_run_all():
+    # T3: `%pip` never fails a cell — the cell after it must import the stack or raise
+    order = [c["id"] for c in _code_cells()]
+    assert order.index("install") + 1 == order.index("deps") < order.index("data"), order
+    src = _cell("deps")
+    assert not any(line.lstrip().startswith(("!", "%")) for line in src.splitlines())
+    saved = {m: sys.modules.get(m) for m in ("ultralytics", "onnxslim")}
+    sys.modules["ultralytics"] = types.SimpleNamespace(__version__="8.4.115")  # no torch import in this test
+    try:
+        with redirect_stdout(io.StringIO()):
+            exec(compile(src, "<deps>", "exec"), {})  # the ml venv has the stack: passes
+        sys.modules["onnxslim"] = None  # -> ImportError, like a package pip could not install
+        try:
+            with redirect_stdout(io.StringIO()):
+                exec(compile(src, "<deps>", "exec"), {})
+        except RuntimeError as e:
+            assert "onnxslim" in str(e) and "requirements-colab.txt" in str(e), e
+        else:
+            raise AssertionError("a missing package did not stop the notebook")
+    finally:
+        for m, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = mod
+    assert "python_version" in src
+
+
+def _run_data_cell(cli_code: str, zip_fp: str = "a" * 64):
+    """Execute the notebook's data cell against a fake repo/Drive whose
+    `cli.py tile` runs `cli_code` (ML_DATA_ROOT is set for it)."""
+    d = Path(tempfile.mkdtemp(prefix="zander_test_nb_"))
+    try:
+        repo, drive, ml_data = d / "repo", d / "drive", d / "ml_data"
+        (repo / "ml" / "configs").mkdir(parents=True)
+        (repo / "ml" / "configs" / "fake_def3_fold0.yaml").write_text("dataset_id: ds_v2_def3\n")
+        (repo / "ml" / "cli.py").write_text(cli_code)
+        drive.mkdir()
+        with zipfile.ZipFile(drive / "ds_v2_def3_tiles.zip", "w") as zf:
+            zf.writestr("ds_v2_def3/provenance.json",
+                        json.dumps({"dataset_fingerprint": zip_fp, "schema": "def3"}))
+        ns = {"os": os, "REPO": str(repo), "BRANCH": "test", "ML_DATA": str(ml_data),
+              "DRIVE_DIR": str(drive), "MATRIX": ["configs/fake_def3_fold0.yaml"], "FINAL": None,
+              "DEIM_MATRIX": []}
+        saved = os.environ.get("ML_DATA_ROOT")
+        try:
+            with redirect_stdout(io.StringIO()):
+                exec(compile(_stub_ipython(_cell("data")), "<data>", "exec"), ns)
+        finally:
+            if saved is None:
+                os.environ.pop("ML_DATA_ROOT", None)
+            else:
+                os.environ["ML_DATA_ROOT"] = saved
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_WRITE_PROV = ("import json, os, pathlib, sys\n"
+               "p = pathlib.Path(os.environ['ML_DATA_ROOT']) / 'tiles' / 'ds_v2_def3' / 'provenance.json'\n"
+               "p.write_text(json.dumps({'dataset_fingerprint': %r}))\n")
+
+
+def test_the_fingerprint_check_cannot_pass_on_a_failed_rebuild():
+    # T4: the rebuild used to be `!python cli.py tile` (never raises) followed by
+    # comparing the zip's own provenance.json with itself
+    assert "cli.py tile" not in "".join(l for l in _cell("data").splitlines(True) if l.lstrip().startswith("!"))
+    _run_data_cell(_WRITE_PROV % ("a" * 64))  # same data + code: passes
+    for code, needle in (("import sys\nsys.exit(1)\n", "rebuilding the YOLO view failed"),
+                         ("print('did nothing')\n", "rebuilding the YOLO view failed")):
+        try:
+            _run_data_cell(code)
+        except RuntimeError as e:
+            assert needle in str(e), e
+        else:
+            raise AssertionError(f"a failed rebuild passed the fingerprint check: {code!r}")
+    try:
+        _run_data_cell(_WRITE_PROV % ("b" * 64))
+    except AssertionError as e:
+        assert "fingerprint mismatch" in str(e), e
+    else:
+        raise AssertionError("a different fingerprint passed")
 
 
 def test_markdown_states_honest_timings():

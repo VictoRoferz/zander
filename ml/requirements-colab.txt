@@ -11,7 +11,12 @@
 # evaluation/inspector needs it, the Colab export does not), pycocotools/
 # imagehash (dataset building happens on the Mac).
 ultralytics==8.4.115
-onnx==1.17.0
+# onnx: 1.17.0 has wheels for cp38-cp312 only, so pip fails on a Python 3.13 runtime.
+# <1.20 resolves to 1.19.1 (manylinux wheels cp310-cp313); Ultralytics 8.4.115 accepts any
+# onnx>=1.12 on Linux and caps the exported IR version at 10, so the models still load in the
+# Mac-side onnxruntime 1.20.1. 1.19.x has no manylinux wheel for 3.14: on such a runtime the
+# notebook's import check stops Run all — then move this range to onnx 1.21 (abi3 wheels).
+onnx>=1.17,<1.20
 onnxslim==0.1.95
 pydantic-settings==2.6.1
 PyYAML==6.0.2
