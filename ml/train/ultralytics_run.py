@@ -19,6 +19,9 @@ the bundle records, and its sha256 is the run's identity):
     leak) — so every run bundles its LAST epoch. dev_all refuses `best`
     outright: its "val" (fold0_val) is inside dev_all_train.
   - extra.patience: 0 — early stopping off (0 = never stop in Ultralytics).
+    Early stopping picks the final epoch on fold{i}_val, the same leak as
+    `best`: a fold run with patience != 0 gets a loud warning (the
+    out-of-fold eval refuses such bundles), dev_all refuses it outright.
   - batch: Ultralytics silently halves it after a CUDA OOM in the first epoch
     of a process; meta.json records what last.pt says it trained with as
     `batch_effective`, and a mismatch is logged as a loud WARNING.
@@ -184,6 +187,13 @@ def resolve_config(raw: dict, overrides: Optional[dict] = None) -> dict:
             "dev_all refuses final_weights: best — its validation view (fold0_val) is inside "
             "dev_all_train, so best.pt would be selected on training data; use last"
         )
+    patience = eff["extra"].get("patience") if isinstance(eff.get("extra"), dict) else None
+    early_stop = patience not in (0, None)  # Ultralytics: 0/None = never stop
+    if fold == "dev_all" and early_stop:
+        errors.append(
+            f"dev_all refuses extra.patience: {patience!r} — early stopping would choose the final "
+            "epoch on fold0_val, which is inside dev_all_train; use 0"
+        )
     for key in ("augment", "extra", "export"):
         need(isinstance(eff.get(key), dict), f"`{key}` must be a mapping")
     if not errors:
@@ -217,6 +227,12 @@ def resolve_config(raw: dict, overrides: Optional[dict] = None) -> dict:
         logger.warning(
             "final_weights: best selects the checkpoint on %s_val — the photos this model is "
             "later evaluated on out-of-fold (selection leak); prefer last", fold,
+        )
+    if early_stop:
+        logger.warning(
+            "WARNING extra.patience: %r turns early stopping on: the run ends at an epoch chosen on "
+            "%s_val — the photos this model is later evaluated on out-of-fold (selection leak; the "
+            "out-of-fold evaluation refuses such bundles); keep 0", patience, fold,
         )
     return eff
 

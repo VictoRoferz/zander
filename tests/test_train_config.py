@@ -237,6 +237,40 @@ def test_dev_all_refuses_best():
     _raises(B.ConfigError, lambda: U.resolve_config(dict(MATRIX_CFG, final_weights="ema")), "final_weights")
 
 
+def test_early_stopping_is_a_selection_leak():
+    # T7: patience != 0 stops at an epoch chosen on the fold's val photos — the
+    # ones it is evaluated on later. Same policy as `best`: loud on folds,
+    # refused on dev_all (its val is inside its training data).
+    import logging
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    grab = Grab()
+    U.logger.addHandler(grab)
+    try:
+        U.resolve_config(dict(MATRIX_CFG))
+        assert not [m for m in grab.lines if "patience" in m], grab.lines
+        eff = U.resolve_config(dict(MATRIX_CFG), {"extra.patience": 30})
+        assert eff["extra"]["patience"] == 30
+        loud = [m for m in grab.lines if "patience" in m]
+        assert len(loud) == 1 and "WARNING" in loud[0] and "fold0_val" in loud[0] and "leak" in loud[0], loud
+        assert U.resolve_config(dict(MATRIX_CFG), {"extra.patience": None})["extra"]["patience"] is None
+        assert len([m for m in grab.lines if "patience" in m]) == 1, "None = never stop: no warning"
+    finally:
+        U.logger.removeHandler(grab)
+    devall = dict(MATRIX_CFG, name="yolo26n_def3_devall", fold="dev_all")
+    _raises(B.ConfigError, lambda: U.resolve_config(devall, {"extra.patience": 30}),
+            "dev_all refuses extra.patience")
+    _raises(B.ConfigError, lambda: U.resolve_config(dict(devall, extra={"patience": 5})), "patience")
+    assert U.resolve_config(devall)["extra"]["patience"] == 0
+
+
 def test_runner_rejects_inconsistent_configs():
     _raises(B.ConfigError, lambda: U.resolve_config(dict(MATRIX_CFG, fold="fold1")), "says fold0")
     _raises(B.ConfigError, lambda: U.resolve_config(dict(MATRIX_CFG, extra={"data": "x.yaml"})), "data")
