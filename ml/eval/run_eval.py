@@ -32,10 +32,13 @@ read or any ONNX session is created:
     re-derived there. On test the op must carry choose-op provenance and belong
     to the model (`op_model_problems`: family + config equivalence with its
     fold bundles — export's identity check, run before the one-shot look);
-  - the TEST LEDGER (committed ml/reports/test_ledger.csv) records every
-    model/operating-point pair evaluated on test. Re-running the same pair is
-    fine (deterministic); a different pair is a second look at the one-shot set
-    and is refused unless `second_look="<reason>"`, which is recorded.
+  - the TEST LEDGER (committed ml/reports/test_ledger.csv) records every look
+    at test, keyed by (model, operating point, conf floor, snapshot id, GT
+    sha). Re-running the same key is fine (deterministic); another key is a
+    second look at the one-shot set and is refused unless
+    `second_look="<reason>"`, which is recorded. Test evals in ml_data/eval
+    (shared across checkouts) count as looks too; a look's eval dir is never
+    overwritten (a further look gets `<bundle_run>__test__look<k>`).
   - fold runs without an operating point report a self-tuned threshold,
     flagged as diagnostic; `choose-op` pools the three fold runs' predictions
     into the real dev operating point (distinct own-fold models required).
@@ -44,7 +47,7 @@ Writes ml_data/eval/<run_name>/{metrics.json, predictions.json (v2), report.md,
 gallery.html} and appends one row to the committed ml/reports/results_v2.csv
 (never for smoke or guard-overridden runs). Default run names follow
 CONTRACTS §8.2: `<family>_fold<k>` on the model's own fold, else
-`<bundle_run>__<bucket>`. Model-vs-model decisions use ONLY these photo-level
+`<bundle_run>__<bucket>` (`__look<k>` appended for a further test look). Model-vs-model decisions use ONLY these photo-level
 numbers — never per-tile or in-training validation metrics.
 
 predictions.json v2 = v1 + format_version, source{…}, per-photo width/height
@@ -55,6 +58,8 @@ detector (5-decimal rounding put the threshold-defining photo on a coin flip).
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import json
 import logging
 import math
@@ -100,6 +105,7 @@ RESULTS_FIELDS = [
 TEST_LEDGER_FIELDS = [
     "date", "run_name", "model_sha256", "operating_point_sha256", "bundle_run",
     "family", "schema", "threshold", "look", "reason",
+    "conf_floor", "snapshot_id", "gt_sha256", "guard_overridden",
 ]
 # choose-op / export / compare: fold models of one family must share these (CONTRACTS §8.3).
 EQUIV_KEYS = ("arch", "dataset_id", "epochs", "imgsz", "batch", "augment", "final_weights", "extra")
@@ -309,6 +315,74 @@ def test_ledger_path() -> Path:
     return settings.test_ledger_file
 
 
+# A test look is identified by the model, the operating point, the confidence
+# floor and the ground truth it was scored against: changing any of them is a
+# new test number, i.e. another look at the one-shot set.
+LEDGER_KEY_FIELDS = ("model_sha256", "operating_point_sha256", "conf_floor", "snapshot_id",
+                     "gt_sha256")
+
+
+def _key_value(field: str, value) -> str:
+    if value is None or value == "":
+        return ""
+    if field == "conf_floor":
+        try:
+            return repr(float(value))
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value).strip().lower() if field.endswith("sha256") else str(value).strip()
+
+
+def look_key(look: dict) -> tuple[str, ...]:
+    """Normalised ledger key of a ledger row / eval-dir look / key dict."""
+    return tuple(_key_value(f, look.get(f)) for f in LEDGER_KEY_FIELDS)
+
+
+def ground_truth_sha256(records: list[dict]) -> str:
+    """Identity of the ground truth an eval scored (the bucket's _gt_record list):
+    a relabel, a review fix or a quarantine change gives another sha."""
+    recs = sorted(records, key=lambda r: r["capture_id"])
+    blob = json.dumps(recs, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _cascade_identity(model_sha: str, stacker_sha: str) -> str:
+    """CONTRACTS §8.4: the ledger's model key of a detector+verifier cascade."""
+    return hashlib.sha256(f"cascade:{model_sha}:{stacker_sha}".encode()).hexdigest()
+
+
+def _eval_dir_look(d: Path) -> dict | None:
+    """The test look an eval dir holds (its metrics.json, bucket test), else None."""
+    mpath = Path(d) / "metrics.json"
+    if not mpath.is_file():
+        return None
+    try:
+        m = json.loads(mpath.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning(f"{mpath}: unreadable ({e}) — not counted as a test look")
+        return None
+    if not isinstance(m, dict) or m.get("bucket") != "test":
+        return None
+    src = m.get("source") or {}
+    model_sha = src.get("model_sha256")
+    if src.get("kind") == "cascade" and model_sha and src.get("stacker_sha256"):
+        model_sha = _cascade_identity(model_sha, src["stacker_sha256"])
+    return {"run_name": Path(d).name, "model_sha256": model_sha,
+            "operating_point_sha256": (m.get("operating_point") or {}).get("sha256"),
+            "conf_floor": src.get("conf_floor"), "snapshot_id": m.get("snapshot_id"),
+            "gt_sha256": m.get("gt_sha256")}
+
+
+def eval_dir_test_looks() -> list[dict]:
+    """Every test evaluation in ml_data/eval. That folder is shared by all
+    checkouts and worktrees while the ledger is per checkout (and `git checkout
+    -- reports/` drops its rows), so these count as recorded looks too."""
+    if not settings.eval_dir.is_dir():
+        return []
+    return [look for d in sorted(settings.eval_dir.iterdir()) if d.is_dir()
+            for look in [_eval_dir_look(d)] if look]
+
+
 def _read_ledger(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -316,42 +390,89 @@ def _read_ledger(path: Path) -> list[dict]:
         return [r for r in csv.DictReader(f) if r.get("model_sha256")]
 
 
-def check_test_ledger(model_sha: str, op_sha: str, second_look: str | None = None) -> dict:
-    """One-shot rule for the test bucket (ml/reports/test_ledger.csv).
+def check_test_ledger(model_sha: str, op_sha: str, second_look: str | None = None, *,
+                      conf_floor: float | None = None, snapshot_id: str | None = None,
+                      gt_sha256: str | None = None) -> dict:
+    """One-shot rule for the test bucket (ml/reports/test_ledger.csv + the test
+    evals in ml_data/eval).
 
-    First look, or a rerun of an already recorded model/op pair -> allowed. Any
-    other pair -> refused unless `second_look` gives a reason (then recorded).
-    Returns {"look": first|rerun|second_look, "reason": str}."""
+    Key = (model sha, operating point sha, conf floor, snapshot id, GT sha).
+    First look, or a rerun of a recorded key -> allowed. Any other key ->
+    refused unless `second_look` gives a reason (then recorded). A rerun found
+    only in ml_data/eval is re-recorded in the ledger. Returns {"look":
+    first|rerun|second_look, "reason": str, "record": bool}."""
     path = test_ledger_path()
     rows = _read_ledger(path)
-    if not rows:
-        return {"look": "first", "reason": ""}
-    if any(r["model_sha256"] == model_sha and r["operating_point_sha256"] == op_sha for r in rows):
-        return {"look": "rerun", "reason": ""}
+    key = look_key({"model_sha256": model_sha, "operating_point_sha256": op_sha,
+                    "conf_floor": conf_floor, "snapshot_id": snapshot_id, "gt_sha256": gt_sha256})
+    in_ledger = {look_key(r) for r in rows}
+    unrecorded = [lk for lk in eval_dir_test_looks() if look_key(lk) not in in_ledger]
+    if not rows and not unrecorded:
+        return {"look": "first", "reason": "", "record": True}
+    if key in in_ledger:
+        return {"look": "rerun", "reason": "", "record": False}
+    same = [lk for lk in unrecorded if look_key(lk) == key]
+    if same:
+        reason = (f"restored: look found in ml_data/eval/{same[0]['run_name']} but missing "
+                  f"from {path.name}")
+        logger.warning(f"rerun of an unrecorded test look — {reason}")
+        return {"look": "rerun", "reason": reason, "record": True}
     reason = (second_look or "").strip()
     if reason:
         logger.warning(f"SECOND LOOK at the test set (recorded in {path.name}): {reason}")
-        return {"look": "second_look", "reason": reason}
-    last = rows[-1]
+        return {"look": "second_look", "reason": reason, "record": True}
+    looks = rows + unrecorded
+    last = looks[-1]
+    extra = (f"; {len(unrecorded)} of them only in ml_data/eval, missing from {path.name}"
+             if unrecorded else "")
     raise EvalGuardError(
-        f"the one-shot test set was already evaluated ({len(rows)} recorded look(s); last "
-        f"{last['run_name']}: model {last['model_sha256'][:12]}…, operating point "
-        f"{last['operating_point_sha256'][:12]}…). A different model/operating-point pair "
-        f"is a second look — if that is deliberate pass --second-look \"<reason>\" "
-        f"(recorded in {path})"
+        f"the one-shot test set was already evaluated ({len(looks)} recorded look(s){extra}; "
+        f"last {last['run_name']}: model {(last.get('model_sha256') or '?')[:12]}…, operating "
+        f"point {(last.get('operating_point_sha256') or '?')[:12]}…). Another model, operating "
+        f"point, --conf or ground truth is a second look — if that is deliberate pass "
+        f"--second-look \"<reason>\" (recorded in {path})"
     )
+
+
+def _ledger_fields(path: Path) -> list[str]:
+    """The ledger's columns, migrating an older header in place first (rows kept,
+    new columns empty). New file -> TEST_LEDGER_FIELDS."""
+    if not path.exists() or path.stat().st_size == 0:
+        return list(TEST_LEDGER_FIELDS)
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        header = list(reader.fieldnames or [])
+        rows = list(reader)
+    fields = list(TEST_LEDGER_FIELDS) + [c for c in header if c not in TEST_LEDGER_FIELDS]
+    if header == fields:
+        return fields
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=fields, restval="", lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
+    _atomic_write_text(path, out.getvalue())
+    logger.warning(f"{path.name}: header migrated to {len(fields)} columns ({len(rows)} row(s) kept)")
+    return fields
 
 
 def record_test_look(look: dict, *, run_name: str, model_sha: str, op_sha: str,
                      bundle_run: str | None, family: str | None, schema: str,
-                     threshold: float) -> None:
-    if look["look"] == "rerun":
+                     threshold: float, conf_floor: float | None = None,
+                     snapshot_id: str | None = None, gt_sha256: str | None = None,
+                     guard_overridden: list[str] | None = None) -> None:
+    if look["look"] == "rerun" and not look.get("record"):
         return
     path = test_ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    fields = _ledger_fields(path)
     new = not path.exists() or path.stat().st_size == 0
+    with open(path, "a+b") as fb:  # a missing final newline would glue two rows
+        if not new:
+            fb.seek(-1, os.SEEK_END)
+            if fb.read(1) != b"\n":
+                fb.write(b"\n")
     with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=TEST_LEDGER_FIELDS)
+        w = csv.DictWriter(f, fieldnames=fields, restval="", lineterminator="\n")
         if new:
             w.writeheader()
         w.writerow({
@@ -360,8 +481,33 @@ def record_test_look(look: dict, *, run_name: str, model_sha: str, op_sha: str,
             "operating_point_sha256": op_sha, "bundle_run": bundle_run or "",
             "family": family or "", "schema": schema, "threshold": threshold,
             "look": look["look"], "reason": look["reason"],
+            "conf_floor": "" if conf_floor is None else conf_floor,
+            "snapshot_id": snapshot_id or "", "gt_sha256": gt_sha256 or "",
+            "guard_overridden": "; ".join(guard_overridden or []),
         })
+        f.flush()
+        os.fsync(f.fileno())  # the audit trail of a one-shot look must survive a crash
     logger.warning(f"test look recorded in {path} ({look['look']}) — commit it")
+
+
+def _claim_run_name(explicit: str | None, default: str, bucket: str, key: dict) -> str:
+    """An eval dir holding a test look is never overwritten by another look (or
+    by a non-test eval): a further test look gets `<default>__look<k>`; an
+    explicit --run-name that would overwrite one is refused."""
+    want = look_key(key) if bucket == "test" else None
+    name, k = explicit or default, 1
+    while True:
+        held = _eval_dir_look(settings.eval_dir / name)
+        if held is None or (want is not None and look_key(held) == want):
+            return name
+        if explicit:
+            raise EvalGuardError(
+                f"ml_data/eval/{name} holds another test look (model "
+                f"{(held.get('model_sha256') or '?')[:12]}…) — a look is never overwritten: "
+                "choose another --run-name"
+            )
+        k += 1
+        name = f"{default}__look{k}"
 
 
 def default_run_name(info: dict | None, model_path: Path, schema: str, bucket: str) -> str:
@@ -425,8 +571,17 @@ def run(
             )
     model_sha = registry.file_sha256(model_path)
     op_sha = registry.file_sha256(operating_point) if operating_point else None
-    look = check_test_ledger(model_sha, op_sha, second_look) if bucket == "test" else None
+    # the bucket's ground truth (manifest + split only — still no photo read): part of the look key
+    manifest, split = load_manifest(), load_split()
+    entries, probe = bucket_photos(bucket, schema)
+    gt = [_gt_record(e, schema, split) for e in entries]
+    gt_sha = ground_truth_sha256(gt)
+    key = {"model_sha256": model_sha, "operating_point_sha256": op_sha, "conf_floor": conf_floor,
+           "snapshot_id": manifest["snapshot_id"], "gt_sha256": gt_sha}
+    look = None
     if bucket == "test":
+        look = check_test_ledger(model_sha, op_sha, second_look, conf_floor=conf_floor,
+                                 snapshot_id=manifest["snapshot_id"], gt_sha256=gt_sha)
         logger.warning(
             "TEST bucket: the one-shot honest number for the FINAL model. Do not use "
             "it for model selection or threshold tuning."
@@ -434,9 +589,8 @@ def run(
     if bucket == "train_always":
         logger.warning("train_always photos are always trained on: memorisation check only")
 
-    manifest, split = load_manifest(), load_split()
-    entries, probe = bucket_photos(bucket, schema)
-    run_name = run_name or default_run_name(info, model_path, schema, bucket)
+    run_name = _claim_run_name(run_name, default_run_name(info, model_path, schema, bucket),
+                               bucket, key)
     out_dir = settings.eval_dir / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -448,7 +602,7 @@ def run(
         )
 
     photos, total_ms = [], 0.0
-    for n, e in enumerate(entries, 1):
+    for n, (e, gt_rec) in enumerate(zip(entries, gt), 1):
         det = detector.detect_file(photo_path(e))
         bad = [c for c in det.labels if not 0 <= c < len(classes)]
         if bad:  # end-to-end exports have no static class count to check up front
@@ -457,10 +611,7 @@ def run(
                 f"schema {schema!r} has {len(classes)} classes — wrong --schema or model"
             )
         total_ms += det.elapsed_ms
-        photos.append({
-            **_gt_record(e, schema, split),
-            "boxes": det.boxes, "scores": det.scores, "labels": det.labels,
-        })
+        photos.append({**gt_rec, "boxes": det.boxes, "scores": det.scores, "labels": det.labels})
         if n % 10 == 0 or n == len(entries):
             logger.info(f"evaluated {n}/{len(entries)} photos")
 
@@ -487,7 +638,7 @@ def run(
         "schema": schema, "bucket": bucket, "n_photos": len(photos),
         "mean_ms_per_photo": round(total_ms / len(photos), 1),
         "tiler_version": detector.tiler_version, "split_id": split["split_id"],
-        "snapshot_id": manifest["snapshot_id"],
+        "snapshot_id": manifest["snapshot_id"], "gt_sha256": gt_sha,
         "dataset_fingerprint": (info or {}).get("dataset_fingerprint")
         or _bundle_meta(model_path).get("dataset_fingerprint"),
         "host": platform.node(),
@@ -501,10 +652,13 @@ def run(
     if overridden:
         metrics["guard_overridden"] = overridden
     if look is not None:
+        metrics["test_look"] = {"look": look["look"], "reason": look["reason"],
+                                "ledger": test_ledger_path().name}
         record_test_look(
             look, run_name=run_name, model_sha=model_sha, op_sha=op_sha,
             bundle_run=source["bundle_run"], family=source["family"], schema=schema,
-            threshold=op["threshold"],
+            threshold=op["threshold"], conf_floor=conf_floor,
+            snapshot_id=manifest["snapshot_id"], gt_sha256=gt_sha, guard_overridden=overridden,
         )
     smoke = registry.is_smoke(run_name) or registry.is_smoke(source["bundle_run"])
     if record and (smoke or overridden):
@@ -952,6 +1106,10 @@ def format_report(m: dict) -> str:
     if m.get("guard_overridden"):
         lines.append("- ⚠ **guard overridden — not an honest number**: "
                      + "; ".join(m["guard_overridden"]))
+    tl = m.get("test_look")
+    if tl:
+        lines.append(f"- test look: **{tl['look']}**" + (f" — {tl['reason']}" if tl.get("reason") else "")
+                     + f" (recorded in reports/{tl.get('ledger') or 'test_ledger.csv'})")
     if m["bucket"] in NOT_HONEST_BUCKETS:
         lines.append(f"- ⚠ {NOT_HONEST_BUCKETS[m['bucket']]}")
     lines += [

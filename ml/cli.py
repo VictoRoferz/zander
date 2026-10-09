@@ -155,7 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--operating-point", default=None,
                    help="operating_point.json (REQUIRED for test/probe_xprod/future)")
     p.add_argument("--run-name", default=None,
-                   help="default: <family>_fold<k> on its own fold, else <bundle_run>__<bucket>")
+                   help="default: <family>_fold<k> on its own fold, else <bundle_run>__<bucket> "
+                        "(+ __look<k> for a further test look; a test look is never overwritten)")
     p.add_argument("--conf", type=float, default=0.001)
     p.add_argument("--no-record", action="store_true", help="do not append to reports/results_v2.csv")
     p.add_argument("--no-gallery", action="store_true", help="skip gallery.html")
@@ -163,8 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="diagnostics only: score a bucket the model trained on / a model without "
                         "meta.json (stamped guard_overridden, never recorded)")
     p.add_argument("--second-look", default=None, metavar="REASON",
-                   help="test bucket: evaluate a model/op pair other than the recorded one "
-                        "(reason goes into reports/test_ledger.csv)")
+                   help="test bucket: evaluate another model / operating point / --conf / ground "
+                        "truth than the recorded looks (reason goes into reports/test_ledger.csv)")
 
     p = sub.add_parser("log-eval", help="log eval runs into their bundles' MLflow runs")
     p.add_argument("eval_runs", nargs="+")

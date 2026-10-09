@@ -170,9 +170,15 @@ verifier ...` — see **`verifier/README.md`**.
   `choose-op` (family, sources, target sensitivity) and belong to the model —
   same family, training config equivalent to its fold bundles — checked before
   the one-shot look is spent.
-- **Test ledger** (`reports/test_ledger.csv`, committed): every model/operating
-  point pair evaluated on `test`. Re-running the same pair is fine; any other
-  pair is a second look and needs `--second-look "<reason>"` (recorded).
+- **Test ledger** (`reports/test_ledger.csv`, committed): every look at `test`,
+  keyed by model, operating point, `--conf` floor and the ground truth scored
+  (snapshot id + `gt_sha256`). Re-running the same key is fine; anything else —
+  another model, op, floor, or a relabel — is a second look and needs
+  `--second-look "<reason>"` (recorded in the ledger, `metrics.json` and
+  `report.md`). Test evals in `ml_data/eval` (shared by every checkout and
+  worktree) count as looks even when this checkout's ledger lost them. A further
+  look lands in `<bundle_run>__test__look<k>`; a look's eval dir is never
+  overwritten.
 - `reports/results_v2.csv` gets one row per honest eval (never smoke or
   overridden runs). Smoke rows are never committed — `git checkout --
   reports/results_v2.csv` after experiments.

@@ -8,6 +8,7 @@ real committed split. predictions.json v2 writing + v1 loading are covered too.
 
 Run: ml/.venv/bin/python -B tests/test_eval_guards.py
 """
+import contextlib
 import csv
 import json
 import os
@@ -15,6 +16,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="zander_eval_guards_"))
@@ -50,6 +52,44 @@ def _no_photos(*a, **k):
 
 run_eval.TiledDetector = _no_onnx
 run_eval.bucket_photos = _no_photos
+
+# manifest-format entries for runs that must get past bucket_photos (the ledger
+# check needs the bucket's ground truth); no photo file is ever opened.
+FAKE_ENTRIES = [
+    {"capture_id": "fake_pos", "image_path": "nowhere/fake_pos.jpg", "board": "A", "pose": "seated",
+     "verdict": "NiO", "width": 2616, "height": 1960,
+     "boxes": [["Nicht ausreichend Lot", [10.0, 10.0, 40.0, 40.0]]]},
+    {"capture_id": "fake_neg", "image_path": "nowhere/fake_neg.jpg", "board": "A", "pose": "seated",
+     "verdict": "iO", "width": 2616, "height": 1960, "boxes": []},
+]
+
+
+def _detector_reached(*a, **k):
+    raise Reached("detector reached (every guard incl. the test ledger passed)")
+
+
+class _FakeDetector:
+    """Stands in for TiledDetector: one NAL hit on positives, nothing elsewhere."""
+    tiler_version = "v2"
+
+    def __init__(self, model_path, adapter, conf_floor=0.001):
+        self.adapter = SimpleNamespace(num_classes=len(NAMES))
+
+    def detect_file(self, path):
+        pos = "pos" in Path(path).name
+        return SimpleNamespace(boxes=[(10.0, 10.0, 40.0, 40.0)] if pos else [],
+                               scores=[0.9] if pos else [], labels=[0] if pos else [],
+                               elapsed_ms=1.0)
+
+
+@contextlib.contextmanager
+def _bucket(entries=None, detector=_detector_reached):
+    run_eval.bucket_photos = lambda bucket, schema: ([dict(e) for e in entries or FAKE_ENTRIES], [])
+    run_eval.TiledDetector = detector
+    try:
+        yield
+    finally:
+        run_eval.bucket_photos, run_eval.TiledDetector = _no_photos, _no_onnx
 run_eval.test_ledger_path = lambda: TMP / "ledger_default.csv"  # never the committed one
 assert settings.ml_data_root == TMP
 
@@ -193,7 +233,7 @@ def test_test_ledger_one_shot_rule():
             "second look", "--second-look")
     _raises(lambda: run_eval.check_test_ledger("a" * 64, "d" * 64), EvalGuardError, "second look")
     second = run_eval.check_test_ledger("c" * 64, "b" * 64, second_look="  new dev_all retrain  ")
-    assert second == {"look": "second_look", "reason": "new dev_all retrain"}
+    assert (second["look"], second["reason"]) == ("second_look", "new dev_all retrain")
     run_eval.record_test_look(second, run_name="y__test", model_sha="c" * 64, op_sha="b" * 64,
                               bundle_run="y", family="f", schema="def3", threshold=0.3)
     run_eval.record_test_look({"look": "rerun", "reason": ""}, run_name="y__test", model_sha="c" * 64,
@@ -221,13 +261,12 @@ def test_different_model_on_test_raises_via_the_ledger():
                               model_sha=registry.file_sha256(model_a), op_sha=registry.file_sha256(op),
                               bundle_run="ma_def3_devall", family="ma_def3", schema="def3",
                               threshold=0.3)
-    _raises(lambda: run_eval.run(model_b, "ultralytics", "def3", "test", operating_point=op),
-            EvalGuardError, "second look")
-    # the recorded pair may re-run: the guards pass and the photos are reached
-    _raises(lambda: run_eval.run(model_a, "ultralytics", "def3", "test", operating_point=op), Reached)
-    # a stated second look passes the guards too
-    _raises(lambda: run_eval.run(model_b, "ultralytics", "def3", "test", operating_point=op,
-                                 second_look="retrained after label fix"), Reached)
+    with _bucket():
+        _raises(lambda: run_eval.run(model_b, "ultralytics", "def3", "test", operating_point=op),
+                EvalGuardError, "second look")
+        # a stated second look passes the guards (the detector is reached)
+        _raises(lambda: run_eval.run(model_b, "ultralytics", "def3", "test", operating_point=op,
+                                     second_look="retrained after label fix"), Reached)
 
 
 def test_probe_xprod_has_no_test_photo():
@@ -478,10 +517,11 @@ def test_test_eval_checks_the_op_belongs_to_the_model_before_the_ledger():
             EvalGuardError, "not imported")
     assert ledger.read_text(encoding="utf-8") == rows_before, "a refused test eval must not be recorded"
     # the matching model passes the identity check (and only then meets the ledger)
-    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=op),
-            EvalGuardError, "second look")
-    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=op,
-                                 second_look="final retrain"), Reached)
+    with _bucket():
+        _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=op),
+                EvalGuardError, "second look")
+        _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=op,
+                                     second_look="final retrain"), Reached)
 
 
 def test_equivalence_covers_extra_and_the_effective_batch():
@@ -538,6 +578,102 @@ def test_choose_op_refuses_stale_evals():
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
     _raises(lambda: run_eval.choose_operating_point([], family="bindf_def3"), EvalGuardError,
             "bindf_def3_fold2", "not the model its bundle describes")
+
+
+def _test_run(model, op, **kw):
+    return run_eval.run(model, "ultralytics", "def3", "test", operating_point=op, record=False,
+                        gallery=False, **kw)
+
+
+def test_test_look_key_has_conf_floor_and_ground_truth_and_looks_never_overwrite():
+    ledger = _ledger("ledger_key.csv")
+    op = _family_op("key_def3")
+    model = _devall("key_def3_devall", "key_def3")
+    first_dir = settings.eval_dir / "key_def3_devall__test"
+    try:
+        with _bucket(detector=_FakeDetector):
+            first = _test_run(model, op)
+            assert first["run_name"] == first_dir.name and first["test_look"]["look"] == "first"
+            again = _test_run(model, op)  # same key: deterministic rerun, same dir, no new row
+            assert again["test_look"]["look"] == "rerun" and again["run_name"] == first_dir.name
+            # --conf is part of the key: another floor is another test number
+            _raises(lambda: _test_run(model, op, conf_floor=0.01), EvalGuardError, "second look")
+            before = (first_dir / "metrics.json").read_bytes()
+            second = _test_run(model, op, conf_floor=0.01, second_look="floor ablation")
+            assert second["run_name"] == "key_def3_devall__test__look2", second["run_name"]
+            assert (first_dir / "metrics.json").read_bytes() == before, "the first look was overwritten"
+            assert second["test_look"] == {"look": "second_look", "reason": "floor ablation",
+                                           "ledger": ledger.name}
+            report = (settings.eval_dir / second["run_name"] / "report.md").read_text(encoding="utf-8")
+            assert "second_look" in report and "floor ablation" in report
+            # an explicit --run-name never overwrites another look's dir
+            _raises(lambda: _test_run(model, op, conf_floor=0.02, second_look="x",
+                                      run_name=first_dir.name), EvalGuardError, "never overwritten")
+            _raises(lambda: run_eval.run(model, "ultralytics", "def3", "probe_xprod", operating_point=op,
+                                         run_name=first_dir.name, record=False, gallery=False),
+                    EvalGuardError, "never overwritten")
+        # a relabel (other ground truth for the same photos) is another look too
+        relabeled = [FAKE_ENTRIES[0], {**FAKE_ENTRIES[1], "verdict": "NiO",
+                                       "boxes": [["Fahne", [5.0, 5.0, 9.0, 9.0]]]}]
+        with _bucket(entries=relabeled, detector=_FakeDetector):
+            _raises(lambda: _test_run(model, op), EvalGuardError, "second look")
+        with open(ledger, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [r["look"] for r in rows] == ["first", "second_look"], rows
+        assert (rows[0]["conf_floor"], rows[1]["conf_floor"]) == ("0.001", "0.01")
+        assert rows[0]["gt_sha256"] == first["gt_sha256"] and len(first["gt_sha256"]) == 64
+        assert rows[0]["snapshot_id"] == first["snapshot_id"] and rows[1]["reason"] == "floor ablation"
+    finally:
+        for d in settings.eval_dir.glob("key_def3_devall__test*"):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_eval_dir_test_looks_count_when_the_ledger_lost_them():
+    """ml_data/eval is shared by every checkout/worktree; the ledger is not."""
+    ledger = _ledger("ledger_lost.csv")
+    op = _family_op("lost_def3")
+    model = _devall("lost_def3_devall", "lost_def3")
+    other = _devall("lost_def3_devall_b", "lost_def3", b"another dev_all model")
+    try:
+        with _bucket(detector=_FakeDetector):
+            _test_run(model, op)
+            ledger.unlink()  # `git checkout -- reports/`, or another worktree's ledger
+            _raises(lambda: _test_run(other, op), EvalGuardError, "second look", "only in ml_data/eval")
+            again = _test_run(model, op)  # its own look: a rerun, and restored in the ledger
+            assert again["test_look"]["look"] == "rerun" and "restored" in again["test_look"]["reason"]
+        with open(ledger, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 1 and rows[0]["look"] == "rerun" and "restored" in rows[0]["reason"], rows
+    finally:
+        for d in settings.eval_dir.glob("lost_def3_devall*__test*"):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_ledger_header_migration_keeps_rows_and_appends_are_fsynced():
+    path = _ledger("ledger_old_header.csv")
+    old = ["date", "run_name", "model_sha256", "operating_point_sha256", "bundle_run", "family",
+           "schema", "threshold", "look", "reason"]
+    path.write_text(",".join(old) + "\n2026-10-01T00:00:00Z,old__test," + "a" * 64 + "," + "b" * 64
+                    + ",old,f,def3,0.3,first,", encoding="utf-8")  # no final newline
+    look = {"look": "second_look", "reason": "r"}
+    kw = dict(model_sha="c" * 64, op_sha="b" * 64, bundle_run="new", family="f", schema="def3",
+              threshold=0.3, conf_floor=0.001, snapshot_id="s", gt_sha256="d" * 64)
+    run_eval.record_test_look(look, run_name="new__test", guard_overridden=["a fold0 model"], **kw)
+    synced, real = [], os.fsync
+    os.fsync = lambda fd: (synced.append(fd), real(fd))[1]
+    try:
+        run_eval.record_test_look(look, run_name="newer__test", **kw)
+    finally:
+        os.fsync = real
+    assert len(synced) == 1, "a ledger append must be fsynced"
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    assert reader.fieldnames == run_eval.TEST_LEDGER_FIELDS, reader.fieldnames
+    assert [r["run_name"] for r in rows] == ["old__test", "new__test", "newer__test"], rows
+    assert rows[0]["reason"] == "" and rows[0]["conf_floor"] == "" and rows[0]["threshold"] == "0.3"
+    assert rows[1]["guard_overridden"] == "a fold0 model" and rows[1]["gt_sha256"] == "d" * 64
+    assert run_eval.check_test_ledger("a" * 64, "b" * 64)["look"] == "rerun"  # the old row still counts
 
 
 def test_zz_results_csv_untouched():

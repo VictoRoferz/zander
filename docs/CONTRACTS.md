@@ -245,6 +245,7 @@ inspector/.env
 - **Run names:**
   - own fold: `<family>_fold<k>` (= the bundle run name)
   - other buckets: `<bundle_run>__<bucket>`
+  - a further look at test (another ledger key): `<bundle_run>__test__look<k>` (k = 2, 3, …) — an eval dir holding a test look is never overwritten by another look or by an explicit `--run-name`
   - cascade: `<family>+<vrun>_fold<k>`
   - A family name resolves to `<F>_fold0..2`.
 - **`predictions.json` v2** = v1 plus:
@@ -259,6 +260,11 @@ inspector/.env
   - all of `scorer.*`
   - `compare.run(run_a, run_b, class_index=0, seed=0)`
 - `_write_outputs` needs these `metrics` keys: run_name, model, adapter, schema, bucket, threshold, threshold_source, n_photos, mean_ms_per_photo, tiler_version, split_id, snapshot_id, dataset_fingerprint, host.
+- `cli.py eval` adds `gt_sha256` (sha256 over the bucket's sorted `_gt_record`s: the ground truth actually scored) and, on `test`, `test_look: {look: first|rerun|second_look, reason, ledger}` (also shown in `report.md`).
+- **Test ledger** `ml/reports/test_ledger.csv` (committed), columns `date, run_name, model_sha256, operating_point_sha256, bundle_run, family, schema, threshold, look, reason, conf_floor, snapshot_id, gt_sha256, guard_overridden`. An older header is migrated in place on the next append (rows kept, new columns empty); appends are fsynced.
+  - A look's key is **(model_sha256, operating_point_sha256, conf_floor, snapshot_id, gt_sha256)** — another floor or a relabel is another test number. A cascade's model key is `sha256("cascade:<detector sha>:<stacker sha>")` (§8.4).
+  - Recorded looks = the ledger rows **plus** every `ml_data/eval/*/metrics.json` with `bucket == "test"` (that folder is shared by all checkouts and worktrees; `git checkout -- reports/` drops ledger rows). A rerun of a key found only there is re-recorded (`look: rerun`, reason `restored: …`).
+  - `check_test_ledger(model_sha, op_sha, second_look=None, *, conf_floor=None, snapshot_id=None, gt_sha256=None) -> {look, reason, record}`, `record_test_look(look, *, run_name, model_sha, op_sha, bundle_run, family, schema, threshold, conf_floor=None, snapshot_id=None, gt_sha256=None, guard_overridden=None)`; the new parameters are keyword-only with defaults (cascade-eval passes the old set).
 - The `ml/reports/results_v2.csv` columns are unchanged. Smoke rows are never committed.
 - **Provenance of a scored model** (`registry.model_file_problem`, `registry.bundle_model_shas`, `run_eval.source_problems`): an ONNX file must be the one its bundle's `meta.json` (`onnx.sha256` / `onnx_raw.sha256`) and import marker (`files`) describe — `eval` refuses a mismatch (never overridable). choose-op, compare and summary pool a fold eval run only if its recorded `source.model_sha256` is still among the bundle's model shas (else "stale eval — re-run eval"), and a frozen operating point is applied to pooled fold runs only if its `sources[].model_sha256` match their models fold by fold (else "stale operating point"; smoke operating points only warn, v1 files cannot be checked). Pooling also refuses one model on several folds among the known shas.
 - **Run policy** (read from the bundle by `run_eval.training_problems`): a model whose bundle has `weights: best`, a non-zero `config.extra.patience`, or `meta.epochs_completed < epochs` carries a checkpoint selected on (or stopped by) its validation view. `eval` treats this as an honesty violation (refused; `--allow-foreign-fold` overrides it, stamped `guard_overridden`); `choose-op` refuses it unconditionally. DEIM bundles (no `extra.patience`, always `last`) pass.
