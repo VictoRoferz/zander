@@ -8,3 +8,8 @@ epochs: 120
 imgsz: 640
 batch: 16
 seed: 20260806
+# Per-epoch validation off (user decision 2026-10-09): the numbers are never used
+# (the last epoch is kept) and the pass cost ~15-25 % of the matrix GPU time.
+# Ultralytics still validates the final epoch.
+extra:
+  val: false

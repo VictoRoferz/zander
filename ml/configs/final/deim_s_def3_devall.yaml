@@ -16,3 +16,8 @@ imgsz: 640
 batch: 16
 seed: 20260806
 final_weights: last
+# DEIM scores the val view after every epoch; nothing uses those numbers (the
+# last epoch is kept, stage 2 is off), so score a 10 % sample instead of all
+# ~1.5k tiles (user decision 2026-10-09, same reason as `val: false` for YOLO).
+extra:
+  val_fraction: 0.1
