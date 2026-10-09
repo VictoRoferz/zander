@@ -68,6 +68,9 @@ The notebook creates `bundles/`, `mirror/`, `logs/` and `matrix_log.jsonl` next 
    Each block of three is a complete family for `choose-op`. If the budget runs short, stop after a block.
 3. After every run the driver prints an ETA from the measured minutes per epoch. At the end it prints a summary table.
 4. Keep the browser tab open. Colab disconnects idle sessions, and background execution needs Pro+.
+5. The **last cell** runs `drive.flush_and_unmount()`. Google Drive uploads in the background, so this waits until everything the session wrote (bundles, mirror, logs) is really on Drive. If you stop a session early, run that cell by hand before you disconnect.
+
+A run's `mirror/<run>/` is **not** deleted when its bundle is written: Drive may still be uploading the bundle. The next session that reads the bundle back from Drive and verifies its sha deletes the mirror.
 
 **After a disconnect:** choose **Reconnect → Runtime → Run all**.
 - Runs whose bundle and `.sha256` are on Drive are skipped.

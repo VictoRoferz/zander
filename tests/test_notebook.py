@@ -127,6 +127,16 @@ def test_v2_guard_and_fingerprint_assert():
     assert "rev-parse" in code, "print the git sha"
 
 
+def test_session_ends_with_a_drive_flush():
+    # T5: Drive uploads in the background; the last code cell waits for it
+    code = _code_cells()
+    assert code[-1]["id"] == "flush", [c["id"] for c in code]
+    assert "drive.flush_and_unmount()" in _src(code[-1])
+    md = "\n".join(_src(c) for c in _nb()["cells"] if c["cell_type"] == "markdown")
+    assert "deleted once a bundle is safe" not in md and "deletes the run's mirror" not in md
+    assert "later" in md and "flush_and_unmount" in RUNBOOK.read_text(encoding="utf-8")
+
+
 def test_markdown_states_honest_timings():
     md = "\n".join(_src(c) for c in _nb()["cells"] if c["cell_type"] == "markdown")
     for needle in ("50–90 min", "35 %", "11–17 h", "55–85 compute units", "2 sessions",

@@ -118,7 +118,7 @@ def _argv(drive, configs, *extra):
 # -------------------------------------------------------------------- flows
 
 
-def test_ok_run_is_published_logged_and_mirror_deleted():
+def test_ok_run_is_published_and_logged():
     drive, cfgs = _fresh("yolo26n_def3_fold0")
     fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
     rc, out = _run(_argv(drive, cfgs), fake)
@@ -185,7 +185,21 @@ def test_retry_resumes_after_a_disconnect():
         ("started", 1, False), ("failed", 1, False), ("started", 2, True), ("ok", 2, True)], log
     assert log[1]["returncode"] == 75 and log[1]["epochs_completed"] == 1
     assert log[-1]["epochs_this_attempt"] == 1 and log[-1]["epochs_completed"] == 2
-    assert not (drive / "mirror" / "yolo26n_def3_fold0").exists(), "mirror deleted once the bundle is safe"
+
+
+def test_mirror_is_kept_until_a_later_session_verified_the_bundle():
+    # T5: Drive uploads in the background — deleting the mirror seconds after
+    # writing the bundle could leave neither copy if the VM dies now
+    drive, cfgs = _fresh("yolo26n_def3_fold0")
+    rc, out = _run(_argv(drive, cfgs, "--max-attempts", "2"),
+                   FakeLauncher({"yolo26n_def3_fold0": ["partial", "ok"]}))
+    assert rc == 0, out
+    mirror = drive / "mirror" / "yolo26n_def3_fold0"
+    assert (mirror / "last.pt").is_file() and (mirror / "zander_run.json").is_file(), "mirror kept"
+    # the next session reads the bundle back from Drive (sha verified) — only then the mirror goes
+    fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
+    rc, out = _run(_argv(drive, cfgs), fake)
+    assert rc == 0 and fake.calls == [] and not mirror.exists(), out
 
 
 def test_next_session_resumes_from_the_drive_mirror():

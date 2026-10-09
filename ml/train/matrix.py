@@ -7,7 +7,8 @@ Resumable training matrix (Colab: notebooks/colab_train.ipynb). Run from ml/:
 
 Drive layout (docs/CONTRACTS.md §8.5), under --drive:
     bundles/<run>_bundle.zip + .sha256   finished marker (the .sha256 is written last)
-    mirror/<run>/                        resume state, deleted once the bundle is safe
+    mirror/<run>/                        resume state; a LATER session deletes it once
+                                         it has read the bundle back from Drive
     logs/<run>.log                       full training output (appended per attempt)
     matrix_log.jsonl                     one line per started/finished/skipped attempt
 
@@ -21,8 +22,10 @@ Per config, in the given (priority) order:
      (the runner restores mirror/<run>/ into its run_dir and resumes), output
      teed to logs/<run>.log; a failure is retried up to --max-attempts times
      (not for exit code 2 = configuration/data error) and never stops the loop.
-  3. on success copy the bundle, verify its sha, write the .sha256, then
-     delete mirror/<run>/.
+  3. on success copy the bundle, verify its sha, write the .sha256. The
+     mirror stays: Drive uploads in the background, so mirror/<run>/ is the
+     only other copy until a later session has verified the bundle (step 1
+     deletes it then). The notebook's last cell flushes Drive.
 Drive trouble never stops a healthy run: a failing logs/<run>.log or
 matrix_log.jsonl write is warned about once and the training goes on; an
 error in the driver around one run fails that run, not the loop.
@@ -579,6 +582,8 @@ class Matrix:
             for w in warnings:
                 _say(f"[matrix] WARNING {item.name}: {w}")
             warning = "; ".join(warnings) or None
+            # the bundle was just read back from Drive, so its upload is done:
+            # only now may the resume state go (see step 3)
             leftover = self.mirror / item.name
             try:
                 if leftover.exists():
@@ -640,7 +645,7 @@ class Matrix:
                     sha = publish_bundle(local_zip, self.bundles)
                     meta = B.read_bundle_meta(local_zip)
                     common["epochs_completed"] = meta.get("epochs_completed", epochs_completed)
-                    shutil.rmtree(self.mirror / item.name, ignore_errors=True)
+                    # mirror/<run>/ stays until a later session has read the bundle back (step 3)
                     rec = self.record(item, status="ok", ended=utc_now(), bundle_sha256=sha, **common)
                     outcome.records.append(rec)
                     outcome.status, outcome.epochs_completed = "ok", common["epochs_completed"]
