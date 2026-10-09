@@ -88,7 +88,10 @@ class Settings(BaseSettings):
 
     @property
     def test_ledger_file(self) -> Path:
-        """Committed audit trail of every test-bucket evaluation (one-shot rule)."""
+        """Committed audit trail of every test-bucket evaluation (one-shot rule).
+        Per checkout (worktrees each have one; `git checkout -- reports/` drops
+        rows), while eval_dir is shared — so eval.run_eval.check_test_ledger also
+        counts every test eval in eval_dir as a recorded look."""
         return self.reports_dir / "test_ledger.csv"
 
     @property

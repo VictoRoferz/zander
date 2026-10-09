@@ -916,9 +916,15 @@ def op_model_problems(op: dict, info: dict) -> list[str]:
     if not sources or missing:
         problems.append(f"the operating point's fold bundles are not imported ({missing}) — "
                         "config equivalence cannot be verified (cli.py import-run)")
-    else:
-        problems += [f"config: {d}" for d in config_differences([info, *src_infos])]
-    return problems
+        return problems
+    for s, i in zip(sources, src_infos):  # else the configs compared are another model's
+        known = registry.bundle_model_shas(i)
+        sha = str(s.get("model_sha256") or "").lower()
+        if sha and known and sha not in known:
+            problems.append(f"fold bundle {i['run_name']} no longer holds the model the operating "
+                            f"point was frozen from ({sha[:12]}…) — stale operating point: "
+                            "re-run eval-matrix + choose-op --force")
+    return problems + [f"config: {d}" for d in config_differences([info, *src_infos])]
 
 
 def config_differences(infos: list[dict]) -> list[str]:

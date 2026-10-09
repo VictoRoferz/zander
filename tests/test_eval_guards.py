@@ -515,6 +515,13 @@ def test_test_eval_checks_the_op_belongs_to_the_model_before_the_ledger():
     _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=orphan,
                                  second_look="would be recorded"),
             EvalGuardError, "not imported")
+    # a fold bundle re-imported after choose-op: the op was frozen from another model
+    _family_op("own2_def3", "op_own2.json")
+    op2 = TMP / "op_own2.json"
+    (TMP / "bundles" / "own2_def3_fold2" / "model.onnx").write_bytes(b"re-imported fold2")
+    _raises(lambda: run_eval.run(_devall("own2_def3_devall", "own2_def3"), "ultralytics", "def3",
+                                 "test", operating_point=op2, second_look="would be recorded"),
+            EvalGuardError, "own2_def3_fold2 no longer holds", "stale operating point")
     assert ledger.read_text(encoding="utf-8") == rows_before, "a refused test eval must not be recorded"
     # the matching model passes the identity check (and only then meets the ledger)
     with _bucket():
