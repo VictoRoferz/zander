@@ -25,6 +25,9 @@ batch 32) do not transfer:
   - model deim_hgnetv2_s_coco: DEIM-D-FINE-S fine-tuned (`train.py -t`) from
     DEIM's own COCO checkpoint (the model zoo of the pinned README), like the
     COCO-pretrained YOLO weights. Class heads are re-initialised (80 -> n).
+    The checkpoint's sha256 is pinned in MODELS, and the train worker stops a
+    run whose tuning load (DEIM: strict=False, mismatches dropped silently)
+    fills less than MIN_TUNING_MATCH of the model.
   - schedule: no_aug = max(2, round(0.1 E)), stop = E - no_aug,
     flat = policy[1] = stop // 2, transforms policy [4, flat, stop]; LR:
     quadratic warm-up over 2 epochs, flat until `flat`, cosine to 0.5 lr at
@@ -176,12 +179,21 @@ TRAIN_MODULES = ("torch", "torchvision", "faster_coco_eval", "calflops", "transf
 
 BASE_CONFIG = "configs/deim_dfine/deim_hgnetv2_s_coco.yml"
 MODELS = {
-    # DEIM-D-FINE-S fine-tuned from DEIM's own COCO checkpoint (49.0 AP; model
-    # zoo row "S" of the README at DEIM_COMMIT; Google Drive is its only host).
+    # DEIM-D-FINE-S fine-tuned from DEIM's own COCO checkpoint (49.0 AP; row
+    # "S" of the D-FINE model zoo table in the README at DEIM_COMMIT; Google
+    # Drive is its only host). The README has a second "S" row, DEIM-RT-DETRv2
+    # R18: another network, which DEIM's tuning load (strict=False, every
+    # tensor with another name or shape dropped) would load ~15 % of without an
+    # error. Hence the sha256 pin (2026-10-09: two independent downloads of
+    # gdrive_id) and the load guard in the train worker (MIN_TUNING_MATCH).
+    # Drive serves the file as `drive_name`; we keep it as `weights_file`.
     "deim_hgnetv2_s_coco": {
         "base_config": BASE_CONFIG,
         "init": "tuning",
         "weights_file": "deim_hgnetv2_s_coco.pth",
+        "drive_name": "deim_dfine_hgnetv2_s_coco_120e.pth",
+        "sha256": "a089c9eb798f8a0322e05f757fe8e8188eee34aa578788a35ec253bcec8a6b38",
+        "readme_row": "the D-FINE table's row S (49.0 AP, 10M params)",
         "gdrive_id": "1tB8gVJNrfb6dhFvoHJECKOF5VpkthhfC",
         "source": "https://drive.google.com/file/d/1tB8gVJNrfb6dhFvoHJECKOF5VpkthhfC/view",
     },
@@ -189,6 +201,11 @@ MODELS = {
     # weights are meaningless).
     "deim_hgnetv2_s_random": {"base_config": BASE_CONFIG, "init": "random"},
 }
+# Share of the model's tensors the init checkpoint must fill in DEIM's tuning
+# load (name and shape match). Measured on DEIM-S: the pinned COCO checkpoint
+# 785/794 (only the class heads + denoising class embedding re-initialise),
+# DEIM-D-FINE-N / -M 46 %, DEIM-RT-DETRv2-R18 15 %.
+MIN_TUNING_MATCH = 0.9
 
 # DEIM's registry at DEIM_COMMIT (engine/data/transforms) + the two torchvision
 # transforms the train worker registers (see EXTRA_TRANSFORMS).
@@ -773,30 +790,39 @@ def validate_checkpoint(path: Path) -> dict:
             "last_epoch": state.get("last_epoch")}
 
 
-def _tofu_sha(file: Path, sha_file: Path) -> str:
-    """Trust on first use: the first copy's sha is recorded, later copies must match."""
-    sha = B.sha256_file(file)
-    known = B.read_sha256_file(sha_file)
-    if known is None:
-        B.atomic_write_text(sha_file, f"{sha}  {file.name}\n")
-    elif known != sha:
-        raise RuntimeError(f"{file} sha256 {sha[:12]} != recorded {known[:12]} ({sha_file}) — "
-                           "a different init checkpoint; delete the record only if that is intended")
+def check_init_weights(model: str, path: Path) -> str:
+    """sha256 of <path>, which must be the pinned init checkpoint of `model`;
+    B.ConfigError otherwise (exit 2: a wrong file never reaches DEIM's
+    lenient tuning load, and retrying will not fix it)."""
+    spec = MODELS[model]
+    sha = B.sha256_file(path)
+    if sha != spec["sha256"]:
+        raise B.ConfigError(
+            f"{path} (sha256 {sha[:12]}) is not the init checkpoint of {model}: expected DEIM's "
+            f"{spec['drive_name']} from {spec['readme_row']} of the README at {DEIM_COMMIT[:7]} "
+            f"({spec['source']}, sha256 {spec['sha256'][:12]}), stored as {spec['weights_file']}. "
+            "Replace the file; the README's other \"S\" row (RT-DETRv2 R18) is a different network"
+        )
     return sha
 
 
 def fetch_weights(model: str = "deim_hgnetv2_s_coco", drive: Optional[Path] = None) -> Optional[Path]:
     """Put the init checkpoint into ml_data/pretrained/deim/: from
     <drive>/pretrained/ if present, else downloaded (gdown) and copied there
-    for later sessions. Its sha256 is pinned on first use (<file>.sha256)."""
+    for later sessions. Every copy must have the pinned sha256 (MODELS); a
+    wrong local copy is moved aside and fetched again, a wrong Drive copy is
+    refused by name."""
     spec = MODELS[model]
     target = weights_path(model)
     if target is None:
         print(f"{model}: random init, nothing to fetch")
         return None
     on_drive = Path(drive) / "pretrained" / target.name if drive else None
+    if target.is_file() and B.sha256_file(target) != spec["sha256"]:
+        print(f"{target} is not the pinned checkpoint: moved aside -> {U.move_aside(target)}", flush=True)
     if not target.is_file():
         if on_drive is not None and on_drive.is_file():
+            check_init_weights(model, on_drive)
             print(f"copying {on_drive} -> {target}", flush=True)
             B.atomic_copy(on_drive, target)
         else:
@@ -810,16 +836,18 @@ def fetch_weights(model: str = "deim_hgnetv2_s_coco", drive: Optional[Path] = No
             got = gdown.download(id=spec["gdrive_id"], output=str(tmp), quiet=False)
             if not got or not tmp.is_file():
                 raise RuntimeError(
-                    f"download failed (Google Drive quota?). Download {spec['source']} by hand and put it at "
-                    f"{on_drive or target} (the same file name), then rerun"
+                    f"download failed (Google Drive quota?). Download {spec['source']} "
+                    f"({spec['drive_name']}) by hand and put it at {on_drive or target} (renamed to "
+                    f"{target.name}), then rerun"
                 )
+            check_init_weights(model, tmp)
             os.replace(tmp, target)
+    sha = check_init_weights(model, target)
     info = validate_checkpoint(target)
-    sha = _tofu_sha(target, target.with_name(target.name + ".sha256"))
     if on_drive is not None:
         if not on_drive.is_file():
             B.atomic_copy(target, on_drive)
-        _tofu_sha(on_drive, on_drive.with_name(on_drive.name + ".sha256"))
+        check_init_weights(model, on_drive)
     print(f"{model}: {target} sha256 {sha} ({info['params'] / 1e6:.1f} M params, ema={info['has_ema']})")
     return target
 
@@ -1501,6 +1529,7 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
             f"init checkpoint {p.init_path} missing — run `python train/deim_run.py --fetch-weights` "
             f"(or download {spec['source']} to that path)"
         )
+    init_sha = check_init_weights(eff["model"], p.init_path) if spec["init"] == "tuning" else None
     check_override_keys(p.override, deim_dir, eff["model"])
     run_root = settings.run_dirs_dir
     run_root.mkdir(parents=True, exist_ok=True)
@@ -1603,7 +1632,7 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
                      "extra_transforms": list(EXTRA_TRANSFORMS), "stage2": "off (collate stop_epoch = epochs)"},
             "init_weights": {"model": eff["model"], "init": spec["init"], "source": spec.get("source"),
                              "file": p.init_path.name if p.init_path else None,
-                             "sha256": B.sha256_file(p.init_path) if p.init_path and p.init_path.is_file() else None},
+                             "sha256": init_sha},
             "schedule": B.to_jsonable(dataclasses.asdict(s)),
             "dataset_view": {k: v for k, v in B.to_jsonable(dataclasses.asdict(p.layout)).items()
                              if k not in ("img_folder", "train_json", "val_json")},
@@ -1631,6 +1660,16 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
 
 
 # ----------------------------------------------------------------- dry run
+
+
+def _init_state(model: str, path: Path) -> str:
+    if not path.is_file():
+        return "MISSING — --fetch-weights"
+    try:
+        check_init_weights(model, path)
+    except B.ConfigError:
+        return "WRONG FILE — sha256 differs from the pin"
+    return "present, sha256 ok"
 
 
 def dry_run(config_path: Path, device: Optional[str] = None, overrides: Optional[dict] = None,
@@ -1666,7 +1705,8 @@ def dry_run(config_path: Path, device: Optional[str] = None, overrides: Optional
             f"{s.ema_decay}, ramp {s.ema_warmups} it; lr {s.lr} (backbone {s.backbone_lr})",
             "", "## init weights",
             f"{eff['model']} ({spec['init']}): "
-            + (f"{p.init_path} ({'present' if p.init_path.is_file() else 'MISSING — --fetch-weights'})"
+            + (f"{p.init_path} ({_init_state(eff['model'], p.init_path)}; sha256 pinned "
+               f"{spec['sha256'][:16]}…, DEIM's {spec['drive_name']})"
                if p.init_path else "random init (plumbing only)"),
             "", f"## override ({p.override_path})", render_override(p.override, _override_header(p)).rstrip()]
     if state == "ok":
@@ -1754,9 +1794,47 @@ def _force_torchscript_onnx_exporter() -> None:
     torch.onnx.export = export
 
 
+def tuning_load_problem(matched: int, total: int, path: str) -> Optional[str]:
+    if total and matched / total >= MIN_TUNING_MATCH:
+        return None
+    return (f"the init checkpoint {path} fills only {matched}/{total} tensors of the model "
+            f"(< {MIN_TUNING_MATCH:.0%}): it is another network than the base config, and DEIM "
+            "would fine-tune from mostly random weights without an error")
+
+
+def _guard_tuning_load() -> None:
+    """DEIM's load_tuning_state keeps only the checkpoint tensors whose name and
+    shape match the model and loads them with strict=False, so a checkpoint
+    of another network "loads" without an error. Count what it matched and
+    stop the run unless that is (nearly) the whole model."""
+    from engine.solver._solver import BaseSolver
+
+    matched_state, load_tuning_state = BaseSolver._matched_state, BaseSolver.load_tuning_state
+    seen: dict = {}
+
+    def counting(state, params):
+        stat, infos = matched_state(state, params)
+        seen.update(matched=len(stat), total=len(state))
+        return stat, infos
+
+    def guarded(self, path):
+        seen.clear()
+        load_tuning_state(self, path)
+        problem = tuning_load_problem(seen.get("matched", 0), seen.get("total", 0), path)
+        if problem:
+            raise RuntimeError(problem)
+        print(f"zander: the init checkpoint fills {seen['matched']}/{seen['total']} model tensors "
+              "(the rest, class heads, start fresh)", flush=True)
+
+    BaseSolver._matched_state = staticmethod(counting)
+    BaseSolver.load_tuning_state = guarded
+
+
 def _worker_train(deim_dir: str, train_args: list) -> int:
     _enter_deim(deim_dir)
     _register_extra_transforms()
+    if "-t" in train_args:
+        _guard_tuning_load()
     import runpy
 
     script = str(Path(deim_dir) / "train.py")

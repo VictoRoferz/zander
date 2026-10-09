@@ -238,7 +238,7 @@ inspector/.env
 - **Entry point:** `train.dispatch.run(config_path: Path, device: str|None = None, overrides: dict|None = None, mirror_dir: Path|None = None) -> Path` returns the bundle zip. Module CLIs: `python train/dispatch.py`, `python train/matrix.py`.
 - **DEIM:** `train.deim_run.run_from_config(config_path, device=None, overrides=None, mirror_dir=None) -> Path` returns the same bundle format.
   - DEIM bundles differ in these details: an extra `deim_override.yml`; `last.pt` is DEIM's checkpoint stripped to its EMA weights; `metrics.json` holds DEIM's log rows; the ONNX opset is **16** (hard-coded by DEIM); layout `deim` (outputs `labels, boxes, scores`, top 300).
-  - DEIM configs: `framework: deim`, `model:` names an init from `deim_run.MODELS` (COCO checkpoint, sha256 pinned on first use); `deterministic` and `export` keys are not accepted; `final_weights` must be `last`. DEIM's stage-2 reload of the best-on-val checkpoint is disabled (`collate_fn.stop_epoch = E`).
+  - DEIM configs: `framework: deim`, `model:` names an init from `deim_run.MODELS` (COCO checkpoint, sha256 pinned in `MODELS`: another file is a config error, and the train worker stops a tuning load that fills < 90 % of the model's tensors); `deterministic` and `export` keys are not accepted; `final_weights` must be `last`. DEIM's stage-2 reload of the best-on-val checkpoint is disabled (`collate_fn.stop_epoch = E`).
 
 ### 8.2 Eval runs, `predictions.json` v2, frozen eval API
 

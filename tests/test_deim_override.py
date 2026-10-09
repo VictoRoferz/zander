@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -889,6 +890,13 @@ def test_the_export_worker_runs_deims_export_without_autograd():
 
 # ------------------------------------------------------- the bundle
 
+FAKE_INIT = b"coco-init"
+
+
+def _pinned_init(sha: str) -> tuple:
+    """(D, "MODELS", copy) with the COCO init's sha256 pin replaced (for patched())."""
+    return (D, "MODELS", {**D.MODELS, "deim_hgnetv2_s_coco": dict(D.MODELS["deim_hgnetv2_s_coco"], sha256=sha)})
+
 
 def _fake_heavy(deim: Path, calls: list, epochs: int):
     """run_subprocess / run_parity / probe / versions replaced by fakes that
@@ -926,6 +934,7 @@ def _fake_heavy(deim: Path, calls: list, epochs: int):
 
     sha = hashlib.sha256(FAKE_LICENSE.encode("utf-8")).hexdigest()
     return (
+        _pinned_init(hashlib.sha256(FAKE_INIT).hexdigest()),
         (D, "missing_modules", lambda *a: []),
         (D, "ensure_deim_source", lambda dest=None: deim),
         (D, "check_override_keys", lambda *a: None),
@@ -945,7 +954,7 @@ def test_bundle_from_fake_training_outputs():
     deim = _fake_deim_tree()
     weights = D.weights_path("deim_hgnetv2_s_coco")
     weights.parent.mkdir(parents=True, exist_ok=True)
-    weights.write_bytes(b"coco-init")
+    weights.write_bytes(FAKE_INIT)
     cfg = _write_cfg()
     mirror_root = _tmp() / "mirror"
     calls: list = []
@@ -959,7 +968,7 @@ def test_bundle_from_fake_training_outputs():
         assert meta["versions"]["deim_commit"] == D.DEIM_COMMIT and meta["bundle_version"] == 2
         assert meta["epochs"] == 3 and meta["epochs_completed"] == 3 and meta["overrides"] == {"epochs": 3}
         assert meta["deim"]["commit"] == D.DEIM_COMMIT and meta["deim"]["license"] == "Apache-2.0"
-        assert meta["init_weights"]["sha256"] == hashlib.sha256(b"coco-init").hexdigest()
+        assert meta["init_weights"]["sha256"] == hashlib.sha256(FAKE_INIT).hexdigest()
         assert meta["parity"]["ok"] and meta["schedule"]["collate_stop_epoch"] == 3
         assert meta["dataset_view"]["category_map"] == {"1": 0, "2": 1, "3": 2}
         assert [a["status"] for a in meta["attempts"]] == ["finished"] and meta["gpu"] == "fake-gpu"
@@ -1024,6 +1033,144 @@ def test_bundle_from_fake_training_outputs():
         _raises(FileNotFoundError, lambda: D.run_from_config(cfg), "--fetch-weights")
     with patched((D, "missing_modules", lambda *a: ["faster_coco_eval"])):
         _raises(B.ConfigError, lambda: D.run_from_config(cfg), "--install-deps")
+
+
+def test_the_init_checkpoint_must_be_the_pinned_file():
+    # The README at the pinned commit has two "S" rows; the RT-DETRv2-R18 one is
+    # another network, and DEIM's tuning load (strict=False, every tensor with
+    # another name or shape dropped) fills ~15 % of D-FINE-S from it, silently.
+    for name, spec in D.MODELS.items():
+        if spec["init"] == "tuning":
+            assert re.fullmatch(r"[0-9a-f]{64}", spec.get("sha256") or ""), name
+            assert spec["drive_name"] and spec["readme_row"] and spec["gdrive_id"] in spec["source"], name
+    assert D.MODELS["deim_hgnetv2_s_coco"]["sha256"] == \
+        "a089c9eb798f8a0322e05f757fe8e8188eee34aa578788a35ec253bcec8a6b38"
+    wrong = b"the RT-DETRv2-R18 checkpoint"
+    probe = _tmp() / "x.pth"
+    probe.write_bytes(wrong)
+    _fake_tiles()
+    deim = _fake_deim_tree()
+    weights = D.weights_path("deim_hgnetv2_s_coco")
+    weights.parent.mkdir(parents=True, exist_ok=True)
+    calls: list = []
+    try:
+        with patched(*_fake_heavy(deim, calls, epochs=3)):
+            _raises(B.ConfigError, lambda: D.check_init_weights("deim_hgnetv2_s_coco", probe),
+                    str(probe), "deim_dfine_hgnetv2_s_coco_120e.pth", "row S", "RT-DETRv2")
+            probe.write_bytes(FAKE_INIT)
+            assert D.check_init_weights("deim_hgnetv2_s_coco", probe) == hashlib.sha256(FAKE_INIT).hexdigest()
+            # a wrong file is refused before anything runs, as a config error (exit 2, not retried)
+            weights.write_bytes(wrong)
+            cfg = _write_cfg()
+            _raises(B.ConfigError, lambda: D.run_from_config(cfg, device="0", overrides={"epochs": 3}),
+                    "is not the init checkpoint")
+            assert calls == []
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert dispatch.main(["--config", str(cfg), "--device", "0", "--set=epochs=3"]) == 2
+            assert "WRONG FILE" in D.dry_run(cfg, device="0")
+            # fetch: a wrong Drive upload is named and never copied ...
+            weights.unlink()
+            drive = _tmp() / "drive"
+            (drive / "pretrained").mkdir(parents=True)
+            upload = drive / "pretrained" / weights.name
+            upload.write_bytes(wrong)
+            with patched((D, "validate_checkpoint", lambda path: {"params": 1e7, "has_ema": True})):
+                _raises(B.ConfigError, lambda: D.fetch_weights("deim_hgnetv2_s_coco", drive), str(upload))
+                assert not weights.exists()
+                # ... a wrong local copy is moved aside and fetched again
+                upload.write_bytes(FAKE_INIT)
+                weights.write_bytes(wrong)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert D.fetch_weights("deim_hgnetv2_s_coco", drive) == weights
+                assert weights.read_bytes() == FAKE_INIT
+                assert [p.read_bytes() for p in weights.parent.glob(weights.name + ".stale-*")] == [wrong]
+                # ... and a Drive without a copy gets the verified one
+                drive2 = _tmp() / "drive2"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    D.fetch_weights("deim_hgnetv2_s_coco", drive2)
+                assert (drive2 / "pretrained" / weights.name).read_bytes() == FAKE_INIT
+            assert "present, sha256 ok" in D.dry_run(cfg, device="0")
+    finally:
+        for p in [weights, *weights.parent.glob(weights.name + ".stale-*")]:
+            if p.exists():
+                p.unlink()
+
+
+_FAKE_SOLVER = """
+import json
+
+
+class BaseSolver:  # the shape of DEIM's engine/solver/_solver.py at the pinned commit
+    def __init__(self, model_state):
+        self.model_state = model_state
+
+    def load_tuning_state(self, path):
+        with open(path) as f:
+            params = json.load(f)
+        stat, infos = self._matched_state(self.model_state, params)
+        print(f"Load model.state_dict, {infos}")
+
+    @staticmethod
+    def _matched_state(state, params):
+        missed, unmatched, matched = [], [], {}
+        for k, v in state.items():
+            if k not in params:
+                missed.append(k)
+            elif len(v) != len(params[k]):
+                unmatched.append(k)
+            else:
+                matched[k] = params[k]
+        return matched, {"missed": missed, "unmatched": unmatched}
+"""
+_FAKE_TRAIN = """
+import argparse
+from engine.solver._solver import BaseSolver
+
+p = argparse.ArgumentParser()
+for flag in ("-c", "-t", "-r", "-d", "--seed"):
+    p.add_argument(flag)
+p.add_argument("--use-amp", action="store_true")
+a = p.parse_args()
+model = {f"w{i}": [0] * (3 if i == 19 else 1) for i in range(20)}  # w19 = the class head
+if a.t:
+    BaseSolver(model).load_tuning_state(a.t)
+print("load_tuning_state:", BaseSolver.load_tuning_state.__name__)
+"""
+
+
+def test_the_train_worker_refuses_an_init_checkpoint_of_another_network():
+    # Measured with DEIM's real load on D-FINE-S: the pinned COCO checkpoint
+    # fills 785/794 tensors, D-FINE-N/-M 46 %, RT-DETRv2-R18 15 %.
+    assert D.tuning_load_problem(785, 794, "x.pth") is None
+    for matched, total in ((115, 794), (371, 794), (0, 0)):
+        assert "fills only" in D.tuning_load_problem(matched, total, "x.pth"), (matched, total)
+    try:
+        import torchvision  # noqa: F401  (the worker registers two torchvision transforms)
+    except ImportError:
+        print("   SKIP: torchvision not installed")
+        return
+    deim = _tmp() / "DEIM"
+    (deim / "engine" / "core").mkdir(parents=True)
+    (deim / "engine" / "solver").mkdir()
+    (deim / "engine" / "__init__.py").write_text("", encoding="utf-8")
+    (deim / "engine" / "core" / "__init__.py").write_text(
+        "GLOBAL_CONFIG = {}\n\ndef register():\n    def deco(cls):\n        GLOBAL_CONFIG[cls.__name__] = cls\n"
+        "        return cls\n    return deco\n", encoding="utf-8")
+    (deim / "engine" / "solver" / "__init__.py").write_text("", encoding="utf-8")
+    (deim / "engine" / "solver" / "_solver.py").write_text(_FAKE_SOLVER, encoding="utf-8")
+    (deim / "train.py").write_text(_FAKE_TRAIN, encoding="utf-8")
+    right, wrong = _tmp() / "right.json", _tmp() / "wrong.json"
+    right.write_text(json.dumps({f"w{i}": [1] * (80 if i == 19 else 1) for i in range(20)}), encoding="utf-8")
+    wrong.write_text(json.dumps({f"w{i}": [1] for i in range(3)}), encoding="utf-8")
+    run = __import__("subprocess").run
+    override = _tmp() / "override.yml"
+    for ckpt, rc, needle in ((right, 0, "fills 19/20"), (wrong, 1, "fills only 3/20")):
+        cmd, env = D.train_command(deim, override, seed=1, device="cpu", tuning=ckpt)
+        out = run([str(c) for c in cmd], capture_output=True, text=True, timeout=300, env=env)
+        assert (out.returncode != 0) == bool(rc) and needle in out.stdout + out.stderr, (ckpt.name, out)
+    cmd, env = D.train_command(deim, override, seed=1, device="cpu", resume=right)
+    out = run([str(c) for c in cmd], capture_output=True, text=True, timeout=300, env=env)
+    assert out.returncode == 0 and "load_tuning_state: load_tuning_state" in out.stdout, "resume: no guard"
 
 
 def test_dry_run_prints_the_plan_without_side_effects():
