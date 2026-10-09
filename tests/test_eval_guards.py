@@ -286,15 +286,21 @@ def test_real_smoke_v1_predictions_load():
     assert doc["format_version"] == 1 and doc["schema"] == "def3" and doc["photos"]
 
 
-def _fold_family(family: str, pos_scores=(0.9, 0.7, 0.4), same_model=False, epochs=(120, 120, 120)):
+def _config(model: Path, run: str, fold: str, epochs=120, extra=None, batch=16) -> None:
+    (model.parent / "config.yaml").write_text(
+        f"name: {run}\nmodel: yolo26n.pt\ndataset_id: ds_v2_def3\nfold: {fold}\n"
+        f"epochs: {epochs}\nimgsz: 640\nbatch: {batch}\n"
+        + (f"extra: {json.dumps(extra)}\n" if extra is not None else ""), encoding="utf-8")
+
+
+def _fold_family(family: str, pos_scores=(0.9, 0.7, 0.4), same_model=False, epochs=(120, 120, 120),
+                 fold_meta=({}, {}, {}), fold_extra=(None, None, None)):
     """3 fold bundles (own meta/config/model) + their own-fold eval runs (v2)."""
     for k in range(3):
         run = f"{family}_fold{k}"
-        model = _bundle(run, fold=f"fold{k}", family=family)
+        model = _bundle(run, fold=f"fold{k}", family=family, **fold_meta[k])
         model.write_bytes(b"one shared model" if same_model else b"model of " + run.encode())
-        (model.parent / "config.yaml").write_text(
-            f"name: {run}\nmodel: yolo26n.pt\ndataset_id: ds_v2_def3\nfold: fold{k}\n"
-            f"epochs: {epochs[k]}\nimgsz: 640\nbatch: 16\n", encoding="utf-8")
+        _config(model, run, f"fold{k}", epochs[k], fold_extra[k])
         photos = [
             {"capture_id": f"{family}_pos{k}", "group": f"g{k}a", "board": "A", "pose": "seated",
              "gt_verdict": "NiO", "gt": [[0, [10, 10, 40, 40]]], "other_gt": [],
@@ -351,6 +357,48 @@ def test_choose_op_refuses_non_oof_or_mixed_recipes():
             EvalGuardError, "one run per fold")
     _raises(lambda: run_eval.choose_operating_point([], family="nope_def3"), EvalGuardError,
             "eval-matrix")
+
+
+def test_training_policy_violations_are_honesty_guards():
+    """weights best / early stopping / a truncated run: refused, overridable + stamped."""
+    best = _bundle("pol_best_def3_fold0", weights="best")
+    _raises(lambda: run_eval.run(best, "ultralytics", "def3", "fold0"), EvalGuardError,
+            "weights 'best'", "--allow-foreign-fold")
+    _, overridden = run_eval.check_eval_guards(best, "ultralytics", "def3", "fold0",
+                                               allow_foreign_fold=True)
+    assert any("weights 'best'" in o for o in overridden), overridden
+    pat = _bundle("pol_pat_def3_fold0")
+    _config(pat, "pol_pat_def3_fold0", "fold0", extra={"patience": 20})
+    _raises(lambda: run_eval.run(pat, "ultralytics", "def3", "fold0"), EvalGuardError,
+            "extra.patience=20")
+    stop = _bundle("pol_stop_def3_fold0", epochs=120, epochs_completed=61)
+    _raises(lambda: run_eval.run(stop, "ultralytics", "def3", "fold0"), EvalGuardError,
+            "stopped after 61 of 120")
+    dev = _bundle("pol_best_def3_devall", fold="dev_all", weights="best")
+    _raises(lambda: run_eval.run(dev, "ultralytics", "def3", "test", operating_point=_op()),
+            EvalGuardError, "weights 'best'")
+    # the run policy passes: last epoch, patience 0, every epoch trained ...
+    ok = _bundle("pol_ok_def3_fold0", weights="last", epochs=120, epochs_completed=120)
+    _config(ok, "pol_ok_def3_fold0", "fold0", extra={"patience": 0})
+    _raises(lambda: run_eval.run(ok, "ultralytics", "def3", "fold0"), Reached)
+    # ... and so does a DEIM bundle (no extra.patience, always last)
+    deim = _bundle("pol_deim_def3_fold0", framework="deim", adapter="deim", weights="last",
+                   epochs=80, epochs_completed=80)
+    _config(deim, "pol_deim_def3_fold0", "fold0", epochs=80, extra={})
+    _raises(lambda: run_eval.run(deim, "deim", "def3", "fold0"), Reached)
+
+
+def test_choose_op_refuses_selected_or_early_stopped_fold_models():
+    """Unconditional: not even --allow-smoke pools a best-on-val / early-stopped model."""
+    _fold_family("pol_smoke_def3", fold_meta=({}, {"weights": "best"}, {}))
+    _raises(lambda: run_eval.choose_operating_point([], family="pol_smoke_def3", allow_smoke=True),
+            EvalGuardError, "pol_smoke_def3_fold1", "weights 'best'")
+    _fold_family("pol2_def3", fold_extra=(None, None, {"patience": 20}))
+    _raises(lambda: run_eval.choose_operating_point([], family="pol2_def3"), EvalGuardError,
+            "pol2_def3_fold2", "patience")
+    _fold_family("pol3_def3", fold_meta=({"epochs_completed": 50}, {}, {}))
+    _raises(lambda: run_eval.choose_operating_point([], family="pol3_def3"), EvalGuardError,
+            "stopped after 50 of 120")
 
 
 def test_zz_results_csv_untouched():

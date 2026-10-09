@@ -20,9 +20,13 @@ read or any ONNX session is created:
     bundle meta.json (next to the .onnx) — not overridable;
   - own-fold guard: a fold bucket only scores the model that was validated on
     it (meta.fold == bucket); dev_all models never score folds; a model without
-    meta.json cannot be verified; test is for dev_all models. Overridable with
-    `allow_foreign_fold=True` (--allow-foreign-fold) for diagnostics: the run is
-    stamped `guard_overridden` and never recorded in results_v2.csv;
+    meta.json cannot be verified; test is for dev_all models;
+  - run policy (train/ultralytics_run.py): a bundle with weights `best`, a
+    non-zero `extra.patience` or `epochs_completed < epochs` holds a checkpoint
+    selected on (or stopped by) its validation view. These and the own-fold
+    guard are overridable with `allow_foreign_fold=True` (--allow-foreign-fold)
+    for diagnostics: the run is stamped `guard_overridden` and never recorded in
+    results_v2.csv; choose-op refuses such models unconditionally;
   - test / probe_xprod / future REQUIRE --operating-point (a threshold frozen
     on out-of-fold dev predictions); the threshold is never re-derived there;
   - the TEST LEDGER (committed ml/reports/test_ledger.csv) records every
@@ -174,6 +178,32 @@ def _bundle_meta(model_path: Path) -> dict:
 # ------------------------------------------------------------------ guards
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def training_problems(info: dict) -> list[str]:
+    """Run-policy violations (train/ultralytics_run.py: last epoch, patience 0)
+    that make a model's out-of-fold numbers dishonest: a checkpoint selected on
+    its validation view (weights best, early stopping) or a run that stopped
+    before its configured epochs. DEIM bundles (no extra.patience, always last)
+    pass."""
+    name = info["run_name"]
+    out = []
+    if info.get("weights") == "best":
+        out.append(f"{name} bundles weights 'best' — a checkpoint selected on its validation "
+                   "view (selection leak; run policy: the last epoch)")
+    extra = (info.get("config") or {}).get("extra")
+    patience = extra.get("patience") if isinstance(extra, dict) else None
+    if patience not in (None, 0):
+        out.append(f"{name} trained with extra.patience={patience!r} — early stopping on its "
+                   "validation view (selection leak; run policy: patience 0)")
+    done, epochs = (info.get("meta") or {}).get("epochs_completed"), info.get("epochs")
+    if _is_int(done) and _is_int(epochs) and done < epochs:
+        out.append(f"{name} stopped after {done} of {epochs} epochs (early stop or truncated run)")
+    return out
+
+
 def check_eval_guards(
     model_path: Path, adapter_name: str, schema: str, bucket: str,
     *, allow_foreign_fold: bool = False,
@@ -223,6 +253,7 @@ def check_eval_guards(
             honesty.append(
                 f"test is the one-shot evaluation of the FINAL dev_all model; {name} is a {fold} model"
             )
+        honesty += training_problems(info)
     if problems:
         raise EvalGuardError("refused: " + "; ".join(problems))
     if honesty:
@@ -666,6 +697,8 @@ def choose_operating_point(
             )
         elif info["split_id"] != split["split_id"]:
             problems.append(f"{r}: model trained on {info['split_id']!r}, not {split['split_id']!r}")
+        if info is not None:  # unconditional: no flag pools a best-on-val model
+            problems += [f"{r}: {p}" for p in training_problems(info)]
     known = [i for i in infos if i]
     families = {i["family"] for i in known}
     if len(families) > 1:

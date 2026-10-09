@@ -260,6 +260,7 @@ inspector/.env
   - `compare.run(run_a, run_b, class_index=0, seed=0)`
 - `_write_outputs` needs these `metrics` keys: run_name, model, adapter, schema, bucket, threshold, threshold_source, n_photos, mean_ms_per_photo, tiler_version, split_id, snapshot_id, dataset_fingerprint, host.
 - The `ml/reports/results_v2.csv` columns are unchanged. Smoke rows are never committed.
+- **Run policy** (read from the bundle by `run_eval.training_problems`): a model whose bundle has `weights: best`, a non-zero `config.extra.patience`, or `meta.epochs_completed < epochs` carries a checkpoint selected on (or stopped by) its validation view. `eval` treats this as an honesty violation (refused; `--allow-foreign-fold` overrides it, stamped `guard_overridden`); `choose-op` refuses it unconditionally. DEIM bundles (no `extra.patience`, always `last`) pass.
 
 ### 8.3 `operating_point.json` v2 (`choose-op`)
 

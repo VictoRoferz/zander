@@ -84,7 +84,8 @@ python cli.py choose-op --family yolo26n_def3   # -> ml_data/eval/operating_poin
 
 t* = the highest threshold with pooled out-of-fold photo sensitivity ≥ 0.95.
 Refused unless the three runs are three **distinct** fold models, each scored
-on its own fold, with equivalent training configs (arch, dataset_id, epochs,
+on its own fold, trained under the run policy (last epoch, no early stopping,
+every epoch completed), with equivalent training configs (arch, dataset_id, epochs,
 imgsz, batch, augment, final_weights, dataset fingerprint); smoke runs need
 `--allow-smoke`. The file is frozen: `--force` archives it to `ml_data/eval/archive/`.
 
@@ -149,8 +150,11 @@ verifier ...` — see **`verifier/README.md`**.
   adapter or split_id that differs from the bundle's `meta.json` (never
   overridable); a fold bucket scored by a model that trained on it (another
   fold's model, or a dev_all model); a model without `meta.json`; a non-dev_all
-  model on `test`. `--allow-foreign-fold` overrides the last three for
-  diagnostics only — the run is stamped `guard_overridden` and never recorded.
+  model on `test`; a bundle that breaks the run policy (`weights: best`,
+  `extra.patience` ≠ 0, `epochs_completed` < `epochs`: a checkpoint selected on
+  or stopped by its validation view). `--allow-foreign-fold` overrides the last
+  four for diagnostics only — the run is stamped `guard_overridden` and never
+  recorded; `choose-op` never pools such a model.
 - `test`, `probe_xprod` and `future` need `--operating-point`; `probe_xprod`
   never includes test photos.
 - **Test ledger** (`reports/test_ledger.csv`, committed): every model/operating
