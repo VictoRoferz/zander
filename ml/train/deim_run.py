@@ -1792,8 +1792,13 @@ def _worker_export(deim_dir: str, config: str, checkpoint: str, out: str) -> int
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     # DEIM's own main(): YAMLConfig(config, resume=ckpt) -> load EMA weights ->
-    # model.deploy() + postprocessor.deploy() (top-300) -> onnx (opset 16) -> checker
-    module.main(_ap.Namespace(config=config, resume=str(stripped_path), check=True, simplify=False))
+    # model.deploy() + postprocessor.deploy() (top-300) -> onnx (opset 16) -> checker.
+    # Autograd off: main() runs a batch-32 640-px forward and traces at batch
+    # 32; with autograd on, both keep every activation for a backward that never
+    # comes (measured peak 32.5 GB vs 3.5 GB, byte-identical ONNX) and a Colab
+    # VM without High-RAM OOM-kills the export after the whole training.
+    with torch.no_grad():
+        module.main(_ap.Namespace(config=config, resume=str(stripped_path), check=True, simplify=False))
     produced = out_dir / "last.onnx"
     if not produced.is_file():
         raise RuntimeError(f"DEIM export wrote no {produced}")

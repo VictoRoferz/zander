@@ -819,6 +819,54 @@ def test_deim_adapter_decodes_a_deim_graph_with_labels_unchanged():
     assert D.deim_onnx_info(stamped, CLASSES)["class_names"] == CLASSES
 
 
+_FAKE_EXPORT_ONNX = '''
+import json
+import torch
+
+def main(args):
+    # DEIM's main() runs a batch-32 forward + trace here: what autograd records
+    w = torch.nn.Parameter(torch.ones(2))
+    y = (w * torch.ones(2)).sum()
+    ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+    with open(args.resume.replace(".pth", ".onnx"), "w") as f:
+        json.dump({"grad_enabled": torch.is_grad_enabled(), "records_graph": y.requires_grad,
+                   "check": args.check, "simplify": args.simplify, "ckpt_keys": sorted(ckpt)}, f)
+'''
+
+
+def test_the_export_worker_runs_deims_export_without_autograd():
+    # DEIM's export_onnx.main() runs a batch-32 640-px forward and traces at
+    # batch 32: with autograd on that peaked at 32.5 GB (3.5 GB without) and a
+    # Colab VM without High-RAM OOM-kills the export after the whole training.
+    try:
+        import torch
+        import torchvision  # noqa: F401  (the worker registers two torchvision transforms)
+    except ImportError:
+        print("   SKIP: torch/torchvision not installed")
+        return
+    deim = _tmp() / "DEIM"
+    (deim / "engine" / "core").mkdir(parents=True)
+    (deim / "engine" / "__init__.py").write_text("", encoding="utf-8")
+    (deim / "engine" / "core" / "__init__.py").write_text(
+        "GLOBAL_CONFIG = {}\n\ndef register():\n    def deco(cls):\n        GLOBAL_CONFIG[cls.__name__] = cls\n"
+        "        return cls\n    return deco\n", encoding="utf-8")
+    (deim / "tools" / "deployment").mkdir(parents=True)
+    (deim / "tools" / "deployment" / "export_onnx.py").write_text(_FAKE_EXPORT_ONNX, encoding="utf-8")
+    ckpt, out = _tmp() / "last.pth", _tmp() / "export"
+    torch.save({"last_epoch": 2, "date": "x", "model": {"w": torch.zeros(1)}, "optimizer": {},
+                "ema": {"module": {"w": torch.ones(1)}, "updates": 3}}, str(ckpt))
+    cmd = D.export_command(deim, _tmp() / "override.yml", ckpt, out)
+    run = __import__("subprocess").run([str(c) for c in cmd], capture_output=True, text=True, timeout=300,
+                                       env=D.subprocess_env())
+    assert run.returncode == 0, run.stderr[-2000:]
+    got = json.loads((out / "model.onnx").read_text(encoding="utf-8"))
+    assert got["grad_enabled"] is False and got["records_graph"] is False, got
+    assert (got["check"], got["simplify"]) == (True, False), got
+    assert got["ckpt_keys"] == ["date", "ema", "last_epoch", "zander"], "exported from the EMA-only checkpoint"
+    stripped = torch.load(str(out / "last.pth"), map_location="cpu", weights_only=False)
+    assert "optimizer" not in stripped and stripped["zander"]["weights"] == "ema"
+
+
 # ------------------------------------------------------- the bundle
 
 
