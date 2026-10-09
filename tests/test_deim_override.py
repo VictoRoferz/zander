@@ -519,6 +519,26 @@ def test_device_plan_and_commands():
                                                                  "--out", "/out"]
 
 
+def test_check_deps_covers_what_calflops_imports():
+    # DEIM imports calflops at start-up and calflops' __init__ imports
+    # transformers, accelerate and huggingface_hub: --check-deps said "all
+    # present" on an interpreter where DEIM then died before training.
+    for mod in ("calflops", "transformers", "accelerate", "huggingface_hub"):
+        assert mod in D.TRAIN_MODULES, mod
+    pip_mods = {m for m, _, _ in D.DEIM_PIP} - {"gdown"}
+    assert pip_mods <= set(D.TRAIN_MODULES), pip_mods - set(D.TRAIN_MODULES)
+    present = set(D.TRAIN_MODULES) - {"accelerate"}
+    with patched((D, "_has_module", lambda name: name in present)):
+        assert D.missing_modules() == ["accelerate"]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert D.main(["--check-deps"]) == 1
+            assert D.install_deps(dry_run=True) == 0
+        out = buf.getvalue()
+        assert "missing ['accelerate']" in out and " accelerate" in out.split("$ ")[-1], out
+        assert "transformers" not in out.split("$ ")[-1], "if-missing deps that are present are not installed"
+
+
 def test_licence_check():
     deim = _fake_deim_tree()
     sha = hashlib.sha256(FAKE_LICENSE.encode("utf-8")).hexdigest()

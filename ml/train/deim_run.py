@@ -151,11 +151,13 @@ LICENSE_NAME = "Apache-2.0"
 SRC_DIR_NAME = "_deim_src"
 
 # Extra runtime deps of DEIM's train/export path on Colab (torch, torchvision,
-# numpy, Pillow, PyYAML, scipy, tensorboard, transformers/accelerate come
-# preinstalled). Pinned: the newest faster-coco-eval before the DEIM commit
-# (DEIM reads its private _evalImgs_cpp), onnxruntime = the Mac-side pin (the
-# parity check). "if-missing" entries are only installed when absent, never
-# pinned, so Colab's stack is not reshuffled.
+# numpy, Pillow, PyYAML, scipy, tensorboard, transformers, accelerate,
+# huggingface_hub come preinstalled). Pinned: the newest faster-coco-eval
+# before the DEIM commit (DEIM reads its private _evalImgs_cpp), onnxruntime =
+# the Mac-side pin (the parity check). "if-missing" entries are only installed
+# when absent, never pinned, so Colab's stack is not reshuffled. DEIM imports
+# calflops at start-up, and calflops' __init__ imports transformers,
+# accelerate and huggingface_hub: without them DEIM dies before training.
 DEIM_PIP = (
     # (import name, pip requirement, policy)
     ("faster_coco_eval", "faster-coco-eval==1.7.2", "pin"),
@@ -164,10 +166,13 @@ DEIM_PIP = (
     ("onnx", "onnx==1.17.0", "if-missing"),
     ("scipy", "scipy", "if-missing"),
     ("tensorboard", "tensorboard", "if-missing"),
+    ("transformers", "transformers", "if-missing"),        # calflops
+    ("accelerate", "accelerate", "if-missing"),            # calflops
+    ("huggingface_hub", "huggingface_hub", "if-missing"),  # calflops
     ("gdown", "gdown", "if-missing"),  # --fetch-weights only
 )
-TRAIN_MODULES = ("torch", "torchvision", "faster_coco_eval", "calflops", "scipy",
-                 "tensorboard", "PIL", "onnx", "onnxruntime")
+TRAIN_MODULES = ("torch", "torchvision", "faster_coco_eval", "calflops", "transformers", "accelerate",
+                 "huggingface_hub", "scipy", "tensorboard", "PIL", "onnx", "onnxruntime")
 
 BASE_CONFIG = "configs/deim_dfine/deim_hgnetv2_s_coco.yml"
 MODELS = {

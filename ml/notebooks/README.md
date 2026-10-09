@@ -116,7 +116,7 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 **Run it:**
 1. In the Parameters cell, set `DEIM_MATRIX` to the three configs from the comment above it (`configs/matrix/deim_s_def3_fold{0,1,2}.yaml`). The first time, add `DEIM_MATRIX = DEIM_MATRIX[:1]` to time one run.
 2. **Run all.** The DEIM cell runs after the YOLO matrix:
-   - it installs DEIM's extra deps (`python train/deim_run.py --install-deps`: pinned faster-coco-eval, calflops and onnxruntime). Colab's torch is not touched;
+   - it installs DEIM's extra deps (`python train/deim_run.py --install-deps`: pinned faster-coco-eval, calflops and onnxruntime; transformers, accelerate and huggingface_hub, which calflops imports, only if missing). Colab's torch is not touched;
    - it puts the init checkpoint in place (`--fetch-weights`): DEIM's COCO-pretrained DEIM-S from the model zoo of the pinned README, which is hosted on Google Drive;
    - it then trains through `train/matrix.py`, like the YOLO runs: skip, resume and retry work the same way.
 3. If Google Drive refuses the download (quota), download the "S" checkpoint of DEIM's model zoo by hand and upload it as `MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth`. The cell copies it from there in every later session too. Its sha256 is pinned on first use, in `<file>.sha256` next to it.
