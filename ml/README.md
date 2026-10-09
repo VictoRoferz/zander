@@ -155,8 +155,12 @@ verifier ...` — see **`verifier/README.md`**.
   or stopped by its validation view). `--allow-foreign-fold` overrides the last
   four for diagnostics only — the run is stamped `guard_overridden` and never
   recorded; `choose-op` never pools such a model.
-- `test`, `probe_xprod` and `future` need `--operating-point`; `probe_xprod`
-  never includes test photos.
+- `test`, `probe_xprod` and `future` need `--operating-point` with a numeric
+  threshold in (0, 1] (`--conf` may not exceed it); `probe_xprod` never
+  includes test photos. On `test` the operating point must come from
+  `choose-op` (family, sources, target sensitivity) and belong to the model —
+  same family, training config equivalent to its fold bundles — checked before
+  the one-shot look is spent.
 - **Test ledger** (`reports/test_ledger.csv`, committed): every model/operating
   point pair evaluated on `test`. Re-running the same pair is fine; any other
   pair is a second look and needs `--second-look "<reason>"` (recorded).

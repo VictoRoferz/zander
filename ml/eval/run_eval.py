@@ -28,7 +28,10 @@ read or any ONNX session is created:
     for diagnostics: the run is stamped `guard_overridden` and never recorded in
     results_v2.csv; choose-op refuses such models unconditionally;
   - test / probe_xprod / future REQUIRE --operating-point (a threshold frozen
-    on out-of-fold dev predictions); the threshold is never re-derived there;
+    on out-of-fold dev predictions, a number in (0, 1]); the threshold is never
+    re-derived there. On test the op must carry choose-op provenance and belong
+    to the model (`op_model_problems`: family + config equivalence with its
+    fold bundles — export's identity check, run before the one-shot look);
   - the TEST LEDGER (committed ml/reports/test_ledger.csv) records every
     model/operating-point pair evaluated on test. Re-running the same pair is
     fine (deterministic); a different pair is a second look at the one-shot set
@@ -54,6 +57,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import platform
 import shutil
@@ -158,15 +162,39 @@ def _gt_record(e: dict, schema: str, split: dict) -> dict:
 gt_record = _gt_record
 
 
-def _load_op(path: Path, schema: str) -> dict:
+def valid_threshold(t) -> bool:
+    """A frozen threshold: a finite real number in (0, 1] (never null/bool/NaN —
+    a null threshold would make score_all self-tune on the bucket)."""
+    return (isinstance(t, (int, float)) and not isinstance(t, bool)
+            and math.isfinite(t) and 0 < t <= 1)
+
+
+# choose-op provenance a test-bucket operating point must carry (CONTRACTS §8.3)
+OP_PROVENANCE_KEYS = ("family", "sources", "target_sensitivity")
+
+
+def _load_op(path: Path, schema: str, *, bucket: str | None = None) -> dict:
     op = json.loads(Path(path).read_text(encoding="utf-8"))
-    if op["schema"] != schema:
-        raise ValueError(f"operating point is for schema {op['schema']!r}, not {schema!r}")
+    if not isinstance(op, dict):
+        raise ValueError("not a JSON object")
+    if op.get("schema") != schema:
+        raise ValueError(f"operating point is for schema {op.get('schema')!r}, not {schema!r}")
     if op.get("class_names") is not None and list(op["class_names"]) != schema_classes(schema):
         raise ValueError(f"operating point classes {op['class_names']} != schema {schema!r}")
     split_id = load_split()["split_id"]
     if op.get("split_id") is not None and op["split_id"] != split_id:
         raise ValueError(f"operating point was frozen on {op['split_id']!r}, not {split_id!r}")
+    if not valid_threshold(op.get("threshold")):
+        raise ValueError(f"threshold {op.get('threshold')!r} is not a number in (0, 1] — a "
+                         "frozen operating point needs one (`cli.py choose-op`)")
+    if bucket == "test":
+        missing = [k for k in OP_PROVENANCE_KEYS if not op.get(k)]
+        if missing:
+            raise ValueError(
+                f"no choose-op provenance ({', '.join(missing)} missing): the one-shot test set "
+                "only takes an operating point frozen by `cli.py choose-op --family <F>` — "
+                "re-run choose-op"
+            )
     return op
 
 
@@ -362,8 +390,8 @@ def run(
     )
     classes = schema_classes(schema)
     try:
-        op = _load_op(operating_point, schema) if operating_point else None
-    except (ValueError, KeyError, OSError) as e:
+        op = _load_op(operating_point, schema, bucket=bucket) if operating_point else None
+    except (ValueError, KeyError, TypeError, OSError) as e:
         raise EvalGuardError(f"operating point {operating_point}: {e}") from None
     if second_look and bucket != "test":
         logger.warning("--second-look only applies to the test bucket — ignored")
@@ -372,6 +400,19 @@ def run(
             f"bucket {bucket!r} needs --operating-point: its threshold must be frozen "
             "on out-of-fold dev predictions (`python cli.py choose-op`), never tuned here"
         )
+    if op is not None and conf_floor > op["threshold"]:
+        raise EvalGuardError(
+            f"--conf {conf_floor} is above the frozen threshold {op['threshold']}: detections "
+            "between them would be cut off and change the verdicts"
+        )
+    if bucket == "test" and info is not None:
+        # the same identity check export runs — but BEFORE the one-shot look is spent
+        mismatch = op_model_problems(op, info)
+        if mismatch:
+            raise EvalGuardError(
+                f"refused: operating point {Path(operating_point).name} does not belong to "
+                f"{info['run_name']}:\n  - " + "\n  - ".join(mismatch)
+            )
     model_sha = registry.file_sha256(model_path)
     op_sha = registry.file_sha256(operating_point) if operating_point else None
     look = check_test_ledger(model_sha, op_sha, second_look) if bucket == "test" else None
@@ -610,6 +651,28 @@ def config_signature(info: dict) -> dict:
         "augment": meta.get("augmentation_online") or cfg.get("augment"),
         "final_weights": cfg.get("final_weights") or info.get("weights"),
     }
+
+
+def op_model_problems(op: dict, info: dict) -> list[str]:
+    """Does a v2 operating point belong to this (dev_all) model? Same family, and
+    a training config equivalent to the fold bundles the op was frozen from
+    (they must be imported). The identity check of `cli.py export`; a test eval
+    runs it before the one-shot look is spent."""
+    problems = []
+    if op.get("family") != info["family"]:
+        problems.append(f"operating point is for family {op.get('family')!r}, the model is "
+                        f"{info['family']!r}")
+    sources = op.get("sources") or []
+    src_infos = [registry.bundle_info(settings.bundles_dir / s["bundle_run"])
+                 if isinstance(s, dict) and s.get("bundle_run") else None for s in sources]
+    missing = [(s or {}).get("bundle_run") if isinstance(s, dict) else s
+               for s, i in zip(sources, src_infos) if i is None]
+    if not sources or missing:
+        problems.append(f"the operating point's fold bundles are not imported ({missing}) — "
+                        "config equivalence cannot be verified (cli.py import-run)")
+    else:
+        problems += [f"config: {d}" for d in config_differences([info, *src_infos])]
+    return problems
 
 
 def config_differences(infos: list[dict]) -> list[str]:

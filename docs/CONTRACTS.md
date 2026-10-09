@@ -267,6 +267,8 @@ inspector/.env
 - All v1 keys (`schema, class_names, threshold, rule, runs, models, split_id, created, oof_level1`), plus `family`, `target_sensitivity` and `sources: [{eval_run, bundle_run, fold, model_sha256, config_sha256, dataset_fingerprint}]`.
 - File: `ml_data/eval/operating_point_<schema>_<family>.json`.
 - It is frozen: overwriting needs `--force`, and the old file moves to `ml_data/eval/archive/`.
+- **Loading** (`run_eval._load_op`, every bucket): `threshold` must be a finite number in (0, 1] — never null or a bool (a null threshold made `score_all` self-tune on the bucket). The `test` bucket also requires the choose-op provenance `family`, non-empty `sources` and `target_sensitivity`; a v1 or hand-written file is refused there ("re-run choose-op"). `--conf` above the threshold is refused.
+- **Op ↔ model** (`run_eval.op_model_problems`, the identity check `export` runs): a `test` eval refuses, before the ledger is consulted, an operating point whose `family` differs from the model's, whose `sources[].bundle_run` fold bundles are not imported, or whose fold bundles' training config is not equivalent to the model's (`config_differences`).
 
 ### 8.4 Verifier artifacts and `ml/infer/verifier.py`
 

@@ -50,6 +50,7 @@ def _no_photos(*a, **k):
 
 run_eval.TiledDetector = _no_onnx
 run_eval.bucket_photos = _no_photos
+run_eval.test_ledger_path = lambda: TMP / "ledger_default.csv"  # never the committed one
 assert settings.ml_data_root == TMP
 
 
@@ -70,6 +71,34 @@ def _op(name: str = "op.json", threshold: float = 0.3) -> Path:
     p.write_text(json.dumps({"schema": "def3", "class_names": NAMES, "threshold": threshold,
                              "split_id": SPLIT["split_id"]}), encoding="utf-8")
     return p
+
+
+def _family_op(family: str, name: str | None = None, **over) -> Path:
+    """Fold bundles of `family` + a v2 operating point frozen from them (choose-op's shape)."""
+    _fold_family(family)
+    sources = []
+    for k in range(3):
+        info = registry.bundle_info(TMP / "bundles" / f"{family}_fold{k}")
+        sources.append({"eval_run": f"{family}_fold{k}", "bundle_run": info["run_name"],
+                        "fold": f"fold{k}", "model_sha256": registry.file_sha256(info["model_path"]),
+                        "config_sha256": info["config_sha256"], "dataset_fingerprint": None})
+    op = {"schema": "def3", "class_names": NAMES, "threshold": 0.3, "split_id": SPLIT["split_id"],
+          "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
+          "runs": [s["eval_run"] for s in sources], "family": family, "target_sensitivity": 0.95,
+          "sources": sources}
+    op.update(over)
+    p = TMP / (name or f"op_{family}.json")
+    p.write_text(json.dumps(op), encoding="utf-8")
+    return p
+
+
+def _devall(run: str, family: str, model_bytes: bytes | None = None, epochs=120) -> Path:
+    """A dev_all bundle of `family`, equivalent to _fold_family's recipe (extra.val differs only)."""
+    model = _bundle(run, fold="dev_all", family=family)
+    if model_bytes:
+        model.write_bytes(model_bytes)
+    _config(model, run, "dev_all", epochs, extra={"val": False})
+    return model
 
 
 def _raises(fn, exc, *needles):
@@ -184,9 +213,9 @@ def test_committed_ledger_header_matches_the_code():
 
 def test_different_model_on_test_raises_via_the_ledger():
     _ledger("ledger_e2e.csv")
-    op = _op("op_e2e.json")
-    model_a = _bundle("ma_def3_devall", fold="dev_all")
-    model_b = _bundle("mb_def3_devall", fold="dev_all")
+    op = _family_op("ma_def3", "op_e2e.json")
+    model_a = _devall("ma_def3_devall", "ma_def3")
+    model_b = _devall("ma_def3_devall_retrain", "ma_def3", b"a retrained dev_all model")
     look = run_eval.check_test_ledger(registry.file_sha256(model_a), registry.file_sha256(op))
     run_eval.record_test_look(look, run_name="ma_def3_devall__test",
                               model_sha=registry.file_sha256(model_a), op_sha=registry.file_sha256(op),
@@ -399,6 +428,60 @@ def test_choose_op_refuses_selected_or_early_stopped_fold_models():
     _fold_family("pol3_def3", fold_meta=({"epochs_completed": 50}, {}, {}))
     _raises(lambda: run_eval.choose_operating_point([], family="pol3_def3"), EvalGuardError,
             "stopped after 50 of 120")
+
+
+def test_operating_point_threshold_is_validated():
+    """A null threshold made a frozen-op bucket self-tune on itself (score_all(None))."""
+    _ledger("ledger_op_validation.csv")
+    model = _bundle("opv_def3_devall", fold="dev_all")
+    for bad in (None, True, 0, -0.1, 1.5, float("nan"), "0.3"):
+        _raises(lambda: run_eval.run(model, "ultralytics", "def3", "probe_xprod",
+                                     operating_point=_op("op_bad.json", threshold=bad)),
+                EvalGuardError, "threshold")
+    _raises(lambda: run_eval.run(model, "ultralytics", "def3", "test",
+                                 operating_point=_family_op("opv_def3", "op_null.json", threshold=None)),
+            EvalGuardError, "threshold")
+    # a hand-written / v1 op is fine for probe_xprod, never for the one-shot test
+    _raises(lambda: run_eval.run(model, "ultralytics", "def3", "probe_xprod",
+                                 operating_point=_op("op_v1.json", threshold=1.0)), Reached)
+    _raises(lambda: run_eval.run(model, "ultralytics", "def3", "test", operating_point=_op("op_v1.json")),
+            EvalGuardError, "choose-op provenance", "family")
+    # --conf above the frozen threshold would cut detections off
+    _raises(lambda: run_eval.run(model, "ultralytics", "def3", "probe_xprod",
+                                 operating_point=_op("op_lo.json", threshold=0.3), conf_floor=0.5),
+            EvalGuardError, "--conf 0.5")
+
+
+def test_test_eval_checks_the_op_belongs_to_the_model_before_the_ledger():
+    ledger = _ledger("ledger_op_model.csv")
+    op = _family_op("own_def3")
+    run_eval.record_test_look({"look": "first", "reason": ""}, run_name="other__test",
+                              model_sha="9" * 64, op_sha="8" * 64, bundle_run="other",
+                              family="other", schema="def3", threshold=0.3)
+    rows_before = ledger.read_text(encoding="utf-8")
+    good = _devall("own_def3_devall", "own_def3")
+    # another family's model: refused on identity, not as a "second look"
+    stranger = _devall("stranger_def3_devall", "stranger_def3")
+    _raises(lambda: run_eval.run(stranger, "ultralytics", "def3", "test", operating_point=op,
+                                 second_look="would be recorded"),
+            EvalGuardError, "does not belong", "family 'own_def3'")
+    # same family, but another recipe than the fold models the op was frozen from
+    drift = _devall("own_def3_devall_e60", "own_def3", b"short retrain", epochs=60)
+    _raises(lambda: run_eval.run(drift, "ultralytics", "def3", "test", operating_point=op,
+                                 second_look="would be recorded"),
+            EvalGuardError, "epochs differs")
+    # the op's fold bundles must be imported to verify that
+    orphan = _family_op("own_def3", "op_orphan.json",
+                        sources=[{"bundle_run": "never_imported_fold0", "fold": "fold0"}])
+    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=orphan,
+                                 second_look="would be recorded"),
+            EvalGuardError, "not imported")
+    assert ledger.read_text(encoding="utf-8") == rows_before, "a refused test eval must not be recorded"
+    # the matching model passes the identity check (and only then meets the ledger)
+    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=op),
+            EvalGuardError, "second look")
+    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "test", operating_point=op,
+                                 second_look="final retrain"), Reached)
 
 
 def test_zz_results_csv_untouched():
