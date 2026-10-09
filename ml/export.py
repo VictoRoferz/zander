@@ -14,7 +14,9 @@ Checks, all before anything is written:
   2. the bundle is the dev_all retrain (`allow_fold_model` records an exception;
      a v1 operating point, which predates these guards, only with it);
   3. a TEST evaluation of exactly this model (sha256) at exactly this operating
-     point exists (`no_test_eval` records null instead);
+     point (the run's recorded operating_point.sha256) exists (`no_test_eval`
+     records null instead); only detector runs count, never a cascade run of
+     the same detector;
   4. parity: TiledDetector(conf_floor=t) + infer.verdict.photo_verdict on
      `verify_photos` photos must reproduce the verdict (N.iO/i.O + class set)
      that the reference eval's predictions.json implies at t — zero mismatches.
@@ -95,7 +97,12 @@ def _dev_photo_ids(n: int) -> list[str]:
 
 
 def _eval_runs_of_model(model_sha: str) -> list[tuple[str, dict]]:
-    """(eval run, metrics) of every eval run of exactly this model file."""
+    """(eval run, metrics) of every DETECTOR eval run of exactly this model file.
+
+    A cascade run (detector + verifier, `source.kind = "cascade"`) records the
+    detector's sha too, but its scores and verdicts are the cascade's: it is
+    neither this model's test evaluation nor a parity reference. A run without
+    `source.kind` (v1) is a detector run."""
     out = []
     if not settings.eval_dir.is_dir():
         return out
@@ -106,6 +113,8 @@ def _eval_runs_of_model(model_sha: str) -> list[tuple[str, dict]]:
         try:
             m = json.loads(mpath.read_text(encoding="utf-8"))
         except ValueError:
+            continue
+        if ((m.get("source") or {}).get("kind") or "detector") != "detector":
             continue
         sha = (m.get("source") or {}).get("model_sha256")
         if not sha:
@@ -339,10 +348,14 @@ def run(
     test_level1 = None
     if test_run:
         tm = runs[test_run]
+        # the run must have RECORDED this operating point's sha: a matching
+        # threshold alone could come from another op file (or none at all)
         used = (tm.get("operating_point") or {}).get("sha256")
-        if tm.get("threshold") is None or abs(tm["threshold"] - t) > 1e-12 or (used and used != op_sha):
-            raise ExportError(f"test eval {test_run} used another operating point "
-                              f"(t={tm.get('threshold')}) than {op_path.name} (t={t})")
+        if tm.get("threshold") is None or abs(tm["threshold"] - t) > 1e-12 or used != op_sha:
+            raise ExportError(
+                f"test eval {test_run} used another operating point (t={tm.get('threshold')}, "
+                f"op sha {(used or 'not recorded')[:12]}) than {op_path.name} (t={t}, sha "
+                f"{op_sha[:12]})")
         if tm.get("guard_overridden"):
             raise ExportError(f"test eval {test_run} was run with guards overridden")
         test_level1 = tm.get("level1_verdict")

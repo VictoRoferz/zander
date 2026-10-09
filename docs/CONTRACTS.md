@@ -37,6 +37,8 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 - If `verifier` is null, `conf_floor <= threshold` (export writes them equal). Otherwise `conf_floor == verifier.candidate_floor`.
 - `tiler_version`, `tile_size` and `stride` equal `infer.tiling`'s constants.
 
+**`validation.test_eval_run` (checked by `cli.py export`, not by the reader):** a **detector** eval run (`source.kind == "detector"`; a run without `kind` is a v1 detector run) of exactly `model_sha256` on the `test` bucket, whose `metrics.json` recorded `operating_point.sha256` equal to the card's `operating_point.sha256` and the same threshold. A cascade run of the same detector (`source.kind == "cascade"`) is never the test eval and never the parity reference. `null` only with `--no-test-eval`, recorded in `validation.overrides`.
+
 **Why `conf_floor == threshold` is safe without a verifier.** Merging is greedy by descending score, and a kept box keeps its maximum score. So the verdict and the class set are identical at floor t and at 0.001, and so is `photo_score` for NiO photos. Only box outlines are tighter. For iO photos `photo_score` is **0.0** at floor t (no box below t is ever produced), so it is not a confidence and the UI never shows it.
 
 **Inspector behaviour:**
