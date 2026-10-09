@@ -157,7 +157,13 @@ verifier ...` — see **`verifier/README.md`**.
   `extra.patience` ≠ 0, `epochs_completed` < `epochs`: a checkpoint selected on
   or stopped by its validation view). `--allow-foreign-fold` overrides the last
   four for diagnostics only — the run is stamped `guard_overridden` and never
-  recorded; `choose-op` never pools such a model.
+  recorded; `choose-op` never pools such a model. A `model.onnx` that is not
+  the file its `meta.json` (`onnx.sha256`) / import marker describes is
+  refused outright.
+- `choose-op`, `compare` and `summary` judge an eval run by the model it
+  scored: if the bundle now holds another model (re-import `--force`) the run is
+  a **stale eval** (re-run it); a frozen operating point is applied only to the
+  fold models it was frozen from (else stale: re-run `choose-op --force`).
 - `test`, `probe_xprod` and `future` need `--operating-point` with a numeric
   threshold in (0, 1] (`--conf` may not exceed it); `probe_xprod` never
   includes test photos. On `test` the operating point must come from

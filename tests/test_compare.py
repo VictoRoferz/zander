@@ -35,7 +35,7 @@ import registry  # noqa: E402
 from config.settings import settings  # noqa: E402
 from eval import compare  # noqa: E402
 from eval.photo_scorer import class_records, is_negative, is_positive, pscore  # noqa: E402
-from eval.run_eval import EvalGuardError, load_predictions  # noqa: E402
+from eval.run_eval import EvalGuardError, load_predictions, run_source  # noqa: E402
 from eval.scorer import (  # noqa: E402
     BOOTSTRAP_N, FPPI_OPERATING, _froc_from_stats, _photo_stats, cluster_resample, recall_at_fppi,
 )
@@ -194,6 +194,67 @@ def test_family_pooling_refuses_mixed_recipes():
             _write_run(f"{fam}_fold{k}", f"fold{k}", "def3", A, order, sha=sha)
     _raises(lambda: compare.resolve("famF"), EvalGuardError, "epochs differs", "famF_fold1=60")
     assert compare.resolve("famG")["runs"] == ["famG_fold0", "famG_fold1"]
+
+
+def test_stale_evals_and_duplicates_among_known_models_are_refused():
+    for k, order in enumerate((["P1", "P2"], ["P3", "P4"])):
+        _write_run(f"famJ_fold{k}", f"fold{k}", "def3", A, order,
+                   sha=_fold_bundle(f"famJ_fold{k}", f"fold{k}"))
+    assert compare.resolve("famJ")["kind"] == "family"
+    (settings.bundles_dir / "famJ_fold1" / "model.onnx").write_bytes(b"re-imported model")
+    _raises(lambda: compare.resolve("famJ"), EvalGuardError, "famJ_fold1: stale eval")
+    # one model on two folds is caught even when a third fold's model is unknown
+    saved = compare._family_runs
+    compare._family_runs = lambda name: [f"{name}_fold{i}" for i in range(3)]
+    try:
+        _write_run("famK_fold0", "fold0", "def3", A, ["P1"], sha="e" * 64)
+        _write_run("famK_fold1", "fold1", "def3", A, ["P2"], sha="e" * 64)
+        _write_run("famK_fold2", "fold2", "def3", A, ["P3", "P4"])
+        path = EVAL / "famK_fold2" / "predictions.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["source"]["model_sha256"] = None  # v2 source without a sha, model file gone
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        _raises(lambda: compare.resolve("famK"), EvalGuardError, "same model")
+    finally:
+        compare._family_runs = saved
+
+
+def test_a_stale_frozen_operating_point_is_never_applied():
+    """compare/summary applied operating_point_<F>.json without checking it was
+    frozen from the pooled runs' models (sources[].model_sha256)."""
+    from eval import summary
+
+    shas = {f"fold{k}": run_source(load_predictions(f"famA2_fold{k}"))["model_sha256"] for k in range(2)}
+    path = EVAL / "operating_point_def3_famA2.json"
+
+    def write(src_shas, **over):
+        path.write_text(json.dumps({
+            "schema": "def3", "class_names": DEF3, "threshold": 0.4, "family": "famA2",
+            "runs": ["famA2_fold0", "famA2_fold1"], "target_sensitivity": 0.95,
+            "sources": [{"fold": f, "model_sha256": s} for f, s in src_shas.items()], **over}),
+            encoding="utf-8")
+
+    for k in range(2):
+        (EVAL / f"famA2_fold{k}" / "metrics.json").write_text(json.dumps(
+            {"bucket": f"fold{k}", "n_photos": 2, "mean_ms_per_photo": 300.0}), encoding="utf-8")
+    summary.load_split = lambda: {"split_id": "split_v2", "folds": {"0": [], "1": []},
+                                  "probe_boxes": []}  # the 2-fold fixture
+    try:
+        write(shas)
+        assert compare.frozen_operating_point(compare.resolve("famA2")) == (0.4, path.name)
+        write({**shas, "fold1": "f" * 64})  # fold1 was re-trained after choose-op
+        _raises(lambda: compare.frozen_operating_point(compare.resolve("famA2")), EvalGuardError,
+                "stale operating point", "fold1")
+        _raises(lambda: compare.compare("famA2", "famA", write=False), EvalGuardError, "stale")
+        doc = summary.run(families=["famA2"], out_md=TMP / "stale.md", out_json=TMP / "stale.json")
+        assert [x["family"] for x in doc["excluded"]] == ["famA2"], doc["excluded"]
+        assert "stale operating point" in doc["excluded"][0]["reason"]
+        write({**shas, "fold1": "f" * 64}, allow_smoke=True)  # a smoke op only warns
+        assert compare.frozen_operating_point(compare.resolve("famA2")) == (0.4, path.name)
+    finally:
+        path.unlink()
+        for k in range(2):
+            (EVAL / f"famA2_fold{k}" / "metrics.json").unlink()
 
 
 def test_missing_operating_point_is_na():

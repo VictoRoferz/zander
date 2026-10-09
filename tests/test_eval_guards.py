@@ -509,6 +509,37 @@ def test_equivalence_covers_extra_and_the_effective_batch():
             "batch differs", "eqb_def3_fold1=8")
 
 
+def test_model_onnx_must_be_the_model_its_meta_describes():
+    """model.onnx and meta.json share only a directory: never overridable."""
+    model = _bundle("bind_def3_fold0", onnx={"file": "model.onnx", "sha256": "0" * 64, "layout": "raw"})
+    _raises(lambda: run_eval.run(model, "ultralytics", "def3", "fold0", allow_foreign_fold=True),
+            EvalGuardError, "not the model its bundle describes", "onnx.sha256")
+    good = _bundle("bind2_def3_fold0")
+    meta = json.loads((good.parent / "meta.json").read_text(encoding="utf-8"))
+    meta["onnx"] = {"file": "model.onnx", "sha256": registry.file_sha256(good), "layout": "raw"}
+    (good.parent / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "fold0"), Reached)
+    (good.parent / registry.BUNDLE_MARKER).write_text(json.dumps({"files": {"model.onnx": "1" * 64}}),
+                                                       encoding="utf-8")
+    _raises(lambda: run_eval.run(good, "ultralytics", "def3", "fold0"), EvalGuardError,
+            "not the model its bundle describes", registry.BUNDLE_MARKER)
+
+
+def test_choose_op_refuses_stale_evals():
+    """choose-op judged the bundle on disk NOW, not the model that made the predictions."""
+    _fold_family("stale_def3")
+    (TMP / "bundles" / "stale_def3_fold1" / "model.onnx").write_bytes(b"re-imported, retrained")
+    _raises(lambda: run_eval.choose_operating_point([], family="stale_def3"), EvalGuardError,
+            "stale_def3_fold1: stale eval", "re-run eval")
+    _fold_family("bindf_def3")
+    meta_path = TMP / "bundles" / "bindf_def3_fold2" / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["onnx"] = {"file": "model.onnx", "sha256": "2" * 64}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    _raises(lambda: run_eval.choose_operating_point([], family="bindf_def3"), EvalGuardError,
+            "bindf_def3_fold2", "not the model its bundle describes")
+
+
 def test_zz_results_csv_untouched():
     now = RESULTS.read_bytes() if RESULTS.exists() else None
     assert now == RESULTS_BEFORE, "tests must never append to ml/reports/results_v2.csv"

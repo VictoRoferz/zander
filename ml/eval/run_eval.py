@@ -289,6 +289,9 @@ def check_eval_guards(
                 f"test is the one-shot evaluation of the FINAL dev_all model; {name} is a {fold} model"
             )
         honesty += training_problems(info)
+    binding = registry.model_file_problem(Path(model_path).parent, Path(model_path))
+    if binding:  # meta.json would describe another model than the one scored
+        problems.append(binding)
     if problems:
         raise EvalGuardError("refused: " + "; ".join(problems))
     if honesty:
@@ -643,6 +646,72 @@ def source_bundle_info(src: dict) -> dict | None:
     return None
 
 
+def stale_eval_problem(run: str, src: dict, info: dict | None) -> str | None:
+    """choose-op / compare / summary judge an eval run by its bundle AS IT IS
+    NOW: if the bundle no longer holds the model the eval scored (re-import
+    --force, a hand-copied model), its meta/config describe another model."""
+    recorded = str(src.get("model_sha256") or "").lower()
+    if info is None or not recorded:
+        return None
+    known = registry.bundle_model_shas(info)
+    if known and recorded not in known:
+        return (f"{run}: stale eval — it scored model {recorded[:12]}…, which bundle "
+                f"{info['run_name']} no longer holds (now "
+                f"{', '.join(s[:12] + '…' for s in sorted(known))}) — re-run eval")
+    return None
+
+
+def source_problems(run: str, src: dict, info: dict | None) -> list[str]:
+    """Why one fold eval run cannot enter a pooled out-of-fold set (choose-op,
+    compare, summary): a stale eval, a model.onnx that is not the one its
+    meta.json describes, or a run-policy violation. `info` = source_bundle_info(src)."""
+    if info is None:
+        return []
+    out = []
+    stale = stale_eval_problem(run, src, info)
+    if stale:
+        out.append(stale)
+    binding = registry.model_file_problem(info["bundle_dir"])
+    if binding:
+        out.append(f"{run}: {binding}")
+    return out + [f"{run}: {p}" for p in training_problems(info)]
+
+
+def check_op_sources(op: dict, op_name: str, docs: list[dict]) -> None:
+    """A frozen operating point applied to fold runs (summary, compare) must have
+    been frozen from exactly those runs' models (`sources[].model_sha256` per
+    fold) — else it is stale. Smoke operating points only warn; v1 files (no
+    sources) cannot be checked. dev_all models are not sources: their match is
+    op_model_problems (test eval, export)."""
+    if "sources" not in op:
+        logger.warning(f"{op_name}: v1 operating point (no sources) — cannot verify it was "
+                       "frozen from these models")
+        return
+    by_fold = {s.get("fold"): str(s.get("model_sha256") or "").lower()
+               for s in op.get("sources") or [] if isinstance(s, dict)}
+    bad = []
+    for d in docs:
+        src = run_source(d)
+        fold = str(src.get("fold") or "")
+        if not fold.startswith("fold"):
+            continue
+        want, got = by_fold.get(fold), str(src.get("model_sha256") or "").lower()
+        if not want:
+            bad.append(f"{fold}: the operating point has no source for it")
+        elif got != want:
+            bad.append(f"{fold}: the run scored model {got[:12] or '?'}…, the operating point "
+                       f"was frozen from {want[:12]}…")
+    if not bad:
+        return
+    msg = (f"{op_name} was frozen from other models than these runs ({'; '.join(bad)}) — "
+           "stale operating point: re-run `cli.py choose-op --force`")
+    if op.get("allow_smoke") or registry.is_smoke(op.get("family")) \
+            or any(registry.is_smoke(r) for r in op.get("runs") or []):
+        logger.warning(msg + " (smoke operating point: warning only)")
+        return
+    raise EvalGuardError(msg)
+
+
 # ----------------------------------------------------------- operating point
 
 
@@ -759,7 +828,7 @@ def choose_operating_point(
             "the same model was scored on several folds — pooled predictions are not "
             f"out-of-fold (model sha256s {[s[:12] for s in shas]})"
         )
-    for r, d, info in zip(runs, docs, infos):
+    for r, d, s, info in zip(runs, docs, sources, infos):
         if d.get("guard_overridden"):
             problems.append(f"{r} was evaluated with guards overridden")
         if info is None:
@@ -771,8 +840,11 @@ def choose_operating_point(
             )
         elif info["split_id"] != split["split_id"]:
             problems.append(f"{r}: model trained on {info['split_id']!r}, not {split['split_id']!r}")
-        if info is not None:  # unconditional: no flag pools a best-on-val model
-            problems += [f"{r}: {p}" for p in training_problems(info)]
+        if info is not None:  # unconditional: no flag pools a best-on-val model / stale eval
+            problems += source_problems(r, s, info)
+            if s.get("model_sha256") and not registry.bundle_model_shas(info):
+                problems.append(f"{r}: bundle {info['run_name']} has no model.onnx and no "
+                                "meta.json onnx.sha256 — cannot verify it is the evaluated model")
     known = [i for i in infos if i]
     families = {i["family"] for i in known}
     if len(families) > 1:

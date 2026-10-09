@@ -54,10 +54,12 @@ from dataprep.split import load_split
 from eval.photo_scorer import class_records, is_negative, is_positive, pscore
 from eval.run_eval import (
     EvalGuardError,
+    check_op_sources,
     config_differences,
     load_predictions,
     run_source,
     source_bundle_info,
+    source_problems,
 )
 from eval.scorer import (
     BOOTSTRAP_N,
@@ -124,6 +126,37 @@ def _family_runs(name: str) -> list[str]:
     return [f"{name}_fold{i}" for i in range(k)]
 
 
+def pool_problems(runs: list[str], docs: list[dict]) -> list[str]:
+    """Why fold eval runs cannot be pooled into one out-of-fold set (resolve,
+    summary): mixed schemas, overridden guards, one model on several folds, a
+    model off its own fold, a stale eval / foreign model file / run-policy
+    violation (run_eval.source_problems), or more than one recipe."""
+    problems = []
+    for r, d in zip(runs, docs):
+        if (d["schema"], d["class_names"]) != (docs[0]["schema"], docs[0]["class_names"]):
+            problems.append(f"{r} has schema {d['schema']!r}, the family {docs[0]['schema']!r}")
+        if d.get("guard_overridden"):
+            problems.append(f"{r} was evaluated with guards overridden")
+    sources = [run_source(d) for d in docs]
+    infos = [source_bundle_info(s) for s in sources]
+    shas = [s.get("model_sha256") for s in sources]
+    known_shas = [s for s in shas if s]  # an unknown sha never hides a duplicate among the rest
+    if len(set(known_shas)) != len(known_shas):
+        problems.append("the same model was scored on several folds — not out-of-fold")
+    for r, d, s, info in zip(runs, docs, sources, infos):
+        if s.get("fold") and s["fold"] != d["bucket"]:
+            problems.append(f"{r}: its model validates on {s['fold']}, not {d['bucket']}")
+        problems += source_problems(r, s, info)
+    known = [i for i in infos if i]
+    # the pooled models must be one recipe (choose-op's guard): epochs 120/120/60 is not a family
+    problems += [f"config: {x}" for x in config_differences(known)] if len(known) > 1 else []
+    if not problems and (len(known_shas) < len(shas) or not all(s.get("fold") for s in sources)
+                         or len(known) < len(infos)):
+        logger.warning(f"{runs}: provenance of some fold runs unverifiable (v1 predictions or "
+                       "bundles not imported)")
+    return problems
+
+
 def resolve(name: str) -> dict:
     """An eval run, or a family pooled over its fold runs (concatenated in fold order)."""
     if (settings.eval_dir / name / "predictions.json").is_file():
@@ -139,30 +172,11 @@ def resolve(name: str) -> dict:
             f"in {settings.eval_dir})"
         )
     docs = [load_predictions(r) for r in runs]
-    problems = []
-    for i, (r, d) in enumerate(zip(runs, docs)):
-        if d["bucket"] != f"fold{i}":
-            problems.append(f"{r} scored bucket {d['bucket']!r}, not fold{i}")
-        if (d["schema"], d["class_names"]) != (docs[0]["schema"], docs[0]["class_names"]):
-            problems.append(f"{r} has schema {d['schema']!r}, the family {docs[0]['schema']!r}")
-        if d.get("guard_overridden"):
-            problems.append(f"{r} was evaluated with guards overridden")
-    sources = [run_source(d) for d in docs]
-    infos = [source_bundle_info(s) for s in sources]
-    shas = [s.get("model_sha256") for s in sources]
-    if all(shas) and len(set(shas)) != len(shas):
-        problems.append("the same model was scored on several folds — not out-of-fold")
-    for r, d, s in zip(runs, docs, sources):
-        if s.get("fold") and s["fold"] != d["bucket"]:
-            problems.append(f"{r}: its model validates on {s['fold']}, not {d['bucket']}")
-    known = [i for i in infos if i]
-    # the pooled models must be one recipe (choose-op's guard): epochs 120/120/60 is not a family
-    problems += [f"config: {x}" for x in config_differences(known)] if len(known) > 1 else []
+    problems = [f"{r} scored bucket {d['bucket']!r}, not fold{i}"
+                for i, (r, d) in enumerate(zip(runs, docs)) if d["bucket"] != f"fold{i}"]
+    problems += pool_problems(runs, docs)
     if problems:
         raise EvalGuardError(f"family {name!r} cannot be pooled: " + "; ".join(problems))
-    if not all(shas) or not all(s.get("fold") for s in sources) or len(known) < len(infos):
-        logger.warning(f"family {name}: provenance of some fold runs unverifiable (v1 predictions "
-                       "or bundles not imported)")
     photos = [p for d in docs for p in d["photos"]]
     ids = [p["capture_id"] for p in photos]
     if len(set(ids)) != len(ids):
@@ -197,15 +211,16 @@ def frozen_operating_point(res: dict) -> tuple[float | None, str]:
     family = _family_of(res)
     path = settings.eval_dir / f"operating_point_{res['schema']}_{family}.json"
     if family and path.is_file():
-        return json.loads(path.read_text(encoding="utf-8"))["threshold"], path.name
+        op = json.loads(path.read_text(encoding="utf-8"))
+        check_op_sources(op, path.name, res["docs"])  # frozen from THESE models?
+        return op["threshold"], path.name
     # legacy / renamed runs: an op file that lists these runs, or (single run)
     # whose fold models include this run's model file
     sha = run_source(res["docs"][0]).get("model_sha256") if res["kind"] == "run" else None
     for path in sorted(settings.eval_dir.glob(f"operating_point_{res['schema']}_*.json")):
         op = json.loads(path.read_text(encoding="utf-8"))
-        if set(res["runs"]) <= set(op.get("runs") or []):
-            return op["threshold"], path.name
-        if sha and sha in _op_model_shas(op):
+        if set(res["runs"]) <= set(op.get("runs") or []) or (sha and sha in _op_model_shas(op)):
+            check_op_sources(op, path.name, res["docs"])
             return op["threshold"], path.name
     return None, NA
 
