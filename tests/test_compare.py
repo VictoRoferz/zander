@@ -31,6 +31,7 @@ TMP = Path(tempfile.mkdtemp(prefix="zander_compare_"))
 os.environ["ML_DATA_ROOT"] = str(TMP)  # BEFORE config.settings is imported
 sys.path.insert(0, str(ROOT / "ml"))
 
+import registry  # noqa: E402
 from config.settings import settings  # noqa: E402
 from eval import compare  # noqa: E402
 from eval.photo_scorer import class_records, is_negative, is_positive, pscore  # noqa: E402
@@ -79,6 +80,22 @@ def _write_run(name, bucket, schema, dets_by_photo, order, sha=None, fold=None, 
     d = EVAL / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "predictions.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+
+def _fold_bundle(run, fold, epochs=120, family=None, **meta_over) -> str:
+    """An imported fold bundle (meta + effective config + model); returns its model sha."""
+    d = settings.bundles_dir / run
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "model.onnx").write_bytes(b"model of " + run.encode())
+    meta = {"run_name": run, "family": family or run.rsplit("_", 1)[0], "fold": fold,
+            "schema": "def3", "classes": DEF3, "split_id": "split_v2", "adapter": "ultralytics",
+            "dataset_id": "ds_v2_def3", "weights": "last"}
+    meta.update(meta_over)
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    (d / "config.yaml").write_text(
+        f"name: {run}\nmodel: yolo26n.pt\ndataset_id: ds_v2_def3\nfold: {fold}\nepochs: {epochs}\n"
+        "imgsz: 640\nbatch: 16\nextra: {patience: 0}\n", encoding="utf-8")
+    return registry.file_sha256(d / "model.onnx")
 
 
 def _op(schema, family, t):
@@ -167,6 +184,16 @@ def test_family_pooling_refuses_non_oof_runs():
     _raises(lambda: compare.resolve("famD"), EvalGuardError, "same model")
     _raises(lambda: compare.resolve("famE"), EvalGuardError, "validates on fold0")
     _raises(lambda: compare.resolve("nothing_here"), compare.CompareError, "neither")
+
+
+def test_family_pooling_refuses_mixed_recipes():
+    """compare/summary/G1/NAL gate pool only one recipe (choose-op's equivalence guard)."""
+    for fam, epochs in (("famF", (120, 60)), ("famG", (120, 120))):
+        for k, order in enumerate((["P1", "P2"], ["P3", "P4"])):
+            sha = _fold_bundle(f"{fam}_fold{k}", f"fold{k}", epochs=epochs[k])
+            _write_run(f"{fam}_fold{k}", f"fold{k}", "def3", A, order, sha=sha)
+    _raises(lambda: compare.resolve("famF"), EvalGuardError, "epochs differs", "famF_fold1=60")
+    assert compare.resolve("famG")["runs"] == ["famG_fold0", "famG_fold1"]
 
 
 def test_missing_operating_point_is_na():

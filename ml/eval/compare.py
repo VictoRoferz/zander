@@ -11,7 +11,9 @@ Operands: an eval run name (ml_data/eval/<name>/), else a family `F`, which
 resolves to `F_fold0..2` (CONTRACTS §8.2) pooled by concatenation in fold
 order; both sides must then cover identical capture_ids in identical order.
 Pooling refuses fold runs that are provably not out-of-fold (the same model
-on several folds, or a model scored off its own fold).
+on several folds, or a model scored off its own fold) or not one recipe (the
+bundles' training configs differ — run_eval.config_differences, choose-op's
+equivalence guard).
 
 `--class` takes a class name, its short name (NAL / Brücke / Fahne), an index
 (meaning run A's class; B must have the same class) or `any` (class-agnostic,
@@ -50,7 +52,13 @@ from config.settings import settings
 from dataprep.remap import SHORT
 from dataprep.split import load_split
 from eval.photo_scorer import class_records, is_negative, is_positive, pscore
-from eval.run_eval import EvalGuardError, load_predictions, run_source
+from eval.run_eval import (
+    EvalGuardError,
+    config_differences,
+    load_predictions,
+    run_source,
+    source_bundle_info,
+)
 from eval.scorer import (
     BOOTSTRAP_N,
     FPPI_OPERATING,
@@ -140,16 +148,21 @@ def resolve(name: str) -> dict:
         if d.get("guard_overridden"):
             problems.append(f"{r} was evaluated with guards overridden")
     sources = [run_source(d) for d in docs]
+    infos = [source_bundle_info(s) for s in sources]
     shas = [s.get("model_sha256") for s in sources]
     if all(shas) and len(set(shas)) != len(shas):
         problems.append("the same model was scored on several folds — not out-of-fold")
     for r, d, s in zip(runs, docs, sources):
         if s.get("fold") and s["fold"] != d["bucket"]:
             problems.append(f"{r}: its model validates on {s['fold']}, not {d['bucket']}")
+    known = [i for i in infos if i]
+    # the pooled models must be one recipe (choose-op's guard): epochs 120/120/60 is not a family
+    problems += [f"config: {x}" for x in config_differences(known)] if len(known) > 1 else []
     if problems:
         raise EvalGuardError(f"family {name!r} cannot be pooled: " + "; ".join(problems))
-    if not all(shas) or not all(s.get("fold") for s in sources):
-        logger.warning(f"family {name}: provenance of some fold runs unverifiable (v1 predictions)")
+    if not all(shas) or not all(s.get("fold") for s in sources) or len(known) < len(infos):
+        logger.warning(f"family {name}: provenance of some fold runs unverifiable (v1 predictions "
+                       "or bundles not imported)")
     photos = [p for d in docs for p in d["photos"]]
     ids = [p["capture_id"] for p in photos]
     if len(set(ids)) != len(ids):

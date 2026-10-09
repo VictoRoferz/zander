@@ -101,8 +101,15 @@ TEST_LEDGER_FIELDS = [
     "date", "run_name", "model_sha256", "operating_point_sha256", "bundle_run",
     "family", "schema", "threshold", "look", "reason",
 ]
-# choose-op / export: fold models of one family must share these (CONTRACTS §8.3).
-EQUIV_KEYS = ("arch", "dataset_id", "epochs", "imgsz", "batch", "augment", "final_weights")
+# choose-op / export / compare: fold models of one family must share these (CONTRACTS §8.3).
+EQUIV_KEYS = ("arch", "dataset_id", "epochs", "imgsz", "batch", "augment", "final_weights", "extra")
+# `extra` keys (model.train() kwargs) that do not change the trained weights —
+# validation, logging and runtime only. dev_all configs differ from the fold
+# configs by extra.val and must stay equivalent. Seeds are never compared.
+NON_TRAINING_EXTRA = frozenset({
+    "val", "val_fraction", "plots", "verbose", "workers", "cache", "device", "exist_ok",
+    "save_period",
+})
 
 
 class EvalGuardError(RuntimeError):
@@ -642,14 +649,18 @@ def source_bundle_info(src: dict) -> dict | None:
 def config_signature(info: dict) -> dict:
     """The recipe keys fold models of one family (and its dev_all retrain) must share."""
     cfg, meta = info.get("config") or {}, info.get("meta") or {}
+    extra = cfg.get("extra") if isinstance(cfg.get("extra"), dict) else {}
     return {
         "arch": cfg.get("model") or meta.get("model"),
         "dataset_id": info.get("dataset_id"),
         "epochs": cfg.get("epochs", meta.get("epochs")),
         "imgsz": cfg.get("imgsz"),
-        "batch": cfg.get("batch"),
+        # the batch the trainer really used (Ultralytics' OOM auto-batch may change it)
+        "batch": meta["batch_effective"] if meta.get("batch_effective") is not None
+        else cfg.get("batch"),
         "augment": meta.get("augmentation_online") or cfg.get("augment"),
         "final_weights": cfg.get("final_weights") or info.get("weights"),
+        "extra": {k: v for k, v in sorted(extra.items()) if k not in NON_TRAINING_EXTRA},
     }
 
 

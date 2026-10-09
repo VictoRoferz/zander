@@ -484,6 +484,31 @@ def test_test_eval_checks_the_op_belongs_to_the_model_before_the_ledger():
                                  second_look="final retrain"), Reached)
 
 
+def test_equivalence_covers_extra_and_the_effective_batch():
+    # extra = arbitrary model.train() kwargs: a fold trained on half its data is another recipe
+    _fold_family("eqx_def3", fold_extra=({"patience": 0}, {"patience": 0, "fraction": 0.5},
+                                         {"patience": 0}))
+    _raises(lambda: run_eval.choose_operating_point([], family="eqx_def3"), EvalGuardError,
+            "extra differs", "fraction")
+    _fold_family("eqlr_def3", fold_extra=(None, None, {"lr0": 0.02}))
+    _raises(lambda: run_eval.choose_operating_point([], family="eqlr_def3"), EvalGuardError,
+            "extra differs", "lr0")
+    # validation / logging / runtime keys do not change the weights
+    _fold_family("eqrt_def3", fold_extra=({"patience": 0, "val": False},
+                                          {"patience": 0, "plots": False, "workers": 2},
+                                          {"patience": 0, "cache": "disk", "verbose": True}))
+    run_eval.choose_operating_point([], family="eqrt_def3")
+    # the dev_all retrain differs from its fold models by extra.val only: equivalent
+    folds = [registry.bundle_info(TMP / "bundles" / f"eqrt_def3_fold{k}") for k in range(3)]
+    dev = _devall("eqrt_def3_devall", "eqrt_def3")
+    _config(dev, "eqrt_def3_devall", "dev_all", extra={"patience": 0, "val": False})
+    assert run_eval.config_differences([registry.bundle_info(dev.parent), *folds]) == []
+    # Ultralytics' OOM auto-batch: the batch really used (meta.batch_effective) counts
+    _fold_family("eqb_def3", fold_meta=({}, {"batch_effective": 8}, {}))
+    _raises(lambda: run_eval.choose_operating_point([], family="eqb_def3"), EvalGuardError,
+            "batch differs", "eqb_def3_fold1=8")
+
+
 def test_zz_results_csv_untouched():
     now = RESULTS.read_bytes() if RESULTS.exists() else None
     assert now == RESULTS_BEFORE, "tests must never append to ml/reports/results_v2.csv"

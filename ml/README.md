@@ -86,7 +86,9 @@ t* = the highest threshold with pooled out-of-fold photo sensitivity ≥ 0.95.
 Refused unless the three runs are three **distinct** fold models, each scored
 on its own fold, trained under the run policy (last epoch, no early stopping,
 every epoch completed), with equivalent training configs (arch, dataset_id, epochs,
-imgsz, batch, augment, final_weights, dataset fingerprint); smoke runs need
+imgsz, batch actually used, augment, final_weights, training `extra` kwargs —
+validation/logging/runtime keys such as `val`, `plots`, `workers` excluded —,
+dataset fingerprint; seeds may differ); smoke runs need
 `--allow-smoke`. The file is frozen: `--force` archives it to `ml_data/eval/archive/`.
 
 **6 · Rank and gate (paired decisions, never overlapping CIs)**
@@ -97,7 +99,8 @@ python cli.py compare yolo26n_def3 yolo11s_def3 --class NAL                  # G
 python cli.py compare yolo26n_def3 yolo26n_nal1 --class NAL --margin 0.05    # NAL gate
 ```
 
-`summary` pools each complete family's fold runs, scores them at the family's
+`summary` and `compare` pool a family's fold runs only under choose-op's guards
+(distinct own-fold models, one recipe). `summary` scores them at the family's
 frozen operating point (self-tuned and flagged ⚠ if `choose-op` has not run),
 ranks the def3 families by pooled NAL recall @ 0.5 FPPI, and runs G1 and the
 NAL gate itself. **G1:** a winner needs a paired CI excluding 0, otherwise the
