@@ -55,7 +55,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--run-name", default="v1", help="verifier run name (ml_data/verifier/<name>/)")
     p.add_argument("--config", default=None, help="verifier config YAML (default: the pre-registered one)")
     p.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE",
-                   help="config override (recorded; makes the run exploratory)")
+                   help="config override (recorded; makes the run exploratory — also at exit "
+                        "time: the exit decision is then invalid-smoke)")
 
 
 def _add_mine(p: argparse.ArgumentParser) -> None:
@@ -77,8 +78,12 @@ def _add_crossfit(p: argparse.ArgumentParser) -> None:
 
 
 def _add_exit(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--latency-photos", type=int, default=None)
-    p.add_argument("--threads", type=int, default=0, help="ORT intra-op threads (0 = default)")
+    p.add_argument("--latency-photos", type=int, default=None,
+                   help="latency bench photos (default: the config's 20; another count makes "
+                        "the exit exploratory)")
+    p.add_argument("--threads", type=int, default=0,
+                   help="ORT intra-op threads (0 = ORT default, pre-registered; anything else "
+                        "makes the exit exploratory)")
 
 
 def build_parser() -> argparse.ArgumentParser:

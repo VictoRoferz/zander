@@ -51,7 +51,7 @@ from verifier.common import (
     FINAL_WEIGHTS, FOLDS, OOF_SCORES, TRAIN_LOG, Refusal, git_state, host, read_json,
     sha256_file, utc_now, vrun_dir, write_json_atomic,
 )
-from verifier.config import VerifierConfig, load_config
+from verifier.config import VerifierConfig, load_config, preregistration_problems
 from verifier.crops import load_windows
 from verifier.mine import load_candidates
 from verifier.stacker import auroc, fit_class_stacker, resolve_hi, select_tau
@@ -234,6 +234,12 @@ def run(
     if not stack:
         raise RuntimeError("no stacked class (every class is passthrough) — nothing to cross-fit")
     t_star, op_info = load_operating_point(operating_point, cand, cfg.exit.target_sensitivity)
+    exploratory = preregistration_problems(cfg.to_dict())
+    if git_state()["git_dirty"] is not False:
+        exploratory.append("uncommitted changes under ml/ (or no git checkout)")
+    if exploratory and not cand["smoke"]:  # say so BEFORE hours of training
+        logger.warning("this cross-fit is EXPLORATORY, its exit decision will be invalid-smoke: "
+                       + "; ".join(exploratory))
     dev = pick_device(device)
     plan = make_plan()
     check_plan(plan)

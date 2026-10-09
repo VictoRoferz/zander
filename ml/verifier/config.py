@@ -1,9 +1,10 @@
 """
 Verifier configuration: the committed, pre-registered YAML
 (verifier/configs/mnv3s_2crop.yaml) plus explicit dotted overrides
-({"train.epochs": 1}). Every override is recorded; a run with overrides or a
-non-default config file is exploratory and can never reach a "ship" decision
-(see exit_rule.py).
+({"train.epochs": 1}). Every override is recorded; a run with overrides, a
+non-default config file or a default file whose content differs from the
+pre-registered one (PREREGISTERED_CONFIG_SHA256) is exploratory and can never
+reach a "ship" decision (see exit_rule.py).
 """
 from __future__ import annotations
 
@@ -15,9 +16,19 @@ from typing import Any, Optional, Union
 import yaml
 
 from infer.verifier import JITTER
-from verifier.common import sha256_file
+from verifier.common import sha256_bytes
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "mnv3s_2crop.yaml"
+# configs/mnv3s_2crop.yaml as committed with PREREGISTRATION.md (1c28a8c,
+# 2026-09-28; unchanged since, `git log --follow`). "As committed" is this
+# content, not the path: an in-place edit keeps the path but not the sha.
+PREREGISTERED_CONFIG_SHA256 = "4b466902346c60b5982b97f8b206f1c8fcb48dae0c5c146fbd5bf913c45285ef"
+
+
+def config_sha256(path: Path) -> str:
+    """sha256 of the config text with LF line endings — the committed blob, so a
+    CRLF checkout (core.autocrlf on Windows) of the same commit hashes the same."""
+    return sha256_bytes(Path(path).read_bytes().replace(b"\r\n", b"\n"))
 
 
 @dataclass(frozen=True)
@@ -102,15 +113,26 @@ class VerifierConfig:
     @property
     def is_default(self) -> bool:
         """The committed pre-registered config, unmodified."""
-        return (
-            not self.overrides
-            and Path(self.path).resolve() == DEFAULT_CONFIG.resolve()
-        )
+        return not preregistration_problems(self.to_dict())
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
         d["candidates"]["ignore_band"] = list(self.candidates.ignore_band)
         return d
+
+
+def preregistration_problems(c: dict) -> list[str]:
+    """Why a recorded config ({path, sha256, overrides}, VerifierConfig.to_dict)
+    is not the pre-registered one; empty if it is."""
+    out = []
+    if c.get("overrides"):
+        out.append(f"config overrides {c['overrides']}")
+    if not c.get("path") or Path(c["path"]).resolve() != DEFAULT_CONFIG.resolve():
+        out.append(f"config file {c.get('path')} is not the pre-registered one")
+    if c.get("sha256") != PREREGISTERED_CONFIG_SHA256:
+        out.append(f"config sha256 {str(c.get('sha256'))[:12]}… is not the pre-registered "
+                   f"{PREREGISTERED_CONFIG_SHA256[:12]}… (file edited?)")
+    return out
 
 
 def _coerce(cls, section: str, raw: dict) -> Any:
@@ -157,7 +179,7 @@ def load_config(path: Optional[Path] = None, overrides: Optional[dict] = None) -
     cfg = VerifierConfig(
         name=str(raw.get("name", path.stem)),
         path=str(path),
-        sha256=sha256_file(path),
+        sha256=config_sha256(path),
         overrides=dict(overrides),
         **{s: _coerce(cls, s, raw.get(s) or {}) for s, cls in SECTIONS.items()},
     )

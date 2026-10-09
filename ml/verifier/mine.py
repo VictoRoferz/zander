@@ -55,7 +55,7 @@ from dataprep.ingest import load_manifest
 from eval.run_eval import load_predictions
 from eval.scorer import iou
 from verifier.common import (
-    CANDIDATES, FOLDS, Refusal, read_json, resolve_model_path, sha256_file, utc_now,
+    CANDIDATES, FOLDS, Refusal, git_state, read_json, resolve_model_path, sha256_file, utc_now,
     vrun_dir, write_json_atomic,
 )
 from verifier.config import VerifierConfig, load_config
@@ -300,7 +300,7 @@ def mine(
         "format_version": FORMAT_VERSION, "kind": KIND, "vrun": vrun, "created": utc_now(),
         "schema": schema, "class_names": class_names, "family": fam,
         "runs": infos, "smoke": smoke, "oof_violations": violations,
-        "fraction": fraction, "config": cfg.to_dict(), "config_sha256": cfg.sha256,
+        "fraction": fraction, "config": cfg.to_dict(), "config_sha256": cfg.sha256, **git_state(),
         "stack_classes": stack, "passthrough_classes": passthrough,
         "positives_per_class": {class_names[i]: positives[i] for i in range(len(class_names))},
         "gt_positives_per_class": {class_names[i]: gt_pos[i] for i in stack},

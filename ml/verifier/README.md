@@ -80,7 +80,14 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python verifier/cli.py all \
 7. **Export** (`export_onnx.py`). V_final to `verifier.onnx` (opset 17,
    dynamic N, parity ≤ 1e-4 on 32 cached windows) plus `stacker.json`.
 8. **Exit** (`exit_rule.py`), as pre-registered, into `exit_report.{md,json}`
-   and `stacker.json.exit`.
+   and `stacker.json.exit`. Only the pre-registered run can decide: the
+   config must be the committed file byte for byte (`PREREGISTERED_CONFIG_SHA256`,
+   no `--set` / `--config`) at mine, crossfit **and** exit time, the code under
+   `ml/` committed at all three steps (`git_dirty`, `ml/reports/` excluded), the
+   exit run with `--threads 0` and the pre-registered 20 latency photos, and all
+   seven cross-fit models ImageNet-initialised (`train_log.json`). Anything else
+   is `invalid-smoke`. An earlier report is never overwritten: it moves to
+   `exit_archive/<UTC stamp>/` and the new report lists it.
 
 ## Why nested
 
@@ -130,7 +137,8 @@ AUROC.
 sha) · `oof_scores.json` (per-candidate inner/outer scores, per-fold t(k),
 tau(k), stackers) · `stacker_fold<k>.json` (S_k, referenced by the cascade
 runs' `source.stacker_sha256`) · `verifier_final.pt` · `verifier.onnx` ·
-`stacker.json` · `exit_report.{md,json}` · `train_log.json`.
+`stacker.json` · `exit_report.{md,json}` (earlier ones in `exit_archive/<UTC stamp>/`) ·
+`train_log.json`.
 Cascade eval runs go to `ml_data/eval/<F>+<vrun>_fold<k>/` (predictions.json
 v2, `source.kind = cascade`). Smoke and fractional runs never append to
 `ml/reports/results_v2.csv`.

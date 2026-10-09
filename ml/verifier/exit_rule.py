@@ -13,7 +13,8 @@ and the `exit` block of stacker.json.
     false-alarm boxes (>= threshold, unmatched at IoU 0.3), false-call photos
     (seated / handheld iO), escapes, and photos the cascade ADDS as escapes.
     Passes iff pooled NAL false alarms <= (1 - 0.30) x the detector's and zero
-    added photo escapes.
+    added photo escapes (compared exactly on integers: 10 x cascade <= 7 x
+    detector, so exactly 30 % fewer passes).
 (c) LATENCY GATE — the detector (fold-0 model, conf floor 0.001) + the
     exported verifier on N photos with ONNX Runtime CPU: verifier p50 for 50
     candidates <= 200 ms and detector + verifier p50 <= 1.0 s.
@@ -21,17 +22,28 @@ and the `exit` block of stacker.json.
     (and by any detection) on the held-out folds: what stage 2 can reach at all.
 (e) inner-vs-outer verifier NAL AUROC (the nested-stacking train/apply gap).
 
-Decision: ship iff (c) and ((a) or (b)). Smoke / non-OOF data, a photo
-fraction < 1, a non-default config or a random-init backbone -> invalid-smoke
-(no decision). (d) and (e) are descriptive.
+Decision: ship iff (c) and ((a) or (b)). invalid-smoke (no decision) when the
+run is not the pre-registered one: smoke / non-OOF data, a photo fraction < 1,
+a config that is not the committed file byte for byte (overrides, another
+path, an edited file: PREREGISTERED_CONFIG_SHA256) at mine, crossfit OR exit
+time, uncommitted code under ml/ at any of the three steps, an exit with
+--threads != 0 (ORT default threads) or another --latency-photos count, or a
+random-init backbone in ANY of the seven cross-fit models. The gates are read
+from the exit-time config, so these checks are what keeps `exit --set
+exit.<gate>=...` from turning no-ship into ship. An earlier exit report is
+archived to exit_archive/<UTC stamp>/, never overwritten (every exit is
+reported), and listed in the new one. (d) and (e) are descriptive.
 """
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import random
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
@@ -47,16 +59,17 @@ from eval.scorer import (
 from infer.pipeline import TiledDetector, load_photo_rgb
 from infer.verifier import Verifier, anchor_map, candidate_features
 from verifier.common import (
-    EXIT_JSON, EXIT_MD, OOF_SCORES, STACKER, FOLDS, read_json, sha256_file, utc_now, vrun_dir,
-    write_json_atomic, write_bytes_atomic,
+    EXIT_ARCHIVE, EXIT_JSON, EXIT_MD, OOF_SCORES, STACKER, FOLDS, TRAIN_LOG, git_state, read_json,
+    sha256_file, utc_now, vrun_dir, write_json_atomic, write_bytes_atomic,
 )
-from verifier.config import DEFAULT_CONFIG
+from verifier.config import VerifierConfig, preregistration_problems
 from verifier.crossfit import NAL, cascade_photos
 from verifier.mine import load_candidates
 
 logger = logging.getLogger("ml.verifier.exit")
 
 PREREG = Path(__file__).resolve().parent / "PREREGISTRATION.md"
+PRETRAINED = "imagenet1k_v1"  # the only backbone source a decision run may use
 
 
 # ------------------------------------------------------------------ (a)
@@ -181,8 +194,10 @@ def crossfit_thresholds(cand: dict, oof: dict, det_by_id: dict, nal: int,
             tot[key] += v
     det_fa, casc_fa = tot["det_fa"], tot["casc_fa"]
     reduction = (det_fa - casc_fa) / det_fa if det_fa else None
-    passed = bool(det_fa > 0 and casc_fa <= (1.0 - fa_reduction) * det_fa
-                  and tot["added_escapes"] == 0)
+    # exact: 1 - Fraction("0.3") = 7/10, so 63 <= 7/10 * 90 holds (in floats
+    # (1 - 0.30) * 90 = 62.999... and exactly 30 % fewer false alarms failed)
+    keep = 1 - Fraction(str(fa_reduction))
+    passed = bool(det_fa > 0 and casc_fa <= keep * det_fa and tot["added_escapes"] == 0)
     return {"per_fold": per_fold, "pooled": dict(tot), "nal_fa_reduction": (
         None if reduction is None else round(reduction, 4)), "required_reduction": fa_reduction,
         "added_escape_photos": added_ids, "rescued_photos": rescued_ids, "passed": passed}
@@ -193,7 +208,8 @@ def crossfit_thresholds(cand: dict, oof: dict, det_by_id: dict, nal: int,
 
 def latency(cand: dict, stacker_path: Path, n_photos: int, warmup: int, threads: int = 0,
             n_candidates: int = 50) -> dict:
-    info = cand["runs"][0]
+    # the pre-registered bench model: the fold-0 detector
+    info = next((r for r in cand["runs"] if r.get("bucket") == "fold0"), cand["runs"][0])
     model = Path(info["model_resolved"])
     ver = Verifier(stacker_path, threads=threads)
     det = TiledDetector(model, info["adapter"], conf_floor=ver.stacker.candidate_floor,
@@ -287,7 +303,22 @@ def candidate_ceiling(cand: dict, det_by_id: dict, nal: int) -> dict:
 # ------------------------------------------------------------------ decision
 
 
-def invalid_reasons(cand: dict, oof: dict) -> list[str]:
+def exit_run_info(cfg: VerifierConfig, threads: int, latency_photos: Optional[int]) -> dict:
+    """What the exit step itself ran with (recorded in the report, checked by
+    invalid_reasons): its config, ORT threads, latency photo count, code state."""
+    return {
+        "config": {"name": cfg.name, "path": cfg.path, "sha256": cfg.sha256,
+                   "overrides": dict(cfg.overrides)},
+        "threads": int(threads or 0),
+        "latency_photos": int(latency_photos or cfg.exit.latency_photos),
+        "latency_photos_default": cfg.exit.latency_photos,
+        **git_state(),
+    }
+
+
+def invalid_reasons(cand: dict, oof: dict, train_log: Optional[dict], exit_run: dict) -> list[str]:
+    """Why this run is not the pre-registered one (empty = it is); any reason
+    makes the decision invalid-smoke."""
     reasons = []
     if cand["smoke"]:
         reasons.append("smoke: candidates are not out-of-fold (" + "; ".join(cand["oof_violations"]) + ")")
@@ -297,26 +328,89 @@ def invalid_reasons(cand: dict, oof: dict) -> list[str]:
                        "cascade 'finds' them by construction, the detector never proposed them")
     if cand["fraction"] < 1.0:
         reasons.append(f"only a {cand['fraction']:.0%} photo sample was mined")
-    for step, c in (("mine", cand["config"]), ("crossfit", oof["config"])):
-        if c["overrides"]:
-            reasons.append(f"{step}: config overrides {c['overrides']} (not the pre-registered run)")
-        if Path(c["path"]).resolve() != DEFAULT_CONFIG.resolve():
-            reasons.append(f"{step}: config file {c['path']} is not the pre-registered one")
-    if not str(oof.get("weights_source", "")).startswith("imagenet1k_v1"):
-        reasons.append(f"backbone not ImageNet-pretrained ({oof.get('weights_source')})")
+    steps = (("mine", cand["config"], cand), ("crossfit", oof["config"], oof),
+             ("exit", exit_run["config"], exit_run))
+    for step, c, doc in steps:
+        for problem in preregistration_problems(c):
+            reasons.append(f"{step}: {problem} (not the pre-registered run)")
+        dirty = doc.get("git_dirty")
+        if dirty is None:
+            reasons.append(f"{step}: code state unknown (no git_dirty recorded — not a git checkout?)")
+        elif dirty:
+            reasons.append(f"{step}: ran with uncommitted changes under ml/ (git "
+                           f"{str(doc.get('git_sha'))[:12]} + local edits)")
+    if exit_run["threads"] != 0:
+        reasons.append(f"exit: --threads {exit_run['threads']} (the pre-registered latency gate uses "
+                       "ONNX Runtime's default intra-op threads, --threads 0)")
+    if exit_run["latency_photos"] != exit_run["latency_photos_default"]:
+        reasons.append(f"exit: --latency-photos {exit_run['latency_photos']} (pre-registered: "
+                       f"{exit_run['latency_photos_default']} photos)")
+    if oof.get("weights_source") != PRETRAINED:
+        reasons.append(f"V_final backbone not ImageNet-pretrained ({oof.get('weights_source')})")
+    planned = sorted(((oof.get("plan") or {}).get("models")) or {})
+    if train_log is None:
+        reasons.append(f"{TRAIN_LOG} missing: the backbone source of the cross-fit models is unverifiable")
+    else:
+        logged = {m.get("name"): m.get("weights_source") for m in train_log.get("models") or []}
+        missing = [n for n in planned if n not in logged]
+        if missing:
+            reasons.append(f"{TRAIN_LOG} lacks the cross-fit models {missing}")
+        bad = {n: w for n, w in sorted(logged.items()) if w != PRETRAINED}
+        if bad:
+            reasons.append("backbone not ImageNet-pretrained in " + "; ".join(
+                f"{n} ({w})" for n, w in bad.items()))
     return reasons
 
 
+def decide(reasons: list[str], latency_passed: bool, primary_passed: bool,
+           secondary_passed: bool) -> str:
+    """PREREGISTRATION.md "Decision rule"."""
+    if reasons:
+        return "invalid-smoke"
+    return "ship" if latency_passed and (primary_passed or secondary_passed) else "no-ship"
+
+
+def archive_reports(d: Path) -> list[dict]:
+    """Move the current exit_report.{json,md} (if any) to
+    exit_archive/<UTC stamp>/ — an exit report is never overwritten — and
+    list every archived report (oldest first)."""
+    current = [p for p in (d / EXIT_JSON, d / EXIT_MD) if p.exists()]
+    root = d / EXIT_ARCHIVE
+    if current:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest, n = root / stamp, 1
+        while dest.exists():
+            dest, n = root / f"{stamp}_{n}", n + 1
+        dest.mkdir(parents=True)
+        for p in current:
+            os.replace(p, dest / p.name)
+        logger.warning(f"the earlier exit report was archived to {dest} (every exit is reported)")
+    out = []
+    for sub in sorted(root.iterdir()) if root.is_dir() else []:
+        try:
+            doc = read_json(sub / EXIT_JSON) if (sub / EXIT_JSON).is_file() else {}
+        except ValueError:
+            doc = {}
+        out.append({"archive": f"{EXIT_ARCHIVE}/{sub.name}", "created": doc.get("created"),
+                    "decision": doc.get("decision")})
+    return out
+
+
 def run(vrun: str, cfg=None, threads: int = 0, latency_photos: Optional[int] = None) -> dict:
+    """The gates are read from `cfg` (default: the pre-registered file); a cfg
+    that is not that file, --threads != 0 or another --latency-photos count
+    turns the decision into invalid-smoke (invalid_reasons)."""
     from verifier.config import load_config
 
     cfg = cfg or load_config()
     ec = cfg.exit
+    exit_run = exit_run_info(cfg, threads, latency_photos)
     d = vrun_dir(vrun)
     cand, cand_sha = load_candidates(vrun)
     oof = read_json(d / OOF_SCORES)
     if oof["candidates_sha256"] != cand_sha:
         raise RuntimeError("oof_scores.json does not belong to this candidates.json")
+    train_log = read_json(d / TRAIN_LOG) if (d / TRAIN_LOG).is_file() else None
     stacker_path = d / STACKER
     Verifier(stacker_path, expected_class_names=cand["class_names"])  # sha + class checks
     names = cand["class_names"]
@@ -334,8 +428,8 @@ def run(vrun: str, cfg=None, threads: int = 0, latency_photos: Optional[int] = N
 
     primary = paired_recall(det_all, casc_all, nal, ec.bootstrap_n, ec.bootstrap_seed)
     secondary = crossfit_thresholds(cand, oof, det_by_id, nal, ec.fa_reduction)
-    lat = latency(cand, stacker_path, latency_photos or ec.latency_photos, ec.latency_warmup,
-                  threads=threads)
+    lat = latency(cand, stacker_path, exit_run["latency_photos"], ec.latency_warmup,
+                  threads=exit_run["threads"])
     lat["gate"] = {
         "verifier_50_p50_ms_max": ec.latency_verifier_p50_ms,
         "total_50_p50_s_max": ec.latency_total_p50_s,
@@ -343,13 +437,9 @@ def run(vrun: str, cfg=None, threads: int = 0, latency_photos: Optional[int] = N
                        and lat["total_50_ms"]["p50"] <= ec.latency_total_p50_s * 1000.0),
     }
     ceiling = candidate_ceiling(cand, det_by_id, nal)
-    reasons = invalid_reasons(cand, oof)
-    if reasons:
-        decision = "invalid-smoke"
-    elif lat["gate"]["passed"] and (primary["passed"] or secondary["passed"]):
-        decision = "ship"
-    else:
-        decision = "no-ship"
+    reasons = invalid_reasons(cand, oof, train_log, exit_run)
+    decision = decide(reasons, lat["gate"]["passed"], primary["passed"], secondary["passed"])
+    earlier = archive_reports(d)
     report = {
         "vrun": vrun, "created": utc_now(), "decision": decision, "invalid_reasons": reasons,
         "rule": "ship iff latency gate AND (primary OR secondary)",
@@ -363,12 +453,17 @@ def run(vrun: str, cfg=None, threads: int = 0, latency_photos: Optional[int] = N
                          "hi": oof["folds"][k]["hi"]} for k in FOLDS},
         "cascade_runs": oof.get("cascade_runs", []),
         "config_sha256": oof["config_sha256"], "candidates_sha256": cand_sha,
+        "exit_run": exit_run,
+        "git": {step: {"sha": doc.get("git_sha"), "dirty": doc.get("git_dirty")}
+                for step, doc in (("mine", cand), ("crossfit", oof), ("exit", exit_run))},
+        "earlier_reports": earlier,
     }
     write_json_atomic(d / EXIT_JSON, report)
     write_bytes_atomic(d / EXIT_MD, format_report(report).encode("utf-8"))
     sdoc = read_json(stacker_path)
     sdoc["exit"] = {"decision": decision, "report": EXIT_MD, "reasons": reasons,
-                    "decided": report["created"]}
+                    "decided": report["created"],
+                    "earlier_decisions": [e["decision"] for e in earlier]}
     write_json_atomic(stacker_path, sdoc)
     Verifier(stacker_path, expected_class_names=names)
     logger.info(f"exit decision for {vrun}: {decision.upper()}" + (f" ({'; '.join(reasons)})" if reasons else ""))
@@ -382,6 +477,7 @@ def _fmt(v, nd=4):
 def format_report(r: dict) -> str:
     p, s, lat, ce, au = (r["primary_recall_at_0.5fppi"], r["secondary_crossfit_thresholds"],
                          r["latency"], r["candidate_ceiling"], r["auroc_inner_vs_outer"])
+    ex = r["exit_run"]
     lines = [f"# Verifier exit report — `{r['vrun']}`", ""]
     if r["decision"] == "invalid-smoke":
         lines += ["> **INVALID (smoke)** — no decision; every number below is a plumbing check only:",
@@ -394,6 +490,18 @@ def format_report(r: dict) -> str:
         f"- family `{r['family']}` · class {r['class']} · anchor t* = {r['t_star']:.5f} · "
         f"tau_final = {r['tau_final']:.5f}",
         f"- cascade eval runs: {', '.join(f'`{x}`' for x in r['cascade_runs']) or '–'}",
+        f"- exit run: config `{ex['config']['name']}` (sha {str(ex['config']['sha256'])[:12]}, "
+        f"overrides {ex['config']['overrides'] or 'none'}), threads "
+        f"{ex['threads'] or 'ORT default'}, {ex['latency_photos']} latency photos · git "
+        + ", ".join(f"{k} {str(g['sha'])[:12]}{' (dirty)' if g['dirty'] else ''}"
+                    for k, g in r["git"].items()),
+    ]
+    if r["earlier_reports"]:
+        lines.append(
+            f"- **{len(r['earlier_reports'])} earlier exit report(s) of this run** (kept in "
+            f"`{EXIT_ARCHIVE}/`, every exit is reported): "
+            + ", ".join(f"{e['created']} {e['decision']}" for e in r["earlier_reports"]))
+    lines += [
         "",
         "## (a) Primary — NAL recall @ 0.5 FPPI, pooled held-out folds",
         "",

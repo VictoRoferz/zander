@@ -5,7 +5,8 @@ writes, hashing, run-name validation, provenance.
 Working files live in ml_data/verifier/<vrun>/ (CONTRACTS §8.4):
 candidates.json, windows.npy (+ windows_index.json), oof_scores.json,
 verifier_final.pt, stacker_fold<k>.json, verifier.onnx, stacker.json,
-exit_report.{md,json}, train_log.json.
+exit_report.{md,json} (earlier ones in exit_archive/<UTC stamp>/),
+train_log.json.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ VERIFIER_ONNX = "verifier.onnx"
 STACKER = "stacker.json"
 EXIT_JSON = "exit_report.json"
 EXIT_MD = "exit_report.md"
+EXIT_ARCHIVE = "exit_archive"
 TRAIN_LOG = "train_log.json"
 
 
@@ -108,15 +110,19 @@ def read_json(path: Path) -> Any:
 
 
 def git_state() -> dict:
-    """{git_sha, git_dirty} of the repo, or nulls outside a git checkout."""
+    """{git_sha, git_dirty} of the repo, or nulls outside a git checkout.
+
+    git_dirty = uncommitted or untracked changes under ml/, except ml/reports/
+    (results_v2.csv / test_ledger.csv rows that eval runs append are outputs,
+    not code). A dirty run is exploratory (exit_rule.invalid_reasons)."""
     try:
         sha = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True,
             timeout=10, check=True,
         ).stdout.strip()
         dirty = bool(subprocess.run(
-            ["git", "status", "--porcelain", "--", "ml"], cwd=REPO_ROOT, capture_output=True,
-            text=True, timeout=10, check=True,
+            ["git", "status", "--porcelain", "--", "ml", ":(exclude)ml/reports"], cwd=REPO_ROOT,
+            capture_output=True, text=True, timeout=10, check=True,
         ).stdout.strip())
         return {"git_sha": sha, "git_dirty": dirty}
     except (OSError, subprocess.SubprocessError):
