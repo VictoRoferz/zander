@@ -362,13 +362,17 @@ def run(
     test_run = _latest_look(matching)  # further looks (other floor, relabel): the latest counts
     others = [r for r in tests if r not in matching]
     test_level1 = None
-    if others and (explicit_test or not (test_run or no_test_eval)):
+    # This model has been looked at on test at another operating point: shipping
+    # this one without its own (ledger-recorded) test look would pick the
+    # threshold after seeing test, so --no-test-eval cannot waive it.
+    if others and (explicit_test or not test_run):
         raise ExportError(
             "test eval " + ", ".join(
                 f"{r} (t={runs[r].get('threshold')}, op sha {(op_used(runs[r]) or 'not recorded')[:12]})"
                 for r in others)
             + f" used another operating point than {op_path.name} (t={t}, sha {op_sha[:12]}) — "
-            f"evaluate this operating point on test, or pass --no-test-eval (recorded as null)")
+            "evaluate this operating point on test (a second look, recorded in the test ledger); "
+            "--no-test-eval cannot waive a test look the model already had")
     if test_run:
         if len(matching) > 1:
             logger.info(f"test evals of this model at this operating point: {sorted(matching)} — "
@@ -378,9 +382,7 @@ def run(
             raise ExportError(f"test eval {test_run} was run with guards overridden")
         test_level1 = tm.get("level1_verdict")
     elif no_test_eval:
-        overrides.append("no_test_eval: no test evaluation of this model at this operating point"
-                         + (f" (only at other operating points: {', '.join(sorted(others))})"
-                            if others else ""))
+        overrides.append("no_test_eval: no test evaluation of this model")
     else:
         raise ExportError(
             f"no test evaluation of this model (sha {model_sha[:12]}…) at this operating point — "

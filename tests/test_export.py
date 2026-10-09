@@ -328,10 +328,9 @@ def test_the_matching_test_look_is_found_among_further_looks():
     (first / "metrics.json").write_text(json.dumps({**m, "threshold": 0.4}))
     _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x19"), export.ExportError,
             "tiny4_def3_devall__test", "another operating point")
-    export.run(fresh, OP, out_dir=TMP / "x24", no_test_eval=True)  # waived: recorded, with the other look
-    raw = json.loads((TMP / "x24" / "detector.json").read_text(encoding="utf-8"))
-    assert raw["validation"]["test_eval_run"] is None
-    assert any("other operating points: tiny4_def3_devall__test" in o for o in raw["validation"]["overrides"])
+    # a look at another op cannot be waived: t would be chosen after seeing test
+    _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x24", no_test_eval=True), export.ExportError,
+            "tiny4_def3_devall__test", "cannot waive")
     looks =[_eval_run(f"tiny4_def3_devall__test__look{k}", fresh, "test", OP) for k in (2, 3)]
     for k, d in enumerate([first, *looks]):  # look3 written last
         os.utime(d / "metrics.json", ns=(10 ** 18 + k, 10 ** 18 + k))

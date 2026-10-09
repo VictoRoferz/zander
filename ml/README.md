@@ -135,7 +135,8 @@ tiler, and the test eval's identity check: family, the op's fold bundles still
 hold the models it was frozen from, config equivalence with them); the bundle
 is the dev_all retrain (`--allow-fold-model` records an exception); a test eval
 of exactly this model at exactly this operating point exists — the latest such
-look, `__test__look<k>` included (`--no-test-eval` records null); **parity** —
+look, `__test__look<k>` included (`--no-test-eval` records null, but cannot waive
+a test look the model already had at another operating point); **parity** —
 the deployed pipeline (`conf_floor = t`) reproduces the evaluated verdicts on
 the 5 photos nearest the threshold, zero mismatches.
 `--force` archives an existing export to `exports/archive/<timestamp>/`.
