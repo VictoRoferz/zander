@@ -95,6 +95,14 @@ class DeimAdapter:
     (labels, boxes xyxy in original pixels, scores). NMS-free top-300 decode
     is inside the graph. Input normalization is /255 only (RT-DETR family
     trains without ImageNet mean/std).
+
+    That top-300 runs over query x class (sigmoid scores), so one query's box
+    comes out once per class above the floor: the COCO DEIM-S model emitted 9
+    boxes with 2-6 labels among 44 detections >= 0.2 on natural photos. A box
+    is one defect, so decode keeps each box's best label only, which is what
+    the Ultralytics raw head's argmax yields. One query = one bit-identical
+    box. Deduplicating after the floor equals deduplicating before it (the
+    kept label is the box's maximum), so conf_floor == threshold stays exact.
     """
 
     name = "deim"
@@ -129,7 +137,11 @@ class DeimAdapter:
             )
         if labels is None:
             labels = np.zeros(len(scores), dtype=np.int64)
-        keep = scores >= conf_floor
+        keep = np.flatnonzero(scores >= conf_floor)
+        if len(keep) > 1:  # one label per box: the highest-scoring one (see the class docstring)
+            keep = keep[np.argsort(-scores[keep], kind="stable")]
+            _, first = np.unique(boxes[keep], axis=0, return_index=True)
+            keep = keep[np.sort(first)]
         return boxes[keep].copy(), scores[keep].copy(), labels[keep].astype(np.int64)
 
 

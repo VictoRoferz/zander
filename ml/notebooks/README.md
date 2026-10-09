@@ -119,10 +119,10 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 **Run it:**
 1. In the Parameters cell, set `DEIM_MATRIX` to the three configs from the comment above it (`configs/matrix/deim_s_def3_fold{0,1,2}.yaml`). The first time, add `DEIM_MATRIX = DEIM_MATRIX[:1]` to time one run.
 2. **Run all.** The DEIM cell runs after the YOLO matrix:
-   - it installs DEIM's extra deps (`python train/deim_run.py --install-deps`: pinned faster-coco-eval, calflops and onnxruntime). Colab's torch is not touched;
-   - it puts the init checkpoint in place (`--fetch-weights`): DEIM's COCO-pretrained DEIM-S from the model zoo of the pinned README, which is hosted on Google Drive;
+   - it installs DEIM's extra deps (`python train/deim_run.py --install-deps`: pinned faster-coco-eval, calflops and onnxruntime; transformers, accelerate and huggingface_hub, which calflops imports, only if missing). Colab's torch is not touched;
+   - it puts the init checkpoint in place (`--fetch-weights`): DEIM's COCO-pretrained DEIM-S, `deim_dfine_hgnetv2_s_coco_120e.pth` from row S of the D-FINE table in the pinned README, hosted on Google Drive and stored as `deim_hgnetv2_s_coco.pth`;
    - it then trains through `train/matrix.py`, like the YOLO runs: skip, resume and retry work the same way.
-3. If Google Drive refuses the download (quota), download the "S" checkpoint of DEIM's model zoo by hand and upload it as `MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth`. The cell copies it from there in every later session too. Its sha256 is pinned on first use, in `<file>.sha256` next to it.
+3. If Google Drive refuses the download (quota), download `deim_dfine_hgnetv2_s_coco_120e.pth` by hand (row S of the **D-FINE** table; the RT-DETRv2 table's "S" row is another network) and upload it renamed as `MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth`. The cell copies it from there in every later session too. Its sha256 must be `a089c9eb798f…` (pinned in `train/deim_run.py`): any other file is refused by name before training, and the training itself stops if the checkpoint fills less than 90 % of the model.
 4. If DEIM wins on the Mac: `FINAL = ['configs/final/deim_s_def3_devall.yaml']`. The DEIM cell then installs the deps before the final cell runs.
 
 **How the DEIM runs differ from the YOLO runs** (details: the docstring of `train/deim_run.py`):
@@ -130,7 +130,7 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 - The schedule follows from the epochs and the view size: 8 epochs without photometric aug at the end, LR warm-up over 2 epochs, EMA memory of about 2.7 epochs.
 - The **last** epoch is bundled. DEIM's own "stage 2", which reloads the checkpoint that scored best on the fold's validation photos, is switched off. That would be a selection leak into the out-of-fold evaluation.
 - The augmentation mirrors the YOLO policy: flips plus ColorJitter at the Ultralytics HSV strengths. Mosaic, zoom-out and IoU crops are off, because they shrink or rotate 28-px defects.
-- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
+- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. A mirror left by a different config is moved aside to `mirror/<run>.stale-<time>/` (never deleted: remove it on Drive by hand once it is not needed). The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
 
 ## Troubleshooting
 

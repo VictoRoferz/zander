@@ -25,6 +25,9 @@ batch 32) do not transfer:
   - model deim_hgnetv2_s_coco: DEIM-D-FINE-S fine-tuned (`train.py -t`) from
     DEIM's own COCO checkpoint (the model zoo of the pinned README), like the
     COCO-pretrained YOLO weights. Class heads are re-initialised (80 -> n).
+    The checkpoint's sha256 is pinned in MODELS, and the train worker stops a
+    run whose tuning load (DEIM: strict=False, mismatches dropped silently)
+    fills less than MIN_TUNING_MATCH of the model.
   - schedule: no_aug = max(2, round(0.1 E)), stop = E - no_aug,
     flat = policy[1] = stop // 2, transforms policy [4, flat, stop]; LR:
     quadratic warm-up over 2 epochs, flat until `flat`, cosine to 0.5 lr at
@@ -67,19 +70,22 @@ batch 32) do not transfer:
     scores float [N,300] = layout "deim". DEIM's onnxsim step is skipped (no
     CPU gain measured; onnxsim 0.4.x has no wheel for Colab's Python) and the
     TorchScript exporter is forced (dynamo=False), which DEIM targets. A
-    5-tile torch-vs-ONNX parity check (tie-tolerant) must pass; its numbers
-    go into meta.json.
+    5-tile torch-vs-ONNX parity check (tie-tolerant; boxes match by IoU or
+    within 0.5 px, because D-FINE also decodes inverted boxes) must pass; its
+    numbers go into meta.json.
 
 Resume (Colab disconnects). With `mirror_dir`, the parent process polls
 DEIM's output/log.txt (one JSON line per finished epoch) and copies log.txt,
-zander_run.json and output/last.pth (as last.pt, weights LAST, torn-write
-guarded) to <mirror_dir>/<name>/ at most every ZANDER_MIRROR_INTERVAL_S
-seconds plus the final epoch. On start the most advanced usable checkpoint
-(local output/last.pth, then the mirror) whose zander_run.json records this
-config sha wins: resumable -> DEIM `train.py -r last.pth` (last_epoch, model,
-EMA, optimizer and AMP scaler are restored; the LR schedule is a pure function
-of the iteration), finished -> export + bundle only, none -> fresh (an
-existing run_dir is moved aside, never deleted). A resumed run is
+output/last.pth (as last.pt, torn-write guarded) and zander_run.json (LAST:
+it vouches for the checkpoint) to <mirror_dir>/<name>/ at most every
+ZANDER_MIRROR_INTERVAL_S seconds plus the final epoch. On start the most
+advanced usable checkpoint (local output/last.pth, then the mirror) whose
+zander_run.json records this config sha wins: resumable -> DEIM `train.py -r
+last.pth` (last_epoch, model, EMA, optimizer and AMP scaler are restored; the
+LR schedule is a pure function of the iteration), finished -> export + bundle
+only, none -> fresh (an existing run_dir is moved aside, never deleted). An
+unusable mirror is moved aside to <mirror_dir>/<name>.stale-<UTC stamp>, so
+a new sidecar never meets an old run's checkpoint. A resumed run is
 statistically equivalent to an uninterrupted one, not bit-identical (no RNG
 state in DEIM checkpoints). Every DEIM subprocess leads its own process
 group: stopping a run (SIGINT -> SIGTERM -> SIGKILL, also on a SIGTERM from
@@ -150,11 +156,13 @@ LICENSE_NAME = "Apache-2.0"
 SRC_DIR_NAME = "_deim_src"
 
 # Extra runtime deps of DEIM's train/export path on Colab (torch, torchvision,
-# numpy, Pillow, PyYAML, scipy, tensorboard, transformers/accelerate come
-# preinstalled). Pinned: the newest faster-coco-eval before the DEIM commit
-# (DEIM reads its private _evalImgs_cpp), onnxruntime = the Mac-side pin (the
-# parity check). "if-missing" entries are only installed when absent, never
-# pinned, so Colab's stack is not reshuffled.
+# numpy, Pillow, PyYAML, scipy, tensorboard, transformers, accelerate,
+# huggingface_hub come preinstalled). Pinned: the newest faster-coco-eval
+# before the DEIM commit (DEIM reads its private _evalImgs_cpp), onnxruntime =
+# the Mac-side pin (the parity check). "if-missing" entries are only installed
+# when absent, never pinned, so Colab's stack is not reshuffled. DEIM imports
+# calflops at start-up, and calflops' __init__ imports transformers,
+# accelerate and huggingface_hub: without them DEIM dies before training.
 DEIM_PIP = (
     # (import name, pip requirement, policy)
     ("faster_coco_eval", "faster-coco-eval==1.7.2", "pin"),
@@ -163,19 +171,31 @@ DEIM_PIP = (
     ("onnx", "onnx==1.17.0", "if-missing"),
     ("scipy", "scipy", "if-missing"),
     ("tensorboard", "tensorboard", "if-missing"),
+    ("transformers", "transformers", "if-missing"),        # calflops
+    ("accelerate", "accelerate", "if-missing"),            # calflops
+    ("huggingface_hub", "huggingface_hub", "if-missing"),  # calflops
     ("gdown", "gdown", "if-missing"),  # --fetch-weights only
 )
-TRAIN_MODULES = ("torch", "torchvision", "faster_coco_eval", "calflops", "scipy",
-                 "tensorboard", "PIL", "onnx", "onnxruntime")
+TRAIN_MODULES = ("torch", "torchvision", "faster_coco_eval", "calflops", "transformers", "accelerate",
+                 "huggingface_hub", "scipy", "tensorboard", "PIL", "onnx", "onnxruntime")
 
 BASE_CONFIG = "configs/deim_dfine/deim_hgnetv2_s_coco.yml"
 MODELS = {
-    # DEIM-D-FINE-S fine-tuned from DEIM's own COCO checkpoint (49.0 AP; model
-    # zoo row "S" of the README at DEIM_COMMIT; Google Drive is its only host).
+    # DEIM-D-FINE-S fine-tuned from DEIM's own COCO checkpoint (49.0 AP; row
+    # "S" of the D-FINE model zoo table in the README at DEIM_COMMIT; Google
+    # Drive is its only host). The README has a second "S" row, DEIM-RT-DETRv2
+    # R18: another network, which DEIM's tuning load (strict=False, every
+    # tensor with another name or shape dropped) would load ~15 % of without an
+    # error. Hence the sha256 pin (2026-10-09: two independent downloads of
+    # gdrive_id) and the load guard in the train worker (MIN_TUNING_MATCH).
+    # Drive serves the file as `drive_name`; we keep it as `weights_file`.
     "deim_hgnetv2_s_coco": {
         "base_config": BASE_CONFIG,
         "init": "tuning",
         "weights_file": "deim_hgnetv2_s_coco.pth",
+        "drive_name": "deim_dfine_hgnetv2_s_coco_120e.pth",
+        "sha256": "a089c9eb798f8a0322e05f757fe8e8188eee34aa578788a35ec253bcec8a6b38",
+        "readme_row": "the D-FINE table's row S (49.0 AP, 10M params)",
         "gdrive_id": "1tB8gVJNrfb6dhFvoHJECKOF5VpkthhfC",
         "source": "https://drive.google.com/file/d/1tB8gVJNrfb6dhFvoHJECKOF5VpkthhfC/view",
     },
@@ -183,6 +203,11 @@ MODELS = {
     # weights are meaningless).
     "deim_hgnetv2_s_random": {"base_config": BASE_CONFIG, "init": "random"},
 }
+# Share of the model's tensors the init checkpoint must fill in DEIM's tuning
+# load (name and shape match). Measured on DEIM-S: the pinned COCO checkpoint
+# 785/794 (only the class heads + denoising class embedding re-initialise),
+# DEIM-D-FINE-N / -M 46 %, DEIM-RT-DETRv2-R18 15 %.
+MIN_TUNING_MATCH = 0.9
 
 # DEIM's registry at DEIM_COMMIT (engine/data/transforms) + the two torchvision
 # transforms the train worker registers (see EXTRA_TRANSFORMS).
@@ -245,6 +270,10 @@ PARITY_TILES = 5
 PARITY_SCORE_FLOOR = 0.01
 PARITY_SCORE_TOL = 1e-3
 PARITY_MIN_IOU = 0.98
+# ... or every coordinate within this many pixels: D-FINE decodes inverted and
+# zero-area boxes (x2 < x1, ...), whose IoU is 0 even against their own twin
+# 0.02 px away (measured torch vs ONNX: <= 0.08 px on every box).
+PARITY_BOX_TOL_PX = 0.5
 
 ENV_POLL = "ZANDER_DEIM_POLL_S"
 DEFAULT_POLL_S = 10.0
@@ -763,30 +792,39 @@ def validate_checkpoint(path: Path) -> dict:
             "last_epoch": state.get("last_epoch")}
 
 
-def _tofu_sha(file: Path, sha_file: Path) -> str:
-    """Trust on first use: the first copy's sha is recorded, later copies must match."""
-    sha = B.sha256_file(file)
-    known = B.read_sha256_file(sha_file)
-    if known is None:
-        B.atomic_write_text(sha_file, f"{sha}  {file.name}\n")
-    elif known != sha:
-        raise RuntimeError(f"{file} sha256 {sha[:12]} != recorded {known[:12]} ({sha_file}) — "
-                           "a different init checkpoint; delete the record only if that is intended")
+def check_init_weights(model: str, path: Path) -> str:
+    """sha256 of <path>, which must be the pinned init checkpoint of `model`;
+    B.ConfigError otherwise (exit 2: a wrong file never reaches DEIM's
+    lenient tuning load, and retrying will not fix it)."""
+    spec = MODELS[model]
+    sha = B.sha256_file(path)
+    if sha != spec["sha256"]:
+        raise B.ConfigError(
+            f"{path} (sha256 {sha[:12]}) is not the init checkpoint of {model}: expected DEIM's "
+            f"{spec['drive_name']} from {spec['readme_row']} of the README at {DEIM_COMMIT[:7]} "
+            f"({spec['source']}, sha256 {spec['sha256'][:12]}), stored as {spec['weights_file']}. "
+            "Replace the file; the README's other \"S\" row (RT-DETRv2 R18) is a different network"
+        )
     return sha
 
 
 def fetch_weights(model: str = "deim_hgnetv2_s_coco", drive: Optional[Path] = None) -> Optional[Path]:
     """Put the init checkpoint into ml_data/pretrained/deim/: from
     <drive>/pretrained/ if present, else downloaded (gdown) and copied there
-    for later sessions. Its sha256 is pinned on first use (<file>.sha256)."""
+    for later sessions. Every copy must have the pinned sha256 (MODELS); a
+    wrong local copy is moved aside and fetched again, a wrong Drive copy is
+    refused by name."""
     spec = MODELS[model]
     target = weights_path(model)
     if target is None:
         print(f"{model}: random init, nothing to fetch")
         return None
     on_drive = Path(drive) / "pretrained" / target.name if drive else None
+    if target.is_file() and B.sha256_file(target) != spec["sha256"]:
+        print(f"{target} is not the pinned checkpoint: moved aside -> {U.move_aside(target)}", flush=True)
     if not target.is_file():
         if on_drive is not None and on_drive.is_file():
+            check_init_weights(model, on_drive)
             print(f"copying {on_drive} -> {target}", flush=True)
             B.atomic_copy(on_drive, target)
         else:
@@ -800,16 +838,18 @@ def fetch_weights(model: str = "deim_hgnetv2_s_coco", drive: Optional[Path] = No
             got = gdown.download(id=spec["gdrive_id"], output=str(tmp), quiet=False)
             if not got or not tmp.is_file():
                 raise RuntimeError(
-                    f"download failed (Google Drive quota?). Download {spec['source']} by hand and put it at "
-                    f"{on_drive or target} (the same file name), then rerun"
+                    f"download failed (Google Drive quota?). Download {spec['source']} "
+                    f"({spec['drive_name']}) by hand and put it at {on_drive or target} (renamed to "
+                    f"{target.name}), then rerun"
                 )
+            check_init_weights(model, tmp)
             os.replace(tmp, target)
+    sha = check_init_weights(model, target)
     info = validate_checkpoint(target)
-    sha = _tofu_sha(target, target.with_name(target.name + ".sha256"))
     if on_drive is not None:
         if not on_drive.is_file():
             B.atomic_copy(target, on_drive)
-        _tofu_sha(on_drive, on_drive.with_name(on_drive.name + ".sha256"))
+        check_init_weights(model, on_drive)
     print(f"{model}: {target} sha256 {sha} ({info['params'] / 1e6:.1f} M params, ema={info['has_ema']})")
     return target
 
@@ -887,14 +927,19 @@ class StartPlan:
     epochs_done: Optional[int] = None
     moved_aside: Optional[Path] = None
     reason: str = ""
+    mirror_moved_aside: Optional[Path] = None
 
 
 LOCAL_CKPT = Path("output") / "last.pth"
 LOCAL_LOG = Path("output") / "log.txt"
-# (run_dir relative path, mirror name) in copy order — the weights LAST, so a
-# mirror's log.txt is never behind its checkpoint. last.pt is DEIM's full
-# training checkpoint under the Drive layout's name (docs/CONTRACTS.md §8.5).
-MIRROR_MEMBERS = ((LOCAL_LOG, "log.txt"), (Path(U.SIDECAR), U.SIDECAR), (LOCAL_CKPT, "last.pt"))
+# (run_dir relative path, mirror name) in copy order: log.txt before the
+# weights, so a mirror's log is never behind its checkpoint, and the sidecar
+# LAST: its config sha is what makes a mirror usable, so it never vouches for
+# a checkpoint that is not there yet. (plan_start moves an unusable mirror
+# aside, so the checkpoint a new sidecar meets is always one of this run's.)
+# last.pt is DEIM's full training checkpoint under the Drive layout's name
+# (docs/CONTRACTS.md §8.5).
+MIRROR_MEMBERS = ((LOCAL_LOG, "log.txt"), (LOCAL_CKPT, "last.pt"), (Path(U.SIDECAR), U.SIDECAR))
 
 
 def probe_checkpoint(path: Path, total_epochs: int) -> CkptState:
@@ -986,7 +1031,11 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
                *, probe: Optional[Callable] = None, stamp: Optional[str] = None,
                fingerprint: Optional[str] = None) -> StartPlan:
     """fresh / resume / finished, and make run_dir match the decision (same
-    rules as ultralytics_run.prepare_run_dir, DEIM's file layout)."""
+    rules as ultralytics_run.prepare_run_dir, DEIM's file layout). A mirror
+    this run cannot use (another config or dataset, no provenance, a corrupt
+    checkpoint) is moved aside, never deleted: left under the run's name, this
+    attempt's first copies (log + sidecar, while its checkpoint is still being
+    written) would pair a new sidecar with the old checkpoint."""
     probe = probe or probe_checkpoint  # looked up at call time
     run_dir = Path(run_dir)
     local, local_why = (None, "no run_dir")
@@ -998,6 +1047,10 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
         mirror, mirror_why = _usable(Path(mirror_run) / "last.pt", Path(mirror_run), config_sha,
                                      total_epochs, probe, fingerprint)
     reason = f"local: {local_why}; mirror: {mirror_why}"
+    mirror_moved = None
+    if mirror is None and mirror_run is not None and Path(mirror_run).is_dir() and any(Path(mirror_run).iterdir()):
+        mirror_moved = U.move_aside(Path(mirror_run), stamp)
+        reason += f"; unusable mirror moved aside -> {mirror_moved.name}"
     moved = None
     if mirror is not None and (local is None or _rank(mirror) > _rank(local)):
         if run_dir.exists():
@@ -1009,10 +1062,10 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
     else:
         if run_dir.exists():
             moved = U.move_aside(run_dir, stamp)
-        return StartPlan("fresh", "none", moved_aside=moved, reason=reason)
+        return StartPlan("fresh", "none", moved_aside=moved, reason=reason, mirror_moved_aside=mirror_moved)
     truncate_log(run_dir / LOCAL_LOG, state.epochs_done or 0)
     kind = "resume" if state.kind == "resumable" else "finished"
-    return StartPlan(kind, source, state.epochs_done, moved, reason)
+    return StartPlan(kind, source, state.epochs_done, moved, reason, mirror_moved)
 
 
 def copy_if_stable(src: Path, dst: Path, settle_s: float = 2.0) -> bool:
@@ -1313,42 +1366,58 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else (1.0 if list(a) == list(b) else 0.0)
 
 
+def _proper(box) -> bool:
+    return box[2] > box[0] and box[3] > box[1]
+
+
 def compare_detections(ref: tuple, test: tuple, *, score_floor: float = PARITY_SCORE_FLOOR,
-                       score_tol: float = PARITY_SCORE_TOL, min_iou: float = PARITY_MIN_IOU) -> dict:
+                       score_tol: float = PARITY_SCORE_TOL, min_iou: float = PARITY_MIN_IOU,
+                       box_tol_px: float = PARITY_BOX_TOL_PX) -> dict:
     """Tie-tolerant parity of two (labels, boxes, scores) top-k outputs: the
     sorted scores must agree, and every reference detection >= score_floor
     needs a partner with the same label, a score within score_tol and IoU >=
-    min_iou (queries with equal scores may come out of TopK in any order).
-    Detections within score_tol of either side's k-th score are skipped: a
-    near-tie there can drop a query out of one top-k but not the other."""
+    min_iou or every coordinate within box_tol_px (queries with equal scores
+    may come out of TopK in any order; an inverted or zero-area box has IoU 0
+    with everything, its own twin included). Detections within score_tol of
+    either side's k-th score are skipped: a near-tie there can drop a query
+    out of one top-k but not the other. `min_iou` reports proper boxes only;
+    `degenerate` counts the matched pairs with an improper box."""
     rl, rb, rs = (list(x) for x in ref)
     tl, tb, ts = (list(x) for x in test)
     n = min(len(rs), len(ts))
     s_ref, s_test = sorted(map(float, rs), reverse=True)[:n], sorted(map(float, ts), reverse=True)[:n]
     max_score = max((abs(a - b) for a, b in zip(s_ref, s_test)), default=0.0)
     cutoff = max(s_ref[-1], s_test[-1]) + score_tol if n else float("inf")
-    used, mismatches, compared, min_seen, max_box = set(), 0, 0, 1.0, 0.0
+    used, ious, mismatches, compared, degenerate, max_box = set(), [], 0, 0, 0, 0.0
     for i in sorted(range(len(rs)), key=lambda k: -float(rs[k])):
         if float(rs[i]) < score_floor or float(rs[i]) <= cutoff:
             break
         compared += 1
-        best, best_iou = None, -1.0
+        a = [float(v) for v in rb[i]]
+        best, best_key, best_iou = None, None, -1.0
         for j in range(len(ts)):
             if j in used or int(tl[j]) != int(rl[i]) or abs(float(ts[j]) - float(rs[i])) > score_tol:
                 continue
-            iou = _iou([float(v) for v in rb[i]], [float(v) for v in tb[j]])
-            if iou > best_iou:
-                best, best_iou = j, iou
-        if best is None or best_iou < min_iou:
+            b = [float(v) for v in tb[j]]
+            iou, dist = _iou(a, b), max(abs(x - y) for x, y in zip(a, b))
+            best_iou = max(best_iou, iou)
+            key = (iou >= min_iou or dist <= box_tol_px, -dist)  # a partner, then the nearest one
+            if best_key is None or key > best_key:
+                best, best_key = j, key
+        if best is None or not best_key[0]:
             mismatches += 1
-            min_seen = min(min_seen, max(best_iou, 0.0))
+            ious.append(max(best_iou, 0.0))
             continue
         used.add(best)
-        min_seen = min(min_seen, best_iou)
-        max_box = max(max_box, max(abs(float(a) - float(b)) for a, b in zip(rb[i], tb[best])))
-    return {"compared": compared, "mismatches": mismatches, "max_score_diff": max_score,
-            "min_iou": round(min_seen, 6) if compared else None, "max_box_diff_px": max_box,
-            "ok": mismatches == 0 and max_score <= score_tol}
+        b = [float(v) for v in tb[best]]
+        if _proper(a) and _proper(b):
+            ious.append(_iou(a, b))
+        else:
+            degenerate += 1
+        max_box = max(max_box, -best_key[1])
+    return {"compared": compared, "mismatches": mismatches, "degenerate": degenerate,
+            "max_score_diff": max_score, "min_iou": round(min(ious), 6) if ious else None,
+            "max_box_diff_px": max_box, "ok": mismatches == 0 and max_score <= score_tol}
 
 
 def parity_images(layout: DatasetLayout, k: int = PARITY_TILES) -> list:
@@ -1475,6 +1544,7 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
             f"init checkpoint {p.init_path} missing — run `python train/deim_run.py --fetch-weights` "
             f"(or download {spec['source']} to that path)"
         )
+    init_sha = check_init_weights(eff["model"], p.init_path) if spec["init"] == "tuning" else None
     check_override_keys(p.override, deim_dir, eff["model"])
     run_root = settings.run_dirs_dir
     run_root.mkdir(parents=True, exist_ok=True)
@@ -1484,6 +1554,8 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
     logger.info(f"{name}: {plan.kind} (source {plan.source}, epochs done {plan.epochs_done}; {plan.reason})")
     if plan.moved_aside:
         logger.warning(f"previous run_dir moved aside -> {plan.moved_aside}")
+    if plan.mirror_moved_aside:
+        logger.warning(f"unusable mirror moved aside -> {plan.mirror_moved_aside}")
     # the dataset layout + override are regenerated every attempt (paths move between VMs)
     prepare_dataset_layout(eff, p.run_dir / "dataset", p.provenance["classes"], write=True)
     B.atomic_write_text(p.override_path, render_override(p.override, _override_header(p)))
@@ -1577,7 +1649,7 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
                      "extra_transforms": list(EXTRA_TRANSFORMS), "stage2": "off (collate stop_epoch = epochs)"},
             "init_weights": {"model": eff["model"], "init": spec["init"], "source": spec.get("source"),
                              "file": p.init_path.name if p.init_path else None,
-                             "sha256": B.sha256_file(p.init_path) if p.init_path and p.init_path.is_file() else None},
+                             "sha256": init_sha},
             "schedule": B.to_jsonable(dataclasses.asdict(s)),
             "dataset_view": {k: v for k, v in B.to_jsonable(dataclasses.asdict(p.layout)).items()
                              if k not in ("img_folder", "train_json", "val_json")},
@@ -1605,6 +1677,16 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
 
 
 # ----------------------------------------------------------------- dry run
+
+
+def _init_state(model: str, path: Path) -> str:
+    if not path.is_file():
+        return "MISSING — --fetch-weights"
+    try:
+        check_init_weights(model, path)
+    except B.ConfigError:
+        return "WRONG FILE — sha256 differs from the pin"
+    return "present, sha256 ok"
 
 
 def dry_run(config_path: Path, device: Optional[str] = None, overrides: Optional[dict] = None,
@@ -1640,7 +1722,8 @@ def dry_run(config_path: Path, device: Optional[str] = None, overrides: Optional
             f"{s.ema_decay}, ramp {s.ema_warmups} it; lr {s.lr} (backbone {s.backbone_lr})",
             "", "## init weights",
             f"{eff['model']} ({spec['init']}): "
-            + (f"{p.init_path} ({'present' if p.init_path.is_file() else 'MISSING — --fetch-weights'})"
+            + (f"{p.init_path} ({_init_state(eff['model'], p.init_path)}; sha256 pinned "
+               f"{spec['sha256'][:16]}…, DEIM's {spec['drive_name']})"
                if p.init_path else "random init (plumbing only)"),
             "", f"## override ({p.override_path})", render_override(p.override, _override_header(p)).rstrip()]
     if state == "ok":
@@ -1728,9 +1811,47 @@ def _force_torchscript_onnx_exporter() -> None:
     torch.onnx.export = export
 
 
+def tuning_load_problem(matched: int, total: int, path: str) -> Optional[str]:
+    if total and matched / total >= MIN_TUNING_MATCH:
+        return None
+    return (f"the init checkpoint {path} fills only {matched}/{total} tensors of the model "
+            f"(< {MIN_TUNING_MATCH:.0%}): it is another network than the base config, and DEIM "
+            "would fine-tune from mostly random weights without an error")
+
+
+def _guard_tuning_load() -> None:
+    """DEIM's load_tuning_state keeps only the checkpoint tensors whose name and
+    shape match the model and loads them with strict=False, so a checkpoint
+    of another network "loads" without an error. Count what it matched and
+    stop the run unless that is (nearly) the whole model."""
+    from engine.solver._solver import BaseSolver
+
+    matched_state, load_tuning_state = BaseSolver._matched_state, BaseSolver.load_tuning_state
+    seen: dict = {}
+
+    def counting(state, params):
+        stat, infos = matched_state(state, params)
+        seen.update(matched=len(stat), total=len(state))
+        return stat, infos
+
+    def guarded(self, path):
+        seen.clear()
+        load_tuning_state(self, path)
+        problem = tuning_load_problem(seen.get("matched", 0), seen.get("total", 0), path)
+        if problem:
+            raise RuntimeError(problem)
+        print(f"zander: the init checkpoint fills {seen['matched']}/{seen['total']} model tensors "
+              "(the rest, class heads, start fresh)", flush=True)
+
+    BaseSolver._matched_state = staticmethod(counting)
+    BaseSolver.load_tuning_state = guarded
+
+
 def _worker_train(deim_dir: str, train_args: list) -> int:
     _enter_deim(deim_dir)
     _register_extra_transforms()
+    if "-t" in train_args:
+        _guard_tuning_load()
     import runpy
 
     script = str(Path(deim_dir) / "train.py")
@@ -1771,8 +1892,13 @@ def _worker_export(deim_dir: str, config: str, checkpoint: str, out: str) -> int
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     # DEIM's own main(): YAMLConfig(config, resume=ckpt) -> load EMA weights ->
-    # model.deploy() + postprocessor.deploy() (top-300) -> onnx (opset 16) -> checker
-    module.main(_ap.Namespace(config=config, resume=str(stripped_path), check=True, simplify=False))
+    # model.deploy() + postprocessor.deploy() (top-300) -> onnx (opset 16) -> checker.
+    # Autograd off: main() runs a batch-32 640-px forward and traces at batch
+    # 32; with autograd on, both keep every activation for a backward that never
+    # comes (measured peak 32.5 GB vs 3.5 GB, byte-identical ONNX) and a Colab
+    # VM without High-RAM OOM-kills the export after the whole training.
+    with torch.no_grad():
+        module.main(_ap.Namespace(config=config, resume=str(stripped_path), check=True, simplify=False))
     produced = out_dir / "last.onnx"
     if not produced.is_file():
         raise RuntimeError(f"DEIM export wrote no {produced}")
@@ -1811,7 +1937,9 @@ def _worker_parity(deim_dir: str, config: str, checkpoint: str, onnx_path: str, 
     summary = {
         "tiles": len(rows), "reference": "torch fp32 CPU, EMA weights, deploy mode",
         "score_floor": PARITY_SCORE_FLOOR, "score_tol": PARITY_SCORE_TOL, "min_iou_required": PARITY_MIN_IOU,
+        "box_tol_px": PARITY_BOX_TOL_PX,
         "compared": sum(r["compared"] for r in rows), "mismatches": sum(r["mismatches"] for r in rows),
+        "degenerate": sum(r["degenerate"] for r in rows),
         "max_score_diff": max((r["max_score_diff"] for r in rows), default=0.0),
         "max_box_diff_px": max((r["max_box_diff_px"] for r in rows), default=0.0),
         "min_iou": min((r["min_iou"] for r in rows if r["min_iou"] is not None), default=None),
