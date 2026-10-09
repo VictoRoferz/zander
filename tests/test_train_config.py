@@ -584,6 +584,7 @@ def test_resume_checks_the_checkpoints_own_train_args():
     assert "epochs=60" in U.train_args_mismatch(dict(ok, epochs=60), eff)
     assert "seed" in U.train_args_mismatch(dict(ok, seed=1), eff)
     assert "imgsz" in U.train_args_mismatch(dict(ok, imgsz=1280), eff)
+    assert U.train_args_mismatch(dict(ok, imgsz=672), dict(eff, imgsz=650)) is None  # check_imgsz rounding
     for halved in (8, 4, 2, 1):  # Ultralytics' first-epoch OOM recovery halves the batch
         assert U.train_args_mismatch(dict(ok, batch=halved), eff) is None, halved
     for wrong in (12, 32):

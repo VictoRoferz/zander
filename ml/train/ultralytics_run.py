@@ -282,6 +282,7 @@ class StartPlan:
 # them from last.pt and ignores ours); they must match the effective config.
 TRAIN_ARG_KEYS = ("epochs", "imgsz", "seed", "batch")
 OOM_HALVINGS = 8  # Ultralytics halves the batch after a first-epoch OOM (up to 3x per process)
+MAX_STRIDE = 32   # YOLO's largest stride: train_args.imgsz is rounded up to a multiple of it
 
 
 def probe_checkpoint(pt: Path) -> CkptState:
@@ -327,13 +328,17 @@ def train_args_mismatch(train_args: Optional[dict], eff: dict) -> Optional[str]:
 
     batch may be the config's batch halved k times (Ultralytics' first-epoch
     OOM recovery; the bundle records it as batch_effective). An auto batch
-    (batch < 1) is resolved by Ultralytics and not compared."""
+    (batch < 1) is resolved by Ultralytics and not compared. imgsz may be
+    rounded up to the model stride (check_imgsz stores the rounded value)."""
     if not train_args:
         return None
     for key in ("epochs", "imgsz", "seed"):
         have, want = train_args.get(key), eff.get(key)
-        if have is not None and want is not None and have != want:
-            return f"checkpoint trained with {key}={have!r}, the config says {want!r}"
+        if have is None or want is None or have == want:
+            continue
+        if key == "imgsz" and isinstance(want, int) and have == -(-want // MAX_STRIDE) * MAX_STRIDE:
+            continue
+        return f"checkpoint trained with {key}={have!r}, the config says {want!r}"
     have, want = train_args.get("batch"), eff.get("batch")
     if (have is not None and isinstance(want, int) and not isinstance(want, bool) and want >= 1):
         allowed = {max(want >> k, 1) for k in range(OOM_HALVINGS)}
