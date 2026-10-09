@@ -19,6 +19,9 @@ the bundle records, and its sha256 is the run's identity):
     leak) — so every run bundles its LAST epoch. dev_all refuses `best`
     outright: its "val" (fold0_val) is inside dev_all_train.
   - extra.patience: 0 — early stopping off (0 = never stop in Ultralytics).
+  - batch: Ultralytics silently halves it after a CUDA OOM in the first epoch
+    of a process; meta.json records what last.pt says it trained with as
+    `batch_effective`, and a mismatch is logged as a loud WARNING.
   - deterministic: true (configurable).
   - export: {opset: 17, raw_variant: auto}. model.onnx is the default export
     (YOLO26: the NMS-free one-to-one head (1,300,6) = layout "e2e"; YOLO11: the
@@ -321,6 +324,13 @@ def train_args_mismatch(train_args: Optional[dict], eff: dict) -> Optional[str]:
         if have not in allowed:
             return f"checkpoint trained with batch={have!r}, the config says {want!r}"
     return None
+
+
+def batch_trained(pt: Path) -> Optional[int]:
+    """The batch a checkpoint says it trained with (train_args.batch), or None."""
+    state = probe_checkpoint(pt)
+    batch = (state.train_args or {}).get("batch")
+    return int(batch) if isinstance(batch, (int, float)) and not isinstance(batch, bool) else None
 
 
 def read_sidecar(directory: Path) -> Optional[dict]:
@@ -911,6 +921,13 @@ def run(
             f"{name}: the checkpoint was trained on dataset_fingerprint "
             f"{sidecar.get('dataset_fingerprint')!r}, today's tiles are {fingerprint!r} — not bundled"
         )
+    batch_effective = batch_trained(run_dir / "weights" / "last.pt")
+    if batch_effective is not None and batch_effective != eff["batch"]:
+        logger.warning(
+            f"WARNING {name}: trained with batch {batch_effective}, but the config says {eff['batch']} "
+            "(Ultralytics halves the batch after a CUDA out-of-memory error). meta.json records "
+            "batch_effective; this model is NOT config-equivalent to its fold siblings"
+        )
 
     t_export = time.time()
     onnx_main, onnx_raw = export_onnx(
@@ -927,6 +944,7 @@ def run(
         extra={
             "deterministic": eff["deterministic"],
             "final_weights": final_weights,
+            "batch_effective": batch_effective,
             "runtime": B.to_jsonable(runtime),
             "export_seconds": export_seconds,
             "toolchain": f"{settings.toolchain_name} {settings.toolchain_version}",

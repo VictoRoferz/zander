@@ -762,6 +762,40 @@ def test_run_records_the_fingerprint_and_never_bundles_old_data():
         logging.disable(logging.NOTSET)
 
 
+def test_run_records_the_batch_the_trainer_really_used():
+    # T6: Ultralytics halves the batch after a first-epoch CUDA OOM without
+    # failing; meta.json must say so (batch_effective) and the log must shout
+    import logging
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    d = _tmp()
+    cfg = _run_cfg(d)
+    grab = Grab()
+    U.logger.addHandler(grab)
+    try:
+        with FakeRunner("f3" * 32):
+            _new_vm()
+            meta = B.read_bundle_meta(U.run(cfg, device="cpu"))
+            assert meta["batch"] == 16 and meta["batch_effective"] == 16, meta
+            assert not [m for m in grab.lines if "batch_effective" in m]
+            _new_vm()
+            FakeYOLO.batch_used = 8
+            meta = B.read_bundle_meta(U.run(cfg, device="cpu"))
+            assert meta["batch"] == 16 and meta["batch_effective"] == 8, meta
+            assert meta["config_sha256"] == B.config_sha256(U.resolve_config(B.load_config(cfg)))
+    finally:
+        U.logger.removeHandler(grab)
+    loud = [m for m in grab.lines if "batch_effective" in m]
+    assert len(loud) == 1 and "WARNING" in loud[0] and "batch 8" in loud[0], grab.lines
+
+
 def test_truncate_results_csv():
     d = _tmp()
     p = d / "results.csv"

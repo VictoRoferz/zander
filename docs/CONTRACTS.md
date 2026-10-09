@@ -231,6 +231,7 @@ inspector/.env
   - `attempts: [{gpu, started, seconds, resumed}]`, `config_sha256`, `overrides`
   - `onnx: {file, sha256, opset, layout: raw|e2e|deim, output_shapes}`, `onnx_raw: {...}|null`
   - `versions: {python, torch, cuda, ultralytics | deim_commit}`, `created`
+  - `batch_effective` (Ultralytics bundles): the batch `last.pt` says it trained with. Ultralytics halves the batch after a CUDA OOM in a process's first epoch without failing, so it can be lower than `batch`; the runner and the matrix warn loudly then. Missing or null = unknown (older bundles, DEIM); readers then fall back to `batch`.
 - **Naming:**
   - Config `name`: `<arch>_<schema>_fold<k>` or `<arch>_<schema>_devall`.
   - Family: `<arch>_<schema>`, e.g. `yolo26n_def3`.

@@ -80,14 +80,15 @@ class FakeLauncher:
             (mirror / "last.pt").write_bytes(b"ckpt")
             shutil.rmtree(run_dir)  # a new VM: nothing local survives
             return M.LaunchResult(75, "epoch 1/2 done\nsimulated disconnect")
-        if action == "ok":
+        if action in ("ok", "ok_halved"):
             side["attempts"].append({"started": B.utc_now(), "start_epoch": start, "end_epoch": 2,
                                      "resumed": resumed, "gpu": "fake", "seconds": 120.0})
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "zander_run.json").write_text(json.dumps(side))
             meta = {"run_name": name, "bundle_version": 2, "config_sha256": req.item.config_sha,
                     "dataset_fingerprint": req.item.fingerprint,
-                    "epochs_completed": 2, "attempts": side["attempts"]}
+                    "epochs_completed": 2, "attempts": side["attempts"], "batch": 8,
+                    "batch_effective": 4 if action == "ok_halved" else 8}
             zip_path, _ = B.write_bundle(req.run_root / f"{name}_bundle.zip", {
                 "config.yaml": "name: x\n", "meta.json": json.dumps(meta), "metrics.json": "{}",
                 "model.onnx": b"onnx", "last.pt": b"weights"})
@@ -139,6 +140,18 @@ def test_ok_run_is_published_and_logged():
     assert ok["resumed"] is False and ok["epochs_completed"] == 2 and ok["epochs_this_attempt"] == 2
     assert ok["gpu"] and ok["git_sha"] and ok["error_tail"] is None
     assert "yolo26n_def3_fold0" in out and " ok " in out  # summary table
+
+
+def test_an_oom_halved_batch_is_warned_about():
+    # T6: the runner records batch_effective; the matrix makes a mismatch visible
+    drive, cfgs = _fresh("yolo26n_def3_fold0", "yolo26n_def3_fold1")
+    fake = FakeLauncher({"yolo26n_def3_fold0": ["ok_halved"], "yolo26n_def3_fold1": ["ok"]})
+    rc, out = _run(_argv(drive, cfgs), fake)
+    assert rc == 0, out
+    ok = {r["run_name"]: r for r in _log(drive) if r["status"] == "ok"}
+    assert "batch 4" in ok["yolo26n_def3_fold0"]["warning"] and ok["yolo26n_def3_fold1"]["warning"] is None
+    assert "WARNING yolo26n_def3_fold0" in out and "WARNING yolo26n_def3_fold1" not in out
+    assert M.batch_warning({"batch": 16}) is None and M.batch_warning({"batch": 16, "batch_effective": 16}) is None
 
 
 def test_failure_never_stops_the_loop_and_exits_1():

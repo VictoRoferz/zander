@@ -522,6 +522,17 @@ def _is_file(path: Path) -> bool:
         return False
 
 
+def batch_warning(meta: dict) -> Optional[str]:
+    """Ultralytics halves the batch after a CUDA OOM in the first epoch of a
+    process (meta["batch_effective"] = what last.pt says it trained with)."""
+    have, want = meta.get("batch_effective"), meta.get("batch")
+    if have is None or want is None or have == want:
+        return None
+    return (f"trained with batch {have}, but the config says {want} (Ultralytics halves the batch "
+            "after a CUDA out-of-memory error) — not equivalent to its fold siblings; retrain it on "
+            "a GPU with more memory or report it")
+
+
 class Matrix:
     def __init__(self, args, items: list, launcher: Launcher, run_root: Path):
         self.args = args
@@ -670,12 +681,16 @@ class Matrix:
                     meta = B.read_bundle_meta(local_zip)
                     common["epochs_completed"] = meta.get("epochs_completed", epochs_completed)
                     # mirror/<run>/ stays until a later session has read the bundle back (step 3)
-                    rec = self.record(item, status="ok", ended=utc_now(), bundle_sha256=sha, **common)
+                    warning = batch_warning(meta)
+                    rec = self.record(item, status="ok", ended=utc_now(), bundle_sha256=sha,
+                                      warning=warning, **common)
                     outcome.records.append(rec)
                     outcome.status, outcome.epochs_completed = "ok", common["epochs_completed"]
-                    outcome.note = f"bundle {sha[:12]}"
+                    outcome.note = f"bundle {sha[:12]}" + (f"; WARNING: {warning}" if warning else "")
                     self.book.add(item.family, item.arch, minutes, this_attempt)
                     _say(f"[matrix] {item.name}: OK in {minutes:.1f} min -> {self.bundles / local_zip.name}")
+                    if warning:
+                        _say(f"[matrix] WARNING {item.name}: {warning}")
                     return outcome
                 except Exception as e:
                     error = f"publishing the bundle failed: {type(e).__name__}: {e}"
