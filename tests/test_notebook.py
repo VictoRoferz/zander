@@ -246,6 +246,24 @@ def test_the_fingerprint_check_cannot_pass_on_a_failed_rebuild():
         raise AssertionError("a different fingerprint passed")
 
 
+def test_summary_survives_a_torn_log_line():
+    # the summary cell runs right before the Drive flush: if it raised, Run all
+    # would stop before flushing (a VM that died mid-append leaves a torn line)
+    d = Path(tempfile.mkdtemp(prefix="zander_test_nb_"))
+    try:
+        (d / "matrix_log.jsonl").write_text(
+            json.dumps({"run_name": "yolo26n_def3_fold0", "status": "ok", "minutes": 60.0,
+                        "epochs_completed": 120, "ended": "2026-10-09T10:00:00Z"}) + "\n"
+            + '{"run_name": "yolo26n_def3_fold1", "sta')
+        ns = {"DRIVE_DIR": str(d), "REPO": str(ROOT), "MATRIX": [], "FINAL": None, "DEIM_MATRIX": []}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            exec(compile(_stub_ipython(_cell("summary")), "<summary>", "exec"), ns)
+        assert "yolo26n_def3_fold0" in out.getvalue() and "1.0 GPU-hours" in out.getvalue(), out.getvalue()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_markdown_states_honest_timings():
     md = "\n".join(_src(c) for c in _nb()["cells"] if c["cell_type"] == "markdown")
     for needle in ("50–90 min", "35 %", "11–17 h", "55–85 compute units", "2 sessions",
