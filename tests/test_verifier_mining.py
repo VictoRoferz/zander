@@ -375,6 +375,69 @@ def test_test_bucket_gate():
             del run_eval.check_test_ledger
 
 
+def test_cascade_eval_guards_run_before_anything_is_loaded():
+    """cascade-eval: dev folds / train_always / no bucket are refused (stage 2
+    was fitted on fold0..2), and the detector passes run_eval's guards — all
+    before the verifier or a photo is loaded (no stacker.json exists here)."""
+    from dataprep.split import load_split
+    from eval import run_eval
+    from verifier import cascade_eval
+    from verifier.common import Refusal
+
+    split_id = load_split()["split_id"]
+
+    def bundle(name, fold, **over):
+        d = settings.bundles_dir / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.onnx").write_bytes(f"model-{name}".encode())
+        meta = {"bundle_version": 2, "run_name": name, "family": "cfam_def3", "fold": fold,
+                "framework": "ultralytics", "adapter": "ultralytics", "schema": "def3",
+                "classes": NAMES, "split_id": split_id, **over}
+        (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return d / "model.onnx"
+
+    def refused(model, bucket, *needles, schema="def3"):
+        try:
+            cascade_eval.run("no_such_vrun", model, schema=schema, bucket=bucket,
+                             operating_point=TMP / "op.json")
+        except Refusal as e:
+            for n in needles:
+                assert n in str(e), f"{n!r} not in: {e}"
+            return
+        raise AssertionError(f"bucket {bucket!r} with {model.parent.name} must be refused")
+
+    devall, fold0 = bundle("cfam_def3_devall", "dev_all"), bundle("cfam_def3_fold0", "fold0")
+    for b in ("fold0", "fold1", "fold2"):
+        refused(fold0, b, "in-sample", "fold")
+    refused(devall, "train_always", "training data")
+    refused(devall, None, "--bucket")
+    refused(fold0, "test", "dev_all")  # test is the dev_all model's one-shot look
+    other = bundle("cfam_def3_devall_s1", "dev_all", split_id="split_v1")
+    refused(other, "probe_xprod", "split")
+    nal = bundle("cfam_nal1_devall", "dev_all", schema="nal1", classes=NAMES[:1])
+    refused(nal, "future", "schema")
+    refused(TMP / "missing" / "model.onnx", "test", "not found")
+    # the dev_all model passes the detector guards and only then reaches the verifier
+    try:
+        cascade_eval.run("no_such_vrun", devall, bucket="test", operating_point=TMP / "op.json")
+        raise AssertionError("no stacker.json: must fail")
+    except Refusal as e:
+        raise AssertionError(f"the dev_all model must pass the detector guards: {e}")
+    except (FileNotFoundError, ValueError):
+        pass
+    from verifier.cli import build_parser
+
+    for argv in (["--bucket", "fold0"], []):  # the CLI has no default bucket
+        try:
+            build_parser().parse_args(["cascade-eval", "--model", "m.onnx", *argv])
+            raise AssertionError(f"cascade-eval {argv} must be a usage error")
+        except SystemExit as e:
+            assert e.code == 2
+    csv = settings.reports_dir / run_eval.RESULTS_FILE
+    assert not any(settings.eval_dir.glob("cfam*")), "nothing may be written"
+    assert csv.exists() is False or "cfam" not in csv.read_text(encoding="utf-8")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

@@ -23,6 +23,9 @@ from typing import Any
 from config.settings import REPO_ROOT, settings
 
 FOLDS = ("fold0", "fold1", "fold2")
+# cascade-eval buckets: never a dev fold (stage 2 was fitted on fold0..2) or
+# train_always (the detector's training data); all need a frozen threshold.
+CASCADE_BUCKETS = ("test", "probe_xprod", "future")
 VRUN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 CANDIDATES = "candidates.json"

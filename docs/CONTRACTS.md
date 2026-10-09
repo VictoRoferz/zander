@@ -302,6 +302,7 @@ inspector/.env
 - **Plug-in point:** `TiledDetector(conf_floor=0.001).detect(rgb)` → `verifier.rescore(rgb, det)` → `photo_verdict(threshold=t*)`.
 - **Working files** (internal to WP-verifier), in `ml_data/verifier/<vrun>/`: `candidates.json`, `windows.npy` (+ index), `oof_scores.json`, `verifier.onnx`, `stacker.json`, `exit_report.{md,json}`, `train_log.json`.
 - **Entry point:** `verifier.cli.main(argv: list[str]) -> int`; module CLI `python verifier/cli.py`.
+- **`cascade-eval` buckets:** only `test`, `probe_xprod` and `future` (all with `--operating-point`, threshold = the stacker's t*). A dev fold is refused (S_final, tau_final and V_final were fitted on fold0..2, so stage 2 would be in-sample; the cross-fit runs `<F>+<vrun>_fold<k>` are the out-of-fold numbers), and so is `train_always`. The detector must pass `run_eval.check_eval_guards` without override (test: the dev_all model only) and belong to the verifier's family.
 - **Test policy:** a cascade test evaluation requires `stacker.json.exit.decision == "ship"`; its ledger key is `sha256("cascade:<detector sha>:<stacker sha>")`, so evaluating the cascade after the detector's own test look counts as a second look and needs `--second-look "<reason>"`. `stacker.json.exit` is null until the exit rule has run.
 
 ### 8.5 Colab and Drive layout

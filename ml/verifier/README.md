@@ -25,8 +25,10 @@ python verifier/cli.py crops --run-name v1
 python verifier/cli.py crossfit --run-name v1 --device mps   # op: ml_data/eval/operating_point_<schema>_<F>.json
 python verifier/cli.py export --run-name v1
 python verifier/cli.py exit --run-name v1
-# detector + verifier on any bucket (test refused until run_eval.check_test_ledger exists):
-python verifier/cli.py cascade-eval --run-name v1 --model <detector.onnx> --bucket fold0
+# detector + verifier on test / probe_xprod / future only (dev folds are refused: stage 2
+# was fitted on them, the cross-fit runs are the out-of-fold numbers; test only after "ship"):
+python verifier/cli.py cascade-eval --run-name v1 --model <dev_all detector.onnx> --bucket test \
+  --operating-point ../ml_data/eval/operating_point_def3_<F>.json
 ```
 
 `python cli.py verifier ...` (ml/cli.py) delegates to `verifier.cli.main(argv)`.
