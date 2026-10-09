@@ -114,8 +114,14 @@ def stacker_rows(plan: dict, k: str, row_ids, row_folds) -> list[tuple[int, str]
 # ------------------------------------------------------------------ helpers
 
 
-def load_operating_point(path: Optional[Path], cand: dict) -> tuple[float, dict]:
-    """t* = the family's frozen detector threshold (operating_point.json)."""
+def load_operating_point(path: Optional[Path], cand: dict,
+                         target_sensitivity: float) -> tuple[float, dict]:
+    """t* = the family's frozen detector threshold (operating_point.json).
+
+    It must be THE pre-registered anchor: the candidates' family, the
+    pre-registered target sensitivity (choose-op rule) and frozen on exactly
+    the three fold models that proposed the candidates (op sources' model
+    sha256s). A mismatch is refused, except for a smoke run (warning)."""
     schema, family = cand["schema"], cand["family"]
     if path is None:
         path = settings.eval_dir / f"operating_point_{schema}_{family}.json"
@@ -132,17 +138,31 @@ def load_operating_point(path: Optional[Path], cand: dict) -> tuple[float, dict]
         raise ValueError("operating point class_names differ from the candidates'")
     runs = sorted(r["eval_run"] for r in cand["runs"])
     same = (op.get("family") == family) if op.get("family") else sorted(op.get("runs") or []) == runs
+    problems = []
     if not same:
-        msg = (f"operating point {path.name} belongs to family {op.get('family')!r} / runs "
-               f"{op.get('runs')}, not {family!r} / {runs}")
+        problems.append(f"operating point {path.name} belongs to family {op.get('family')!r} / "
+                        f"runs {op.get('runs')}, not {family!r} / {runs}")
+    ts = op.get("target_sensitivity")
+    if ts is None or abs(float(ts) - target_sensitivity) > 1e-12:
+        problems.append(f"operating point {path.name} was chosen at target sensitivity {ts!r}, "
+                        f"the pre-registered rule is {target_sensitivity}")
+    op_shas = sorted(str(s.get("model_sha256")) for s in op.get("sources") or [])
+    cand_shas = sorted(str(r.get("model_sha256")) for r in cand["runs"])
+    if op_shas != cand_shas:
+        problems.append(
+            f"operating point {path.name} was frozen on the models "
+            f"{[x[:12] for x in op_shas] or '(no sources: a v1 operating point)'}, the candidates "
+            f"come from {[x[:12] for x in cand_shas]} — not the same three fold models")
+    if problems:
         if not cand["smoke"]:
-            raise Refusal(msg)
-        logger.warning("SMOKE: " + msg)
+            raise Refusal("; ".join(problems))
+        logger.warning("SMOKE: " + "; ".join(problems))
     t = float(op["threshold"])
     if not (0.0 < t < 1.0):
         raise ValueError(f"operating point threshold {t} not in (0, 1)")
     return t, {"file": str(path.resolve()), "sha256": sha256_file(path), "threshold": t,
-               "family": op.get("family"), "runs": op.get("runs"), "rule": op.get("rule")}
+               "family": op.get("family"), "runs": op.get("runs"), "rule": op.get("rule"),
+               "target_sensitivity": ts, "source_model_sha256s": op_shas}
 
 
 def _photo_index(cand: dict) -> dict:
@@ -213,7 +233,7 @@ def run(
     stack = list(cand["stack_classes"])
     if not stack:
         raise RuntimeError("no stacked class (every class is passthrough) — nothing to cross-fit")
-    t_star, op_info = load_operating_point(operating_point, cand)
+    t_star, op_info = load_operating_point(operating_point, cand, cfg.exit.target_sensitivity)
     dev = pick_device(device)
     plan = make_plan()
     check_plan(plan)

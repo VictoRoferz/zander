@@ -92,3 +92,22 @@ seated and handheld iO photos, rescued photos.
   their exit numbers; re-tuning tau, hi-passthrough, C, epochs or the
   configuration on the folds; any test-bucket evaluation before a "ship" and
   the test ledger.
+
+## Implementation corrections before the first real run, 2026-10-09
+
+A code review found places where the code did not enforce what this file
+already says. They were fixed **before any real (non-smoke) verifier run**. No
+threshold, metric, endpoint or decision rule above changed; each item only
+makes the code do what the text says.
+
+- **Anchor = the family's frozen operating point** (Frozen protocol,
+  "anchor"). `crossfit` matched the operating point by family only. It now
+  also refuses one whose `target_sensitivity` differs from the pre-registered
+  0.95 (or is missing) and one not frozen on exactly the three fold models
+  that proposed the candidates (`sources[*].model_sha256`).
+- **The test bucket is not touched** (Scope) and the cross-fit numbers are the
+  out-of-fold ones. `cascade-eval` defaulted to `fold0`, where the final
+  stacker, tau and verifier (fitted on fold0..2) are in-sample, recorded a
+  results row there, and never ran the detector's eval guards. It now accepts
+  only `test` / `probe_xprod` / `future`, runs `run_eval.check_eval_guards`
+  (test: the dev_all detector only) and checks the detector's family.

@@ -246,6 +246,51 @@ def test_smoke_run_artifacts_respect_the_nesting_when_present():
             assert k not in doc["plan"]["models"][scorer]["train"]
 
 
+def test_operating_point_must_be_the_preregistered_anchor():
+    """t*: the candidates' family, the pre-registered target sensitivity and
+    the op frozen on exactly the three fold models that proposed them."""
+    from verifier.common import Refusal
+    from verifier.crossfit import load_operating_point
+
+    shas = [c * 64 for c in "abc"]
+    cand = {"schema": "def3", "family": "opfam", "class_names": NAMES, "smoke": False,
+            "runs": [{"eval_run": f"opfam_{k}", "bucket": k, "model_sha256": s}
+                     for k, s in zip(FOLDS, shas)]}
+
+    def op(name, **over):
+        doc = {"schema": "def3", "class_names": NAMES, "threshold": 0.31, "family": "opfam",
+               "runs": [f"opfam_{k}" for k in FOLDS], "target_sensitivity": 0.95,
+               "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
+               "sources": [{"eval_run": f"opfam_{k}", "fold": k, "model_sha256": s}
+                           for k, s in zip(FOLDS, shas)]}
+        doc.update(over)
+        for key in [k for k, v in over.items() if v is None]:
+            del doc[key]
+        path = TMP / "ops" / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    t, info = load_operating_point(op("good"), cand, 0.95)
+    assert t == 0.31 and info["target_sensitivity"] == 0.95 and info["source_model_sha256s"] == shas
+    bad = {
+        "other_target": op("t90", target_sensitivity=0.9),
+        "no_target": op("t_none", target_sensitivity=None),
+        "other_model": op("sha", sources=[{"eval_run": "x", "fold": "fold0", "model_sha256": "d" * 64},
+                                          *[{"model_sha256": s} for s in shas[1:]]]),
+        "v1_no_sources": op("v1", sources=None),
+        "other_family": op("fam", family="otherfam"),
+    }
+    for why, path in bad.items():
+        try:
+            load_operating_point(path, cand, 0.95)
+            raise AssertionError(f"{why}: must be refused")
+        except Refusal:
+            pass
+    # a smoke run only warns (its op is a smoke op by construction)
+    assert load_operating_point(bad["other_model"], {**cand, "smoke": True}, 0.95)[0] == 0.31
+
+
 # ------------------------------------------------------------------ cascade runs
 
 
