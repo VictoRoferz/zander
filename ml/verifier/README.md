@@ -87,7 +87,9 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python verifier/cli.py all \
    exit run with `--threads 0` and the pre-registered 20 latency photos, and all
    seven cross-fit models ImageNet-initialised (`train_log.json`). Anything else
    is `invalid-smoke`. An earlier report is never overwritten: it moves to
-   `exit_archive/<UTC stamp>/` and the new report lists it.
+   `exit_archive/<UTC stamp>/` and the new report lists it. The first valid
+   decision (ship / no-ship) of a vrun binds: a later exit only re-measures the
+   latency, so it is reported but cannot change `stacker.json.exit.decision`.
 
 ## Why nested
 

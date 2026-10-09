@@ -130,6 +130,10 @@ makes the code do what the text says.
 - **"Every run is reported"**. A second `exit` overwrote the first report.
   Now an existing report moves to `exit_archive/<UTC stamp>/`, and the new
   report and `stacker.json.exit.earlier_decisions` list every earlier one.
+  Re-running `exit` only re-measures the latency (everything else is
+  deterministic), so the **first valid decision binds**: a later exit is
+  reported (`run_decision`) but cannot change `stacker.json.exit.decision`,
+  which gates the cascade test bucket.
 - **Secondary (b) "≥ 30 % fewer"**. `casc_fa <= (1 - 0.30) * det_fa` in
   floating point made exactly 30 % fail (0.7 × 90 = 62.999…); it is now
   compared exactly in rationals (10 × cascade ≤ 7 × detector).

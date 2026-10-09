@@ -440,6 +440,15 @@ def run(vrun: str, cfg=None, threads: int = 0, latency_photos: Optional[int] = N
     reasons = invalid_reasons(cand, oof, train_log, exit_run)
     decision = decide(reasons, lat["gate"]["passed"], primary["passed"], secondary["passed"])
     earlier = archive_reports(d)
+    # The first valid decision of a vrun binds. Everything but the latency is
+    # deterministic, so a later exit only re-measures (c): re-running until the
+    # gate passes must not turn an earlier no-ship into a ship. Every later run
+    # is still reported (`decision` = this run's own outcome).
+    first_valid = next((e for e in earlier if e["decision"] in ("ship", "no-ship")), None)
+    binding = first_valid["decision"] if first_valid else decision
+    if binding != decision:
+        logger.warning(f"this exit says {decision!r}, but the first valid decision of {vrun} "
+                       f"({first_valid['archive']}) binds: {binding!r}")
     report = {
         "vrun": vrun, "created": utc_now(), "decision": decision, "invalid_reasons": reasons,
         "rule": "ship iff latency gate AND (primary OR secondary)",
@@ -457,12 +466,15 @@ def run(vrun: str, cfg=None, threads: int = 0, latency_photos: Optional[int] = N
         "git": {step: {"sha": doc.get("git_sha"), "dirty": doc.get("git_dirty")}
                 for step, doc in (("mine", cand), ("crossfit", oof), ("exit", exit_run))},
         "earlier_reports": earlier,
+        "binding_decision": binding,
+        "binding_from": first_valid["archive"] if first_valid else None,
     }
     write_json_atomic(d / EXIT_JSON, report)
     write_bytes_atomic(d / EXIT_MD, format_report(report).encode("utf-8"))
     sdoc = read_json(stacker_path)
-    sdoc["exit"] = {"decision": decision, "report": EXIT_MD, "reasons": reasons,
-                    "decided": report["created"],
+    sdoc["exit"] = {"decision": binding, "report": EXIT_MD, "reasons": reasons,
+                    "decided": report["created"], "run_decision": decision,
+                    "binding_from": report["binding_from"],
                     "earlier_decisions": [e["decision"] for e in earlier]}
     write_json_atomic(stacker_path, sdoc)
     Verifier(stacker_path, expected_class_names=names)
@@ -501,6 +513,9 @@ def format_report(r: dict) -> str:
             f"- **{len(r['earlier_reports'])} earlier exit report(s) of this run** (kept in "
             f"`{EXIT_ARCHIVE}/`, every exit is reported): "
             + ", ".join(f"{e['created']} {e['decision']}" for e in r["earlier_reports"]))
+    if r["binding_decision"] != r["decision"]:
+        lines.append(f"- **Binding decision: {r['binding_decision'].upper()}** — the first valid "
+                     f"exit of this run (`{r['binding_from']}`) decides; this run is reported only")
     lines += [
         "",
         "## (a) Primary — NAL recall @ 0.5 FPPI, pooled held-out folds",

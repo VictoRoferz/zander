@@ -286,7 +286,7 @@ inspector/.env
   - `top_k: 50, candidate_floor: 0.001`, `detector_threshold`, `crop{...}`
   - `features: ["det_logit","ver_logit","log_area","seam_margin"]`
   - `classes: {<name>: {"mode":"stack", mean, std, coef, intercept, tau, hi_passthrough} | {"mode":"passthrough"}}`
-  - `anchor: "piecewise_linear"`, `knn: null`, `provenance{...}`, `exit{decision: ship|no-ship|invalid-smoke, report, reasons, decided, earlier_decisions}`
+  - `anchor: "piecewise_linear"`, `knn: null`, `provenance{...}`, `exit{decision: ship|no-ship|invalid-smoke, report, reasons, decided, run_decision, binding_from, earlier_decisions}` (`decision` = the first valid exit decision of the vrun, which binds; `run_decision` = the latest exit's own outcome)
 - **Features:**
   - `det_logit = logit(clip(s,1e-6,1-1e-6))`
   - `ver_logit` = the logit of the candidate's class head

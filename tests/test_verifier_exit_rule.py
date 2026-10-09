@@ -249,6 +249,32 @@ def test_earlier_reports_are_archived_never_overwritten():
     assert sdoc["exit"]["earlier_decisions"] == ["no-ship", "ship"]
 
 
+def test_first_valid_decision_binds():
+    """A later exit only re-measures latency: re-running until the gate passes
+    must not turn the first valid no-ship into a ship (it is still reported)."""
+    reset()  # slow verifier: no-ship
+    first = run_exit("e_bind")
+    assert first["decision"] == first["binding_decision"] == "no-ship"
+    assert first["binding_from"] is None
+    reset(primary=True, ver_ms=100.0, det_ms=700.0)  # "faster" on the re-run
+    second = exit_rule.run("e_bind")
+    assert second["decision"] == "ship" and second["binding_decision"] == "no-ship"
+    assert second["binding_from"].startswith("exit_archive/")
+    d = vrun_dir("e_bind")
+    sdoc = json.loads((d / STACKER).read_text(encoding="utf-8"))
+    assert sdoc["exit"]["decision"] == "no-ship" and sdoc["exit"]["run_decision"] == "ship"
+    assert "Binding decision: NO-SHIP" in (d / EXIT_MD).read_text(encoding="utf-8")
+    # an invalid first exit binds nothing: the first VALID one decides
+    loose = load_config(overrides={"exit.fa_reduction": 0})
+    reset(primary=True, ver_ms=100.0, det_ms=700.0)
+    r = run_exit("e_bind2", cfg=loose)
+    assert r["decision"] == "invalid-smoke"
+    r = exit_rule.run("e_bind2")
+    assert r["decision"] == r["binding_decision"] == "ship" and r["binding_from"] is None
+    sdoc = json.loads((vrun_dir("e_bind2") / STACKER).read_text(encoding="utf-8"))
+    assert sdoc["exit"]["decision"] == "ship"
+
+
 # ------------------------------------------------------------------ V2: "as committed"
 
 
