@@ -679,6 +679,56 @@ def test_a_stale_mirror_never_pairs_a_new_sidecar_with_its_old_checkpoint():
         "an empty mirror dir is left alone"
 
 
+def test_a_drive_read_error_is_never_a_corrupt_checkpoint():
+    # a dropped Drive mount (ENOTCONN / EIO) while reading the mirror's last.pt
+    # says nothing about the checkpoint: the attempt fails (and is retried), the
+    # mirror is NOT moved aside and the run does not restart from scratch
+    try:
+        import torch
+    except ImportError:
+        print("   SKIP: torch not installed")
+        return
+    import errno
+
+    ck = _tmp() / "last.pt"
+    torch.save({"last_epoch": 2, "model": {"w": torch.zeros(1)}, "optimizer": {}}, str(ck))
+    assert D.probe_checkpoint(ck, 10) == D.CkptState("resumable", 3)
+    assert D.probe_checkpoint(ck, 3).kind == "finished"
+    assert D.probe_checkpoint(ck.with_name("none.pt"), 10).kind == "missing"
+    torn = ck.with_name("torn.pt")
+    torn.write_bytes(ck.read_bytes()[: ck.stat().st_size // 2])  # a tail-truncated write is corrupt
+    assert D.probe_checkpoint(torn, 10).kind == "corrupt"
+    foreign = ck.with_name("foreign.pt")
+    torch.save({"epoch": 4}, str(foreign))
+    assert D.probe_checkpoint(foreign, 10).kind == "corrupt"
+    real_read = Path.read_bytes
+
+    def dropped_mount(self):
+        if self.name == ck.name:
+            raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        return real_read(self)
+
+    with patched((Path, "read_bytes", dropped_mount)):
+        _raises(OSError, lambda: D.probe_checkpoint(ck, 10), "not connected")
+    if os.geteuid() == 0:
+        return  # root reads anything
+    side = {"format": 1, "config_sha256": "a" * 64, "attempts": [], "dataset_fingerprint": FP}
+    root = _tmp()
+    mirror = root / "mirror" / "deim_x"
+    mirror.mkdir(parents=True)
+    torch.save({"last_epoch": 6, "ema": {"module": {"w": torch.ones(1)}}}, str(mirror / "last.pt"))
+    U.write_sidecar(mirror, side)
+    assert D.plan_start(root / "run", "a" * 64, 10, mirror, fingerprint=FP).kind == "resume"
+    shutil.rmtree(root / "run")
+    (mirror / "last.pt").chmod(0)  # unreadable, like a dropped mount
+    try:
+        _raises(OSError, lambda: D.plan_start(root / "run", "a" * 64, 10, mirror, fingerprint=FP))
+    finally:
+        (mirror / "last.pt").chmod(0o644)
+    assert (mirror / "last.pt").is_file() and not list(mirror.parent.glob("deim_x.stale-*"))
+    assert not (root / "run").exists()
+
+
 def test_supervisor_mirrors_every_epoch_and_the_abort_hook():
     run, mirror = _tmp() / "run", _tmp() / "mirror"
     ck = _fake_ckpt(run / "output" / "last.pth", 0)
@@ -1062,6 +1112,7 @@ def test_bundle_from_fake_training_outputs():
             assert key in meta, key
         eff = D.resolve_config(B.load_config(cfg), {"epochs": 3})
         assert meta["config_sha256"] == B.config_sha256(eff)
+        assert meta["batch_effective"] == meta["batch"] == eff["batch"], meta  # both runners carry it
         with zipfile.ZipFile(zip_path) as zf:
             names = set(zf.namelist())
             assert {"config.yaml", "meta.json", "metrics.json", "model.onnx", "last.pt", "LICENSE_DEIM",

@@ -5,7 +5,8 @@ A tiny onnx.helper graph returns a CONSTANT raw Ultralytics head (1, 7, N)
 for every tile, so the full tiled pipeline runs on a synthetic 2616x1960
 photo with a known verdict (t=0.5: N.iO, classes NAL + Brücke). Covers the
 card round trip through infer/detector_card, the refusals (fold model, tiler,
-schema, config, missing test eval, v1 operating point, existing export), sha
+schema, config, stale operating point, missing test eval, v1 operating point,
+existing export), the choice of the test look recorded at this op, sha
 tampering, the parity check (reference mode, live floor mode, a forced
 mismatch, the v1 rounding tolerance) and the floor-equivalence property that
 makes conf_floor = threshold safe.
@@ -99,6 +100,13 @@ def _bundle(run: str, fold: str, with_model=True, rows=ROWS, **meta_over) -> Pat
     return d
 
 
+def _fold_model_sha(i: int) -> str:
+    """The model choose-op froze the op from: fold i's model.onnx (only fold0 has
+    one; a bundle without model and onnx.sha256 cannot be checked for staleness)."""
+    model = settings.bundles_dir / f"tiny_def3_fold{i}" / "model.onnx"
+    return registry.file_sha256(model) if model.is_file() else str(i) * 64
+
+
 def _op(name="operating_point_def3_tiny_def3.json", **over) -> Path:
     op = {"schema": "def3", "class_names": NAMES, "threshold": T,
           "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
@@ -106,7 +114,7 @@ def _op(name="operating_point_def3_tiny_def3.json", **over) -> Path:
           "created": "2026-09-28T00:00:00Z", "oof_level1": {"n_positive": 3},
           "family": "tiny_def3", "target_sensitivity": 0.95,
           "sources": [{"eval_run": f"tiny_def3_fold{i}", "bundle_run": f"tiny_def3_fold{i}",
-                       "fold": f"fold{i}", "model_sha256": str(i) * 64, "config_sha256": None,
+                       "fold": f"fold{i}", "model_sha256": _fold_model_sha(i), "config_sha256": None,
                        "dataset_fingerprint": "f" * 64} for i in range(3)]}
     op.update(over)
     for key in [k for k, v in over.items() if v is None]:
@@ -306,6 +314,51 @@ def test_cascade_run_is_not_the_detectors_test_eval():
     raw = json.loads((TMP / "x18" / "detector.json").read_text(encoding="utf-8"))
     assert raw["validation"]["test_eval_run"] == "tiny3_def3_devall__test"
     assert raw["validation"]["test_level1"]["n_positive"] == 3
+
+
+def test_the_matching_test_look_is_found_among_further_looks():
+    """A further test look is written to <bundle_run>__test__look<k>: export takes
+    the detector test eval that recorded THIS op's sha (the latest of several),
+    whatever look number it has; looks at another op never count."""
+    fresh = _bundle("tiny4_def3_devall", "dev_all", family="tiny_def3")
+    _tiny_onnx(fresh / "model.onnx", rows=ROWS[:-1] + [(610, 30, 20, 20, 0.42, 0.1, 0.1)])  # own sha
+    other_op = _op("op_look_other_t.json", threshold=0.4)
+    first = _eval_run("tiny4_def3_devall__test", fresh, "test", other_op)  # first look: another op
+    m = json.loads((first / "metrics.json").read_text())
+    (first / "metrics.json").write_text(json.dumps({**m, "threshold": 0.4}))
+    _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x19"), export.ExportError,
+            "tiny4_def3_devall__test", "another operating point")
+    # a look at another op cannot be waived: t would be chosen after seeing test
+    _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x24", no_test_eval=True), export.ExportError,
+            "tiny4_def3_devall__test", "cannot waive")
+    looks =[_eval_run(f"tiny4_def3_devall__test__look{k}", fresh, "test", OP) for k in (2, 3)]
+    for k, d in enumerate([first, *looks]):  # look3 written last
+        os.utime(d / "metrics.json", ns=(10 ** 18 + k, 10 ** 18 + k))
+    export.run(fresh, OP, out_dir=TMP / "x20")
+    raw = json.loads((TMP / "x20" / "detector.json").read_text(encoding="utf-8"))
+    assert raw["validation"]["test_eval_run"] == "tiny4_def3_devall__test__look3", raw["validation"]
+    assert raw["validation"]["overrides"] == [] and raw["validation"]["parity"]["mode"] == "reference"
+    # an explicitly named test eval must still be one at this op
+    _raises(lambda: export.run(fresh, OP, eval_run="tiny4_def3_devall__test", out_dir=TMP / "x21"),
+            export.ExportError, "another operating point")
+    export.run(fresh, OP, eval_run="tiny4_def3_devall__test__look2", out_dir=TMP / "x22")
+    raw = json.loads((TMP / "x22" / "detector.json").read_text(encoding="utf-8"))
+    assert raw["validation"]["test_eval_run"] == "tiny4_def3_devall__test__look2"
+
+
+def test_a_fold_bundle_replaced_after_choose_op_makes_the_op_stale():
+    """export runs the test eval's op <-> model check (run_eval.op_model_problems):
+    a fold bundle that no longer holds the model the op was frozen from is a
+    stale operating point."""
+    fold0 = settings.bundles_dir / "tiny_def3_fold0" / "model.onnx"
+    original = fold0.read_bytes()
+    try:
+        _tiny_onnx(fold0, rows=FOLD0_ROWS[:-1] + [(610, 30, 20, 20, 0.47, 0.1, 0.1)])  # re-imported
+        _raises(lambda: export.run(DEVALL, OP, out_dir=TMP / "x23", force=True), export.ExportError,
+                "tiny_def3_fold0 no longer holds", "stale operating point")
+    finally:
+        fold0.write_bytes(original)
+    export.run(DEVALL, OP, out_dir=TMP / "x23")
 
 
 def test_fold_model_and_v1_op_only_with_allow_fold_model():

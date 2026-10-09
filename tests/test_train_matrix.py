@@ -240,6 +240,56 @@ def test_mirror_is_kept_until_a_later_session_verified_the_bundle():
     assert rc == 0 and fake.calls == [] and not mirror.exists(), out
 
 
+def test_set_aside_mirrors_go_with_the_verified_bundle_only():
+    # the runners move an unusable mirror to mirror/<run>.stale-<UTC>/ (~165 MB for
+    # DEIM): it goes with mirror/<run>/ once a LATER session verified the run's
+    # bundle — never earlier, never another run's, never when Drive cannot be read
+    from train import ultralytics_run as U
+
+    drive, cfgs = _fresh("yolo26n_def3_fold0", "yolo26n_def3_fold1")
+    mirror = drive / "mirror"
+
+    def set_aside(name, stamp=None):
+        d = mirror / name
+        d.mkdir(parents=True)
+        (d / "last.pt").write_bytes(b"old weights")
+        return U.move_aside(d, stamp)  # the runners' own naming
+
+    own = [set_aside("yolo26n_def3_fold0"), set_aside("yolo26n_def3_fold0", "20261009T120000Z"),
+           set_aside("yolo26n_def3_fold0", "20261009T120000Z")]  # -> ...Z-1
+    assert own[2].name == "yolo26n_def3_fold0.stale-20261009T120000Z-1"
+    kept = [set_aside("yolo26n_def3_fold1"), set_aside("yolo26n_def3_fold0x"),
+            mirror / "yolo26n_def3_fold0.stale-keep-me", mirror / "yolo26n_def3_fold0.stale-20261009T130000Z"]
+    kept[2].mkdir()
+    kept[3].write_bytes(b"a file, not a set-aside folder")
+    assert M.stale_mirrors(mirror, "yolo26n_def3_fold0") == sorted(own)
+    rc, out = _run(_argv(drive, cfgs, "--max-attempts", "1"),
+                   FakeLauncher({"yolo26n_def3_fold0": ["ok"], "yolo26n_def3_fold1": ["fail"]}))
+    assert rc == 1 and all(d.exists() for d in own + kept), "the bundle was not read back yet"
+    # Drive unreadable while checking the bundle: nothing is deleted
+    real_sha = B.sha256_file
+    B.sha256_file = lambda path, *a, **kw: (_ for _ in ()).throw(OSError(5, "Input/output error"))
+    try:
+        rc, out = _run(_argv(drive, cfgs[:1]), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))
+    finally:
+        B.sha256_file = real_sha
+    assert rc == 1 and all(d.exists() for d in own + kept), out
+    # the next session verifies fold0's bundle: its set-aside folders go, nobody else's
+    rc, out = _run(_argv(drive, cfgs[:1]), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))
+    assert rc == 0 and _log(drive)[-1]["status"] == "skipped", out
+    assert not any(d.exists() for d in own) and all(d.exists() for d in kept), out
+    assert "set-aside resume state" in out
+    # a mirror folder that cannot be listed: the skip still succeeds, nothing is deleted
+    if os.geteuid() != 0:  # root lists anything
+        late = set_aside("yolo26n_def3_fold0")
+        mirror.chmod(0o300)  # no read permission: listing fails, the folder itself is reachable
+        try:
+            rc, out = _run(_argv(drive, cfgs[:1]), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))
+        finally:
+            mirror.chmod(0o755)
+        assert rc == 0 and late.exists() and "cannot list" in out, out
+
+
 def test_next_session_resumes_from_the_drive_mirror():
     drive, cfgs = _fresh("yolo26n_def3_fold0")
     rc, _ = _run(_argv(drive, cfgs, "--max-attempts", "1"), FakeLauncher({"yolo26n_def3_fold0": ["partial"]}))

@@ -483,6 +483,166 @@ def test_cascade_eval_guards_run_before_anything_is_loaded():
     assert csv.exists() is False or "cfam" not in csv.read_text(encoding="utf-8")
 
 
+def test_cascade_test_look_has_the_detector_evals_ledger_key():
+    """cascade-eval on test: the operating point goes through run_eval._load_op
+    (+ op_model_problems) before the ledger; the ledger row and the eval dir's
+    metrics.json carry the same key (cascade identity, op sha, candidate floor,
+    snapshot id, GT sha), so a ledger that lost the row still sees the look; a
+    further look never overwrites the first one's dir. Detector, verifier and
+    photos are stubs; no photo file is opened."""
+    import csv
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    import registry
+    from dataprep.ingest import load_manifest
+    from dataprep.split import load_split
+    from eval import run_eval
+    from verifier import cascade_eval
+    from verifier.common import Refusal, sha256_file, vrun_dir
+
+    committed = [ROOT / "ml" / "reports" / f for f in ("test_ledger.csv", run_eval.RESULTS_FILE)]
+    committed_before = [p.read_bytes() if p.exists() else None for p in committed]
+    split, fam, t, floor, vrun = load_split(), "kfam_def3", 0.3, 0.001, "kv"
+
+    def bundle(name, fold, payload):
+        d = settings.bundles_dir / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.onnx").write_bytes(payload)
+        meta = {"bundle_version": 2, "run_name": name, "family": fam, "fold": fold,
+                "framework": "ultralytics", "adapter": "ultralytics", "schema": "def3",
+                "classes": NAMES, "split_id": split["split_id"], "dataset_id": "ds_v2_def3"}
+        (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return d / "model.onnx"
+
+    folds = [bundle(f"{fam}_fold{k}", f"fold{k}", f"fold model {k}".encode()) for k in range(3)]
+    devall = bundle(f"{fam}_devall", "dev_all", b"the dev_all model")
+
+    def op(name, drop=(), **over):
+        doc = {"schema": "def3", "class_names": NAMES, "threshold": t, "split_id": split["split_id"],
+               "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
+               "runs": [f"{fam}_fold{k}" for k in range(3)], "family": fam, "target_sensitivity": 0.95,
+               "sources": [{"eval_run": f"{fam}_fold{k}", "bundle_run": f"{fam}_fold{k}", "fold": f"fold{k}",
+                            "model_sha256": registry.file_sha256(m)} for k, m in enumerate(folds)]}
+        doc.update(over)
+        for key in drop:
+            del doc[key]
+        path = TMP / "cascade_ops" / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    stacker = vrun_dir(vrun, create=True) / "stacker.json"
+    stacker.write_text(json.dumps({"stub": vrun}), encoding="utf-8")
+
+    class FakeVerifier:
+        def __init__(self, path, threads=0):
+            self.stacker = SimpleNamespace(
+                doc={"schema": "def3", "provenance": {"family": fam, "smoke": False}},
+                exit_decision="ship", t_star=t, candidate_floor=floor)
+            self.class_names = list(NAMES)
+
+        def score_candidates(self, rgb, boxes, scores, labels):
+            s = np.asarray(scores, dtype=float)
+            return {"boxes": list(boxes), "final": s, "labels": np.asarray(labels, int), "det": s}
+
+    class FakeDetector:
+        tiler_version = "v2"
+
+        def __init__(self, model_path, adapter, conf_floor=0.001):
+            assert conf_floor == floor
+            self.adapter = SimpleNamespace(num_classes=len(NAMES))
+
+        def detect(self, rgb):
+            pos = bool(rgb[0, 0, 0])
+            return SimpleNamespace(boxes=[(10.0, 10.0, 40.0, 40.0)] if pos else [],
+                                   scores=[0.9] if pos else [], labels=[0] if pos else [], elapsed_ms=1.0)
+
+    entries = [
+        {"capture_id": "k_pos", "image_path": "nowhere/k_pos.jpg", "board": "A", "pose": "seated",
+         "verdict": "NiO", "width": 60, "height": 50,
+         "boxes": [["Nicht ausreichend Lot", [10.0, 10.0, 40.0, 40.0]]]},
+        {"capture_id": "k_neg", "image_path": "nowhere/k_neg.jpg", "board": "A", "pose": "seated",
+         "verdict": "iO", "width": 60, "height": 50, "boxes": []},
+    ]
+    ledger = TMP / "ledger_cascade.csv"
+    saved = {(run_eval, k): getattr(run_eval, k)
+             for k in ("bucket_photos", "test_ledger_path", "results_path", "_gallery")}
+    saved.update({(cascade_eval, k): getattr(cascade_eval, k)
+                  for k in ("Verifier", "TiledDetector", "load_photo_rgb", "photo_path")})
+    run_eval.bucket_photos = lambda bucket, schema: ([dict(e) for e in entries], [])
+    run_eval.test_ledger_path = lambda: ledger
+    run_eval.results_path = lambda: TMP / "results_cascade.csv"
+    run_eval._gallery = lambda *a, **k: None  # the stub capture ids are not in the manifest
+    cascade_eval.Verifier, cascade_eval.TiledDetector = FakeVerifier, FakeDetector
+    cascade_eval.load_photo_rgb = lambda p: np.full((50, 60, 3), "pos" in str(p), np.uint8)
+    cascade_eval.photo_path = lambda e: Path(e["image_path"])
+    good = op("good")
+
+    def cascade(op_path=good, **kw):
+        return cascade_eval.run(vrun, devall, bucket="test", operating_point=op_path, **kw)
+
+    def rows():
+        with open(ledger, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    try:
+        # the op is loaded like a detector test eval's — before the ledger is touched
+        for bad, needles in ((op("null_t", threshold=None), ("threshold None",)),
+                             (op("v1", drop=("family", "sources", "target_sensitivity")),
+                              ("provenance", "re-run choose-op")),
+                             (op("other_fam", family="zfam_def3"), ("does not belong", "zfam_def3"))):
+            try:
+                cascade(bad)
+                raise AssertionError(f"{bad.name} must be refused")
+            except Refusal as e:
+                for n in needles:
+                    assert n in str(e), f"{n!r} not in: {e}"
+        assert not ledger.exists(), "a refused op must not spend the test look"
+
+        first = cascade()
+        name = f"{fam}_devall+{vrun}__test"
+        assert first["run_name"] == name and first["test_look"]["look"] == "first"
+        (row,) = rows()
+        gt_sha = run_eval.ground_truth_sha256([run_eval._gt_record(e, "def3", split) for e in entries])
+        assert row["model_sha256"] == cascade_eval.cascade_identity(sha256_file(devall), sha256_file(stacker))
+        assert row["operating_point_sha256"] == registry.file_sha256(good)
+        assert (row["conf_floor"], row["snapshot_id"], row["gt_sha256"]) == (
+            "0.001", load_manifest()["snapshot_id"], gt_sha), row
+        m = json.loads((settings.eval_dir / name / "metrics.json").read_text(encoding="utf-8"))
+        assert m["operating_point"]["sha256"] == row["operating_point_sha256"] and m["gt_sha256"] == gt_sha
+        assert m["test_look"]["look"] == "first" and m["source"]["conf_floor"] == floor
+        held = run_eval._eval_dir_look(settings.eval_dir / name)
+        assert run_eval.look_key(held) == run_eval.look_key(row), (held, row)
+        # the same key again: a deterministic rerun, same dir, no new row
+        again = cascade()
+        assert again["test_look"]["look"] == "rerun" and again["run_name"] == name and len(rows()) == 1
+        # the ledger lost the row (another worktree, `git checkout -- reports/`): the eval dir is the look
+        ledger.unlink()
+        restored = cascade()
+        assert restored["test_look"]["look"] == "rerun" and "restored" in restored["test_look"]["reason"]
+        assert [r["look"] for r in rows()] == ["rerun"]
+        # a relabel is another look: refused without a reason, then a new dir (the first one kept)
+        before = (settings.eval_dir / name / "metrics.json").read_bytes()
+        relabeled = [entries[0], {**entries[1], "verdict": "NiO", "boxes": [["Fahne", [5.0, 5.0, 9.0, 9.0]]]}]
+        run_eval.bucket_photos = lambda bucket, schema: ([dict(e) for e in relabeled], [])
+        try:
+            cascade()
+            raise AssertionError("a relabel must be a second look")
+        except Refusal as e:
+            assert "second look" in str(e), e
+        second = cascade(second_look="relabel")
+        assert second["run_name"] == f"{name}__look2" and second["test_look"]["look"] == "second_look"
+        assert (settings.eval_dir / name / "metrics.json").read_bytes() == before, "the first look was overwritten"
+        assert [r["look"] for r in rows()] == ["rerun", "second_look"]
+    finally:
+        for (mod, k), v in saved.items():
+            setattr(mod, k, v)
+    assert [p.read_bytes() if p.exists() else None for p in committed] == committed_before, \
+        "the committed ledger / results_v2.csv were touched"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

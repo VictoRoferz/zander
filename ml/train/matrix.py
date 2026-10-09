@@ -9,14 +9,17 @@ Drive layout (docs/CONTRACTS.md §8.5), under --drive:
     bundles/<run>_bundle.zip + .sha256   finished marker (the .sha256 is written last)
     mirror/<run>/                        resume state; a LATER session deletes it once
                                          it has read the bundle back from Drive
-    mirror/<run>.stale-<UTC>/            unusable resume state set aside (never deleted)
+    mirror/<run>.stale-<UTC>/            unusable resume state the runner set aside;
+                                         deleted together with mirror/<run>/
     logs/<run>.log                       full training output (appended per attempt)
     matrix_log.jsonl                     one line per started/finished/skipped attempt
 
 Per config, in the given (priority) order:
   1. skip when bundles/<run>_bundle.zip has a matching .sha256 — even if its
      config_sha256 or dataset_fingerprint differs from today's (warned):
-     results are never overwritten. A zip without a valid marker is moved
+     results are never overwritten. Only then, the bundle having been read
+     back from Drive, the run's mirror/<run>/ and mirror/<run>.stale-*/ are
+     deleted (never another run's). A zip without a valid marker is moved
      aside and redone. If Drive cannot be READ (an I/O error, not a bad
      bundle) the run is reported as failed and left alone: never moved aside,
      never retrained.
@@ -45,6 +48,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -522,6 +526,19 @@ def _is_file(path: Path) -> bool:
         return False
 
 
+# The suffix ultralytics_run.move_aside gives a set-aside folder (both runners use it).
+STALE_SUFFIX = r"\.stale-\d{8}T\d{6}Z(?:-\d+)?"
+
+
+def stale_mirrors(mirror_dir: Path, name: str) -> list:
+    """mirror/<name>.stale-<UTC stamp>[-n]/ — the unusable resume states the
+    runners set aside for exactly this run: the name is matched whole and the
+    suffix must be move_aside's, so another run's folder never matches. An
+    OSError while listing propagates."""
+    pattern = re.compile(re.escape(name) + STALE_SUFFIX)
+    return sorted(p for p in Path(mirror_dir).iterdir() if pattern.fullmatch(p.name) and p.is_dir())
+
+
 def batch_warning(meta: dict) -> Optional[str]:
     """Ultralytics halves the batch after a CUDA OOM in the first epoch of a
     process (meta["batch_effective"] = what last.pt says it trained with)."""
@@ -596,6 +613,29 @@ class Matrix:
         rec = self.record(item, status="failed", started=now, ended=now, error_tail=note)
         return Outcome(item.name, "failed", note=f"Drive unreadable: {why}"[:120], records=[rec])
 
+    def _drop_resume_state(self, name: str) -> None:
+        """Delete mirror/<run>/ and the run's mirror/<run>.stale-*/ (~165 MB each
+        for DEIM). Only for a run whose bundle was just read back and verified.
+        Drive trouble is never fatal here: a folder that cannot be listed is
+        left alone, and the next session that skips the run tries again."""
+        leftover = self.mirror / name
+        try:
+            if leftover.exists():
+                shutil.rmtree(leftover, ignore_errors=True)
+        except OSError:
+            pass
+        try:
+            stale = stale_mirrors(self.mirror, name)
+        except OSError as e:
+            _say(f"[matrix] {name}: cannot list {self.mirror} ({type(e).__name__}: {e}) — "
+                 "its set-aside resume state stays for now")
+            return
+        if stale:
+            _say(f"[matrix] {name}: bundle verified — deleting the set-aside resume state "
+                 f"{', '.join(d.name for d in stale)}")
+        for d in stale:
+            shutil.rmtree(d, ignore_errors=True)
+
     def skip_if_done(self, item: Item) -> Optional[Outcome]:
         zip_path = self.bundles / f"{item.name}_bundle.zip"
         check = B.verify_bundle(zip_path)
@@ -619,12 +659,7 @@ class Matrix:
             warning = "; ".join(warnings) or None
             # the bundle was just read back from Drive, so its upload is done:
             # only now may the resume state go (see step 3)
-            leftover = self.mirror / item.name
-            try:
-                if leftover.exists():
-                    shutil.rmtree(leftover, ignore_errors=True)
-            except OSError:
-                pass
+            self._drop_resume_state(item.name)
             now = utc_now()
             rec = self.record(item, status="skipped", started=now, ended=now,
                               epochs_completed=meta.get("epochs_completed"),
