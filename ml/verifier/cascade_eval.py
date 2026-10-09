@@ -18,12 +18,19 @@ candidates, `source.kind = "cascade"`, per-photo width/height.
   and must belong to the verifier's family.
 - The cascade's decision threshold is the stacker's anchor t* by construction;
   every allowed bucket needs a frozen threshold, so --operating-point is
-  required and its threshold must equal that t*.
+  required, is loaded by run_eval._load_op (a number in (0, 1]; on test the
+  choose-op provenance, and run_eval.op_model_problems: the op belongs to the
+  detector) and its threshold must equal that t*.
 - The test bucket is refused until run_eval.check_test_ledger exists
   (WP-eval), and for any verifier whose exit decision is not "ship". The
-  ledger key of a cascade is sha256("cascade:<detector sha>:<stacker sha>"), so
+  ledger key is the detector eval's (CONTRACTS §8.2) with the model sha
+  replaced by sha256("cascade:<detector sha>:<stacker sha>"): + the operating
+  point sha, the candidate floor, the snapshot id and the bucket's GT sha. So
   evaluating the cascade after the detector alone is a second look
-  (--second-look "<reason>", recorded).
+  (--second-look "<reason>", recorded). metrics.json records the same key
+  (operating_point.sha256, gt_sha256, snapshot_id, source.conf_floor), so the
+  eval dir counts as that look when a ledger lost the row; a look's eval dir
+  is never overwritten (run_eval._claim_run_name: `__look<k>`).
 - Cross-fit runs are written without a results row or gallery; cascade-eval
   runs record a row unless the verifier is a smoke run (and only ever for a
   frozen-threshold bucket).
@@ -218,10 +225,8 @@ def _call_with_known(fn, known: dict):
     return fn(**kwargs)
 
 
-def check_test_bucket(decision: Optional[str], smoke: bool, **known):
-    """The one-shot test bucket: only a shipped, non-smoke cascade, only through
-    the test ledger (run_eval.check_test_ledger, WP-eval). Returns the ledger's
-    look for record_test_look."""
+def check_test_gate(decision: Optional[str], smoke: bool):
+    """Only a shipped, non-smoke cascade, only with the test ledger (WP-eval)."""
     fn = getattr(run_eval, "check_test_ledger", None)
     if fn is None:
         raise Refusal(
@@ -233,7 +238,17 @@ def check_test_bucket(decision: Optional[str], smoke: bool, **known):
             f"test bucket refused: the verifier's exit decision is {decision!r} — only a "
             "pre-registered 'ship' decision earns the cascade a look at the test set"
         )
-    return _call_with_known(fn, known)
+    return fn
+
+
+def check_test_bucket(decision: Optional[str], smoke: bool, **known):
+    """The one-shot test bucket: check_test_gate, then the test ledger
+    (run_eval.check_test_ledger). Returns the ledger's look for record_test_look."""
+    fn = check_test_gate(decision, smoke)
+    try:
+        return _call_with_known(fn, known)
+    except run_eval.EvalGuardError as e:  # e.g. a second look without a reason
+        raise Refusal(f"cascade-eval: {e}") from None
 
 
 def check_bucket(bucket: Optional[str]) -> str:
@@ -282,42 +297,64 @@ def run(
             raise Refusal(msg)
         logger.warning("SMOKE: " + msg)
     t_star = ver.stacker.t_star
+    conf_floor = ver.stacker.candidate_floor
     bundle_run = _bundle_run_name(model_path)
-    run_name = run_name or f"{bundle_run}+{vrun}__{bucket}"
     model_sha = sha256_file(model_path)
     stacker_sha = sha256_file(stacker_path)
     if bucket in run_eval.FROZEN_OP_BUCKETS and operating_point is None:
         raise Refusal(f"bucket {bucket!r} needs --operating-point (frozen threshold)")
-    look, ledger = None, {}
-    if bucket == "test":
-        ledger = {"model_sha": cascade_identity(model_sha, stacker_sha),
-                  "op_sha": sha256_file(operating_point), "second_look": second_look,
-                  "run_name": run_name, "bundle_run": bundle_run, "family": prov.get("family"),
-                  "schema": schema, "threshold": t_star}
-        look = check_test_bucket(ver.stacker.exit_decision, smoke, **ledger)
+    if bucket == "test":  # the fundamental refusal first, before the op is examined
+        check_test_gate(ver.stacker.exit_decision, smoke)
+    op, op_sha = None, None
     threshold_source = f"stacker anchor t* ({stacker_path.name}, verifier {vrun})"
     if operating_point is not None:
-        op = read_json(operating_point)
-        if op.get("schema") != schema:
-            raise ValueError(f"operating point is for schema {op.get('schema')!r}")
+        try:  # the detector eval's loader: a real threshold; on test the choose-op provenance
+            op = run_eval._load_op(operating_point, schema, bucket=bucket)
+        except (ValueError, KeyError, TypeError, OSError) as e:
+            raise Refusal(f"operating point {operating_point}: {e}") from None
         if abs(float(op["threshold"]) - t_star) > 1e-12:
             raise Refusal(
                 f"operating point t={op['threshold']} differs from the stacker's anchor "
                 f"t*={t_star}: the cascade's scores are anchored to t*"
             )
+        if bucket == "test" and info is not None:  # before the one-shot look is spent
+            mismatch = run_eval.op_model_problems(op, info)
+            if mismatch:
+                raise Refusal(
+                    f"operating point {Path(operating_point).name} does not belong to "
+                    f"{info['run_name']}:\n  - " + "\n  - ".join(mismatch)
+                )
+        op_sha = sha256_file(operating_point)
         threshold_source = f"frozen: {operating_point} (= stacker anchor t*)"
-    if smoke:
-        logger.warning("verifier %s is a SMOKE run: numbers are meaningless", vrun)
 
+    # the bucket's ground truth (manifest + split only — no photo read yet): part of the look key
     split = load_split()
     manifest = load_manifest()
     entries, probe = run_eval.bucket_photos(bucket, schema)
-    detector = TiledDetector(model_path, adapter, conf_floor=ver.stacker.candidate_floor)
+    gt = [run_eval._gt_record(e, schema, split) for e in entries]
+    gt_sha = run_eval.ground_truth_sha256(gt)
+    key = {"model_sha256": cascade_identity(model_sha, stacker_sha), "operating_point_sha256": op_sha,
+           "conf_floor": conf_floor, "snapshot_id": manifest["snapshot_id"], "gt_sha256": gt_sha}
+    look, ledger = None, {}
+    if bucket == "test":
+        ledger = {"model_sha": key["model_sha256"], "op_sha": op_sha, "second_look": second_look,
+                  "conf_floor": conf_floor, "snapshot_id": manifest["snapshot_id"],
+                  "gt_sha256": gt_sha, "bundle_run": bundle_run, "family": prov.get("family"),
+                  "schema": schema, "threshold": t_star}
+        look = check_test_bucket(ver.stacker.exit_decision, smoke, **ledger)
+    try:  # a look's eval dir is never overwritten: a further look gets __look<k>
+        run_name = run_eval._claim_run_name(run_name, f"{bundle_run}+{vrun}__{bucket}", bucket, key)
+    except run_eval.EvalGuardError as e:
+        raise Refusal(f"cascade-eval: {e}") from None
+    if smoke:
+        logger.warning("verifier %s is a SMOKE run: numbers are meaningless", vrun)
+
+    detector = TiledDetector(model_path, adapter, conf_floor=conf_floor)
     n_model = getattr(detector.adapter, "num_classes", None)
     if n_model is not None and n_model != len(ver.class_names):
         raise ValueError(f"model outputs {n_model} classes, the verifier has {len(ver.class_names)}")
     photos, det_ms, ver_ms = [], [], []
-    for n, e in enumerate(entries, 1):
+    for n, (e, gt_rec) in enumerate(zip(entries, gt), 1):
         rgb = load_photo_rgb(photo_path(e))
         det = detector.detect(rgb)
         t0 = time.perf_counter()
@@ -326,7 +363,7 @@ def run(
         det_ms.append(det.elapsed_ms)
         order = np.argsort(-r["final"], kind="stable")
         photos.append({
-            **run_eval._gt_record(e, schema, split),
+            **gt_rec,
             "boxes": [r["boxes"][i] for i in order],
             "scores": [float(r["final"][i]) for i in order],
             "labels": [int(r["labels"][i]) for i in order],
@@ -341,7 +378,7 @@ def run(
         "kind": "cascade", "bundle_run": bundle_run, "family": meta_doc.get("family") or prov.get("family"),
         "fold": meta_doc.get("fold"), "model_sha256": model_sha,
         "model_resolved": str(model_path.resolve()), "adapter": adapter,
-        "conf_floor": ver.stacker.candidate_floor, "verifier_run": vrun,
+        "conf_floor": conf_floor, "verifier_run": vrun,
         "stacker_sha256": stacker_sha,
     }
     base = {
@@ -350,12 +387,17 @@ def run(
         "mean_ms_detector": round(float(np.mean(det_ms)), 1) if photos else None,
         "mean_ms_verifier": round(float(np.mean(ver_ms)), 1) if photos else None,
         "tiler_version": detector.tiler_version, "split_id": split["split_id"],
-        "snapshot_id": manifest["snapshot_id"],
+        "snapshot_id": manifest["snapshot_id"], "gt_sha256": gt_sha,
         "dataset_fingerprint": meta_doc.get("dataset_fingerprint"), "host": platform.node(),
     }
+    if op is not None:  # with gt_sha256, snapshot_id and source: the eval dir's look key
+        base["operating_point"] = {"file": str(operating_point), "sha256": op_sha,
+                                   "family": op.get("family"), "threshold": op["threshold"]}
+    if look is not None:
+        base["test_look"] = {"look": look["look"], "reason": look["reason"],
+                             "ledger": run_eval.test_ledger_path().name}
+        if hasattr(run_eval, "record_test_look"):  # recorded before the outputs, like run_eval
+            _call_with_known(run_eval.record_test_look, {"look": look, "run_name": run_name, **ledger})
     record = not smoke and bucket in run_eval.FROZEN_OP_BUCKETS
-    metrics = write_run(run_name, photos, ver.class_names, bucket, t_star, threshold_source,
-                        base, source, smoke, probe=probe, record=record, gallery=True)
-    if look is not None and hasattr(run_eval, "record_test_look"):
-        _call_with_known(run_eval.record_test_look, {"look": look, **ledger})
-    return metrics
+    return write_run(run_name, photos, ver.class_names, bucket, t_star, threshold_source,
+                     base, source, smoke, probe=probe, record=record, gallery=True)
