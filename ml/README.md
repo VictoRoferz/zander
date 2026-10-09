@@ -131,11 +131,13 @@ python cli.py export --bundle ../ml_data/bundles/yolo26n_def3_devall --operating
 ```
 
 Checks before writing: bundle meta vs operating point (schema, classes, split,
-tiler, family, config equivalence with the op's fold bundles); the bundle is
-the dev_all retrain (`--allow-fold-model` records an exception); a test eval of
-exactly this model at exactly this operating point exists (`--no-test-eval`
-records null); **parity** — the deployed pipeline (`conf_floor = t`) reproduces
-the evaluated verdicts on the 5 photos nearest the threshold, zero mismatches.
+tiler, and the test eval's identity check: family, the op's fold bundles still
+hold the models it was frozen from, config equivalence with them); the bundle
+is the dev_all retrain (`--allow-fold-model` records an exception); a test eval
+of exactly this model at exactly this operating point exists — the latest such
+look, `__test__look<k>` included (`--no-test-eval` records null); **parity** —
+the deployed pipeline (`conf_floor = t`) reproduces the evaluated verdicts on
+the 5 photos nearest the threshold, zero mismatches.
 `--force` archives an existing export to `exports/archive/<timestamp>/`.
 
 **10 · Inspector.** Copy `detector.onnx` **and** `detector.json` to

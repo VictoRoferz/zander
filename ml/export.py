@@ -8,15 +8,21 @@ Export the chosen detector for the inspector: ONNX + detector.json card
 
 Checks, all before anything is written:
   1. bundle meta vs operating point: schema, class names, split, tiler
-     version, family, and training-config equivalence with the op's fold
-     models (arch, dataset_id, epochs, imgsz, batch, augment, final_weights,
-     dataset fingerprint — the fold bundles must be imported);
+     version, and run_eval.op_model_problems — the identity check a test eval
+     runs: same family; the op's fold bundles are imported and still hold the
+     models it was frozen from (else a stale operating point); their training
+     config is equivalent to this bundle's (run_eval.EQUIV_KEYS: arch,
+     dataset_id, epochs, imgsz, batch — meta.batch_effective when the trainer
+     changed it —, augment, final_weights, `extra` minus NON_TRAINING_EXTRA;
+     plus the dataset fingerprint);
   2. the bundle is the dev_all retrain (`allow_fold_model` records an exception;
      a v1 operating point, which predates these guards, only with it);
   3. a TEST evaluation of exactly this model (sha256) at exactly this operating
      point (the run's recorded operating_point.sha256) exists (`no_test_eval`
      records null instead); only detector runs count, never a cascade run of
-     the same detector;
+     the same detector. Further looks live in `<bundle_run>__test__look<k>`:
+     of several matching looks the latest (metrics.json written last) is
+     taken; looks at other operating points never count;
   4. parity: TiledDetector(conf_floor=t) + infer.verdict.photo_verdict on
      `verify_photos` photos must reproduce the verdict (N.iO/i.O + class set)
      that the reference eval's predictions.json implies at t — zero mismatches.
@@ -123,6 +129,18 @@ def _eval_runs_of_model(model_sha: str) -> list[tuple[str, dict]]:
         if sha == model_sha:
             out.append((d.name, m))
     return out
+
+
+def _latest_look(runs: list[str]) -> str | None:
+    """The most recently completed eval run (metrics.json is written last),
+    ties broken by name: deterministic for a given eval folder."""
+    def written(run: str) -> int:
+        try:
+            return (settings.eval_dir / run / "metrics.json").stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    return max(runs, key=lambda r: (written(r), r), default=None)
 
 
 def _load_rgb(path: Path):
@@ -266,7 +284,7 @@ def run(
     force: bool = False,
 ) -> Path:
     """Verify and export; returns the written card path (<out_dir>/<name>.json)."""
-    from eval.run_eval import config_differences
+    from eval.run_eval import op_model_problems
 
     bundle_dir, op_path, out_dir = Path(bundle_dir), Path(operating_point), Path(out_dir)
     if not _NAME_RE.match(name):
@@ -304,17 +322,8 @@ def run(
     t = op.get("threshold")
     if not isinstance(t, (int, float)) or isinstance(t, bool) or not 0 < t < 1:
         problems.append(f"operating point threshold {t!r} is not in (0, 1)")
-    if "sources" in op:  # v2 operating point
-        if op.get("family") != info["family"]:
-            problems.append(f"operating point is for family {op.get('family')!r}, the bundle is "
-                            f"{info['family']!r}")
-        src_infos = [registry.bundle_info(settings.bundles_dir / s["bundle_run"]) for s in op["sources"]]
-        missing = [s["bundle_run"] for s, i in zip(op["sources"], src_infos) if i is None]
-        if missing:
-            problems.append(f"the operating point's fold bundles are not imported ({missing}) — "
-                            "config equivalence cannot be verified (cli.py import-run)")
-        else:
-            problems += [f"config: {d}" for d in config_differences([info, *src_infos])]
+    if "sources" in op:  # v2 operating point: the test eval's op <-> model identity check
+        problems += op_model_problems(op, info)
     elif allow_fold_model:
         overrides.append("v1 operating point (no family/sources): family and config "
                          "equivalence unverified")
@@ -339,28 +348,39 @@ def run(
     if eval_run is not None and eval_run not in runs:
         raise ExportError(f"eval run {eval_run!r} is not an evaluation of this model (sha "
                           f"{model_sha[:12]}…)")
-    tests = [r for r, m in runs.items() if m.get("bucket") == "test"]
-    preferred = f"{info['run_name']}__test"
-    if eval_run is not None and runs[eval_run].get("bucket") == "test":
-        test_run = eval_run
-    else:  # an explicit non-test eval_run is the parity reference only
-        test_run = preferred if preferred in tests else (tests[0] if tests else None)
+    explicit_test = eval_run is not None and runs[eval_run].get("bucket") == "test"
+    # an explicit non-test eval_run is the parity reference only
+    tests = [eval_run] if explicit_test else [r for r, m in runs.items() if m.get("bucket") == "test"]
+
+    def op_used(m: dict) -> str | None:
+        return (m.get("operating_point") or {}).get("sha256")
+
+    # the run must have RECORDED this operating point's sha: a matching
+    # threshold alone could come from another op file (or none at all)
+    matching = [r for r in tests if op_used(runs[r]) == op_sha
+                and runs[r].get("threshold") is not None and abs(runs[r]["threshold"] - t) <= 1e-12]
+    test_run = _latest_look(matching)  # further looks (other floor, relabel): the latest counts
+    others = [r for r in tests if r not in matching]
     test_level1 = None
+    if others and (explicit_test or not (test_run or no_test_eval)):
+        raise ExportError(
+            "test eval " + ", ".join(
+                f"{r} (t={runs[r].get('threshold')}, op sha {(op_used(runs[r]) or 'not recorded')[:12]})"
+                for r in others)
+            + f" used another operating point than {op_path.name} (t={t}, sha {op_sha[:12]}) — "
+            f"evaluate this operating point on test, or pass --no-test-eval (recorded as null)")
     if test_run:
+        if len(matching) > 1:
+            logger.info(f"test evals of this model at this operating point: {sorted(matching)} — "
+                        f"the latest, {test_run}, is recorded")
         tm = runs[test_run]
-        # the run must have RECORDED this operating point's sha: a matching
-        # threshold alone could come from another op file (or none at all)
-        used = (tm.get("operating_point") or {}).get("sha256")
-        if tm.get("threshold") is None or abs(tm["threshold"] - t) > 1e-12 or used != op_sha:
-            raise ExportError(
-                f"test eval {test_run} used another operating point (t={tm.get('threshold')}, "
-                f"op sha {(used or 'not recorded')[:12]}) than {op_path.name} (t={t}, sha "
-                f"{op_sha[:12]})")
         if tm.get("guard_overridden"):
             raise ExportError(f"test eval {test_run} was run with guards overridden")
         test_level1 = tm.get("level1_verdict")
     elif no_test_eval:
-        overrides.append("no_test_eval: no test evaluation of this model")
+        overrides.append("no_test_eval: no test evaluation of this model at this operating point"
+                         + (f" (only at other operating points: {', '.join(sorted(others))})"
+                            if others else ""))
     else:
         raise ExportError(
             f"no test evaluation of this model (sha {model_sha[:12]}…) at this operating point — "
