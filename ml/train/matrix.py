@@ -510,7 +510,7 @@ def _move_invalid(bundles_dir: Path, name: str, reason: str) -> None:
         if p.exists():
             target = p.with_name(f"{p.name}.invalid-{stamp}")
             shutil.move(str(p), str(target))
-            print(f"[matrix] {name}: moved an invalid bundle file aside ({reason}): {target.name}", flush=True)
+            _say(f"[matrix] {name}: moved an invalid bundle file aside ({reason}): {target.name}")
 
 
 def _is_file(path: Path) -> bool:
@@ -651,8 +651,8 @@ class Matrix:
             started = utc_now()
             outcome.records.append(self.record(item, status="started", attempt=attempt,
                                                resumed=resumed_hint, started=started))
-            print(f"[matrix] {item.name}: attempt {attempt}/{self.args.max_attempts} "
-                  f"({'resume' if resumed_hint else 'fresh'})", flush=True)
+            _say(f"[matrix] {item.name}: attempt {attempt}/{self.args.max_attempts} "
+                 f"({'resume' if resumed_hint else 'fresh'})")
             req = RunRequest(item, attempt, self.command(item), env, ML_DIR,
                              self.logs / f"{item.name}.log", self.mirror, self.run_root)
             t0 = time.monotonic()
@@ -777,7 +777,7 @@ def main(argv: Optional[list] = None, *, launcher: Optional[Launcher] = None) ->
                 _say(f"[matrix] {item.name}: FAILED ({note})")
                 outcomes.append(Outcome(item.name, "failed", note=note[:120]))
             rest = [it for it in items[i + 1:] if it in pending]
-            print(f"[matrix] {eta_line(rest, matrix.book)}", flush=True)
+            _say(f"[matrix] {eta_line(rest, matrix.book)}")
     except KeyboardInterrupt:
         print("\n[matrix] interrupted — finished bundles are safe; rerun to resume", flush=True)
         print(summary_table(outcomes), flush=True)
