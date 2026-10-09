@@ -247,6 +247,7 @@ inspector/.env
 - **Run names:**
   - own fold: `<family>_fold<k>` (= the bundle run name)
   - other buckets: `<bundle_run>__<bucket>`
+  - a further look at test (another ledger key): `<bundle_run>__test__look<k>` (k = 2, 3, …) — an eval dir holding a test look is never overwritten by another look or by an explicit `--run-name`
   - cascade: `<family>+<vrun>_fold<k>`
   - A family name resolves to `<F>_fold0..2`.
 - **`predictions.json` v2** = v1 plus:
@@ -261,13 +262,25 @@ inspector/.env
   - all of `scorer.*`
   - `compare.run(run_a, run_b, class_index=0, seed=0)`
 - `_write_outputs` needs these `metrics` keys: run_name, model, adapter, schema, bucket, threshold, threshold_source, n_photos, mean_ms_per_photo, tiler_version, split_id, snapshot_id, dataset_fingerprint, host.
-- The `ml/reports/results_v2.csv` columns are unchanged. Smoke rows are never committed.
+- `cli.py eval` adds `gt_sha256` (sha256 over the bucket's sorted `_gt_record`s: the ground truth actually scored) and, on `test`, `test_look: {look: first|rerun|second_look, reason, ledger}` (also shown in `report.md`).
+- **Test ledger** `ml/reports/test_ledger.csv` (committed), columns `date, run_name, model_sha256, operating_point_sha256, bundle_run, family, schema, threshold, look, reason, conf_floor, snapshot_id, gt_sha256, guard_overridden`. An older header is migrated in place on the next append (rows kept, new columns empty); appends are fsynced.
+  - A look's key is **(model_sha256, operating_point_sha256, conf_floor, snapshot_id, gt_sha256)** — another floor or a relabel is another test number. A cascade's model key is `sha256("cascade:<detector sha>:<stacker sha>")` (§8.4).
+  - Recorded looks = the ledger rows **plus** every `ml_data/eval/*/metrics.json` with `bucket == "test"` (that folder is shared by all checkouts and worktrees; `git checkout -- reports/` drops ledger rows). A rerun of a key found only there is re-recorded (`look: rerun`, reason `restored: …`).
+  - `check_test_ledger(model_sha, op_sha, second_look=None, *, conf_floor=None, snapshot_id=None, gt_sha256=None) -> {look, reason, record}`, `record_test_look(look, *, run_name, model_sha, op_sha, bundle_run, family, schema, threshold, conf_floor=None, snapshot_id=None, gt_sha256=None, guard_overridden=None)`; the new parameters are keyword-only with defaults (cascade-eval passes the old set).
+- The `ml/reports/results_v2.csv` columns are unchanged. It holds honest evals only: never smoke or guard-overridden runs, never `train_always` (memorisation); a `probe_xprod` row carries provenance + `probe_found` only (the photo/defect-level columns stay empty — the probe photos' other defects may be trained). Smoke rows are never committed.
+- `compare` refuses two sides scored against different ground truth (per photo: verdict + all boxes of `gt` ∪ `other_gt`, and the `metrics.json` `snapshot_id`s when both record one).
+- **Provenance of a scored model** (`registry.model_file_problem`, `registry.bundle_model_shas`, `run_eval.source_problems`): an ONNX file must be the one its bundle's `meta.json` (`onnx.sha256` / `onnx_raw.sha256`) and import marker (`files`) describe — `eval` refuses a mismatch (never overridable). choose-op, compare and summary pool a fold eval run only if its recorded `source.model_sha256` is still among the bundle's model shas (else "stale eval — re-run eval"), and a frozen operating point is applied to pooled fold runs only if its `sources[].model_sha256` match their models fold by fold (else "stale operating point"; smoke operating points only warn, v1 files cannot be checked). Pooling also refuses one model on several folds among the known shas.
+- **Run policy** (read from the bundle by `run_eval.training_problems`): a model whose bundle has `weights: best`, a non-zero `config.extra.patience`, or `meta.epochs_completed < epochs` carries a checkpoint selected on (or stopped by) its validation view. `eval` treats this as an honesty violation (refused; `--allow-foreign-fold` overrides it, stamped `guard_overridden`); `choose-op` refuses it unconditionally. DEIM bundles (no `extra.patience`, always `last`) pass.
 
 ### 8.3 `operating_point.json` v2 (`choose-op`)
 
-- All v1 keys (`schema, class_names, threshold, rule, runs, models, split_id, created, oof_level1`), plus `family`, `target_sensitivity` and `sources: [{eval_run, bundle_run, fold, model_sha256, config_sha256, dataset_fingerprint}]`.
+- All v1 keys (`schema, class_names, threshold, rule, runs, models, split_id, created, oof_level1`), plus `family`, `target_sensitivity`, `allow_smoke` (true = frozen from smoke runs under `--allow-smoke`: plumbing only) and `sources: [{eval_run, bundle_run, fold, model_sha256, config_sha256, dataset_fingerprint}]`.
+- **choose-op refuses** (besides the pooling guards of §8.2): `--target-sensitivity` outside (0, 1]; a t* below the `source.conf_floor` of any fold run (its scores under the floor were cut off).
 - File: `ml_data/eval/operating_point_<schema>_<family>.json`.
 - It is frozen: overwriting needs `--force`, and the old file moves to `ml_data/eval/archive/`.
+- **Equivalence** (`run_eval.config_differences`; used by choose-op, export, the test eval and compare/summary pooling): `arch`, `dataset_id`, `epochs`, `imgsz`, `batch` (`meta.batch_effective` when the trainer changed it), `augment`, `final_weights`, `extra` minus the keys that do not change the weights (`val, val_fraction, plots, verbose, workers, cache, device, exist_ok, save_period` — so a dev_all config differing by `extra.val` stays equivalent), and the dataset fingerprint. Seeds may differ.
+- **Loading** (`run_eval._load_op`, every bucket): `threshold` must be a finite number in (0, 1] — never null or a bool (a null threshold made `score_all` self-tune on the bucket). The `test` bucket also requires the choose-op provenance `family`, non-empty `sources` and `target_sensitivity`; a v1 or hand-written file is refused there ("re-run choose-op"). `--conf` above the threshold is refused.
+- **Op ↔ model** (`run_eval.op_model_problems`, the identity check `export` runs): a `test` eval refuses, before the ledger is consulted, an operating point whose `family` differs from the model's, whose `sources[].bundle_run` fold bundles are not imported or no longer hold the models in `sources[].model_sha256` (stale operating point), or whose fold bundles' training config is not equivalent to the model's (`config_differences`).
 
 ### 8.4 Verifier artifacts and `ml/infer/verifier.py`
 

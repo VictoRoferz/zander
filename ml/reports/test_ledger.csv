@@ -1,1 +1,1 @@
-date,run_name,model_sha256,operating_point_sha256,bundle_run,family,schema,threshold,look,reason
+date,run_name,model_sha256,operating_point_sha256,bundle_run,family,schema,threshold,look,reason,conf_floor,snapshot_id,gt_sha256,guard_overridden

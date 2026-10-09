@@ -14,6 +14,10 @@ Bundles (docs/CONTRACTS.md §8.1):
     `cli.py eval` read meta.json.
   - Extraction goes through a staging dir INSIDE ml_data/bundles/ and one
     rename, so a crash never leaves a half bundle or a stray temp dir behind.
+  - model.onnx and meta.json share only a directory: `model_file_problem`
+    checks the file against meta.json's `onnx.sha256` and the import marker,
+    and `bundle_model_shas` tells eval consumers (choose-op, compare, summary)
+    whether an eval run scored the model the bundle holds now.
   - Identity = sha256 of the zip (a Drive `<zip>.sha256` marker is verified
     when present). The same sha re-imports as a no-op (the model file is
     re-verified); a DIFFERENT sha under an existing run_name is refused unless
@@ -199,6 +203,58 @@ def bundle_info(bundle_dir: Path) -> dict | None:
 def is_smoke(name: str | None) -> bool:
     """Smoke runs (plumbing checks, not models) never enter benchmarks."""
     return bool(name) and "smoke" in str(name).lower()
+
+
+# ONNX files a bundle may carry, with the meta.json block that describes each.
+_ONNX_BLOCKS = (("onnx", "model.onnx"), ("onnx_raw", "model_raw.onnx"))
+
+
+def model_file_problem(bundle_dir: Path, model_path: Path | None = None) -> str | None:
+    """An ONNX file and its meta.json are bound only by sharing a directory: the
+    file must be the one meta.json (`onnx.sha256` / `onnx_raw.sha256`) and the
+    import marker (`files`) describe. A problem string on a mismatch, None when
+    consistent or unverifiable (v1 bundle placed by hand)."""
+    bundle_dir = Path(bundle_dir)
+    model_path = Path(model_path) if model_path else bundle_dir / "model.onnx"
+    if not model_path.is_file():
+        return None
+    expected: dict[str, str] = {}
+    try:
+        meta = json.loads((bundle_dir / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    for key, default_file in _ONNX_BLOCKS:
+        block = meta.get(key)
+        if isinstance(block, dict) and block.get("sha256") and \
+                (block.get("file") or default_file) == model_path.name:
+            expected[f"meta.json {key}.sha256"] = str(block["sha256"]).lower()
+    marker_sha = ((_read_marker(bundle_dir) or {}).get("files") or {}).get(model_path.name)
+    if marker_sha:
+        expected[f"{BUNDLE_MARKER} files"] = str(marker_sha).lower()
+    if not expected:
+        return None
+    actual = file_sha256(model_path)
+    bad = [f"{src} says {sha[:12]}…" for src, sha in expected.items() if sha != actual]
+    if not bad:
+        return None
+    return (f"{model_path.name} in {bundle_dir.name} (sha {actual[:12]}…) is not the model its "
+            f"bundle describes ({'; '.join(bad)}) — re-import the bundle (cli.py import-run --force)")
+
+
+def bundle_model_shas(info: dict) -> set[str]:
+    """Every sha256 the bundle knows for its ONNX files: the files on disk now,
+    meta.json's onnx/onnx_raw blocks and the import marker. An eval whose
+    recorded model sha is not in here scored a model this bundle no longer holds."""
+    bundle_dir = Path(info["bundle_dir"])
+    shas = {file_sha256(p) for p in sorted(bundle_dir.glob("*.onnx")) if p.is_file()}
+    meta = info.get("meta") or {}
+    for key, _ in _ONNX_BLOCKS:
+        block = meta.get(key)
+        if isinstance(block, dict) and block.get("sha256"):
+            shas.add(str(block["sha256"]).lower())
+    files = (_read_marker(bundle_dir) or {}).get("files") or {}
+    shas.update(str(s).lower() for n, s in files.items() if n.endswith(".onnx") and s)
+    return shas
 
 
 # ------------------------------------------------------------------- import

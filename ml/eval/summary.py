@@ -7,8 +7,10 @@ Mac after `eval-matrix` (and ideally `choose-op` per family).
 Per family F (fold runs F_fold0..2 in ml_data/eval, own-fold, distinct
 models — see eval/compare.resolve):
   - pooled OOF photos = the fold runs concatenated -> eval/photo_scorer.score_all
-    at F's FROZEN operating point (operating_point_<schema>_<F>.json); without
-    one the threshold is self-tuned on the pooled OOF and FLAGGED (optimistic);
+    at F's FROZEN operating point (operating_point_<schema>_<F>.json, which must
+    have been frozen from exactly these runs' models — a stale op excludes the
+    family); without one the threshold is self-tuned on the pooled OOF and
+    FLAGGED (optimistic);
   - pooled NAL recall @ 0.5 FPPI with board-group bootstrap CIs, per-fold
     recalls, AP50 (literature comparison only), photo AUROC, escape and
     false-call rates with their counts, probe hits (never-trained board-A
@@ -37,7 +39,14 @@ from dataprep.remap import BOX_CLASSES
 from dataprep.split import load_split
 from eval import compare
 from eval.photo_scorer import score_all, threshold_for_sensitivity
-from eval.run_eval import EvalGuardError, load_predictions, run_source, source_bundle_info
+from eval.run_eval import (
+    EvalGuardError,
+    _atomic_write_text,
+    check_op_sources,
+    load_predictions,
+    run_source,
+    source_bundle_info,
+)
 
 logger = logging.getLogger("ml.summary")
 
@@ -75,16 +84,17 @@ def _family_entry(family: str, runs: dict[int, str], k: int) -> tuple[dict | Non
         docs = res["docs"]
     else:
         docs = [load_predictions(runs[i]) for i in sorted(runs)]
-        for r, d in zip((runs[i] for i in sorted(runs)), docs):
-            src = run_source(d)
-            if src.get("fold") and src["fold"] != d["bucket"]:
-                raise EvalGuardError(f"{r}: model validates on {src['fold']}, not {d['bucket']}")
+        problems = compare.pool_problems([runs[i] for i in sorted(runs)], docs)
+        if problems:
+            raise EvalGuardError(f"family {family!r} cannot be pooled: " + "; ".join(problems))
         res = None
     schema, class_names = docs[0]["schema"], docs[0]["class_names"]
     photos = [p for d in docs for p in d["photos"]]
     op_path = settings.eval_dir / f"operating_point_{schema}_{family}.json"
     if op_path.is_file():
-        t = json.loads(op_path.read_text(encoding="utf-8"))["threshold"]
+        op = json.loads(op_path.read_text(encoding="utf-8"))
+        check_op_sources(op, op_path.name, docs)  # a stale op is refused, never applied
+        t = op["threshold"]
         t_src = f"frozen: {op_path.name}"
     else:
         t = threshold_for_sensitivity(photos)
@@ -202,7 +212,7 @@ def run(
     def paired(a: str, b: str, **kw) -> dict:
         try:
             return compare.compare(a, b, cls="NAL", seed=seed, resolved=(pools[a], pools[b]), **kw)
-        except compare.CompareError as e:  # e.g. families scored on different photo sets
+        except (compare.CompareError, EvalGuardError) as e:  # e.g. different photo sets
             logger.warning(f"summary: {a} vs {b} not comparable — {e}")
             return {"run_a": a, "run_b": b, "error": str(e)}
 
@@ -226,7 +236,7 @@ def run(
     }
     out_json = Path(out_json) if out_json else settings.eval_dir / "summary_v2.json"
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(doc, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
+    _atomic_write_text(out_json, json.dumps(doc, indent=1, ensure_ascii=False, default=str))
 
     md = [
         "# Model selection v2 — pooled out-of-fold",
@@ -277,7 +287,7 @@ def run(
         md += ["", "_⚠ Smoke families included (`--include-smoke`): plumbing checks, not models._"]
     out_md = Path(out_md) if out_md else settings.reports_dir / "model_selection_v2.md"
     out_md.parent.mkdir(parents=True, exist_ok=True)
-    out_md.write_text("\n".join(md) + "\n", encoding="utf-8")
+    _atomic_write_text(out_md, "\n".join(md) + "\n")
     logger.info(f"summary: {len(candidates)} ranked, {len(incomplete)} incomplete, "
                 f"{len(excluded)} excluded -> {out_md}, {out_json}")
     return doc

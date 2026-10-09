@@ -182,6 +182,30 @@ def test_bundle_dir_placed_by_hand_is_adopted_in_place():
     assert again["status"] == "registered-in-place" and again["bundle_sha256"] == first["bundle_sha256"]
 
 
+def test_model_file_is_bound_to_its_bundle():
+    """model.onnx vs meta.json onnx.sha256 / the import marker (they only share a dir)."""
+    z = _bundle_zip(TMP / "in" / "bind_def3_fold0_bundle.zip", "bind_def3_fold0", model=b"bound model")
+    target = registry.import_bundle(z, register=False)["bundle_dir"]
+    original = registry.file_sha256(target / "model.onnx")
+    assert registry.model_file_problem(target) is None
+    assert registry.bundle_model_shas(registry.bundle_info(target)) == {original}
+    (target / "model.onnx").write_bytes(b"copied over by hand")
+    problem = registry.model_file_problem(target)
+    assert problem and registry.BUNDLE_MARKER in problem and "re-import" in problem, problem
+    # the bundle still knows the model it was imported with (an eval of it is not stale)
+    assert original in registry.bundle_model_shas(registry.bundle_info(target))
+    meta = json.loads((target / "meta.json").read_text(encoding="utf-8"))
+    meta["onnx"]["sha256"] = registry.file_sha256(target / "model.onnx")
+    (target / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert "onnx.sha256" not in registry.model_file_problem(target)  # only the marker disagrees now
+    # a hand-placed v1 dir without marker or onnx block is unverifiable, not a mismatch
+    loose = TMP / "loose_bundle"
+    loose.mkdir()
+    (loose / "model.onnx").write_bytes(b"x")
+    (loose / "meta.json").write_text(json.dumps({"run_name": "loose"}), encoding="utf-8")
+    assert registry.model_file_problem(loose) is None
+
+
 def test_log_eval_into_the_bundles_run():
     import mlflow
 

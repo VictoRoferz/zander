@@ -84,8 +84,11 @@ python cli.py choose-op --family yolo26n_def3   # -> ml_data/eval/operating_poin
 
 t* = the highest threshold with pooled out-of-fold photo sensitivity ≥ 0.95.
 Refused unless the three runs are three **distinct** fold models, each scored
-on its own fold, with equivalent training configs (arch, dataset_id, epochs,
-imgsz, batch, augment, final_weights, dataset fingerprint); smoke runs need
+on its own fold, trained under the run policy (last epoch, no early stopping,
+every epoch completed), with equivalent training configs (arch, dataset_id, epochs,
+imgsz, batch actually used, augment, final_weights, training `extra` kwargs —
+validation/logging/runtime keys such as `val`, `plots`, `workers` excluded —,
+dataset fingerprint; seeds may differ); smoke runs need
 `--allow-smoke`. The file is frozen: `--force` archives it to `ml_data/eval/archive/`.
 
 **6 · Rank and gate (paired decisions, never overlapping CIs)**
@@ -96,7 +99,8 @@ python cli.py compare yolo26n_def3 yolo11s_def3 --class NAL                  # G
 python cli.py compare yolo26n_def3 yolo26n_nal1 --class NAL --margin 0.05    # NAL gate
 ```
 
-`summary` pools each complete family's fold runs, scores them at the family's
+`summary` and `compare` pool a family's fold runs only under choose-op's guards
+(distinct own-fold models, one recipe). `summary` scores them at the family's
 frozen operating point (self-tuned and flagged ⚠ if `choose-op` has not run),
 ranks the def3 families by pooled NAL recall @ 0.5 FPPI, and runs G1 and the
 NAL gate itself. **G1:** a winner needs a paired CI excluding 0, otherwise the
@@ -149,16 +153,40 @@ verifier ...` — see **`verifier/README.md`**.
   adapter or split_id that differs from the bundle's `meta.json` (never
   overridable); a fold bucket scored by a model that trained on it (another
   fold's model, or a dev_all model); a model without `meta.json`; a non-dev_all
-  model on `test`. `--allow-foreign-fold` overrides the last three for
-  diagnostics only — the run is stamped `guard_overridden` and never recorded.
-- `test`, `probe_xprod` and `future` need `--operating-point`; `probe_xprod`
-  never includes test photos.
-- **Test ledger** (`reports/test_ledger.csv`, committed): every model/operating
-  point pair evaluated on `test`. Re-running the same pair is fine; any other
-  pair is a second look and needs `--second-look "<reason>"` (recorded).
+  model on `test`; a bundle that breaks the run policy (`weights: best`,
+  `extra.patience` ≠ 0, `epochs_completed` < `epochs`: a checkpoint selected on
+  or stopped by its validation view). `--allow-foreign-fold` overrides the last
+  four for diagnostics only — the run is stamped `guard_overridden` and never
+  recorded; `choose-op` never pools such a model. A `model.onnx` that is not
+  the file its `meta.json` (`onnx.sha256`) / import marker describes is
+  refused outright.
+- `choose-op`, `compare` and `summary` judge an eval run by the model it
+  scored: if the bundle now holds another model (re-import `--force`) the run is
+  a **stale eval** (re-run it); a frozen operating point is applied only to the
+  fold models it was frozen from (else stale: re-run `choose-op --force`).
+- `test`, `probe_xprod` and `future` need `--operating-point` with a numeric
+  threshold in (0, 1] (`--conf` may not exceed it); `probe_xprod` never
+  includes test photos. On `test` the operating point must come from
+  `choose-op` (family, sources, target sensitivity) and belong to the model —
+  same family, training config equivalent to its fold bundles — checked before
+  the one-shot look is spent.
+- **Test ledger** (`reports/test_ledger.csv`, committed): every look at `test`,
+  keyed by model, operating point, `--conf` floor and the ground truth scored
+  (snapshot id + `gt_sha256`). Re-running the same key is fine; anything else —
+  another model, op, floor, or a relabel — is a second look and needs
+  `--second-look "<reason>"` (recorded in the ledger, `metrics.json` and
+  `report.md`). Test evals in `ml_data/eval` (shared by every checkout and
+  worktree) count as looks even when this checkout's ledger lost them. A further
+  look lands in `<bundle_run>__test__look<k>`; a look's eval dir is never
+  overwritten.
 - `reports/results_v2.csv` gets one row per honest eval (never smoke or
-  overridden runs). Smoke rows are never committed — `git checkout --
-  reports/results_v2.csv` after experiments.
+  overridden runs, never `train_always`; a `probe_xprod` row keeps only the
+  probe hit counts — the photo-level columns stay empty). Smoke rows are never
+  committed — `git checkout -- reports/results_v2.csv` after experiments.
+- `compare` refuses two sides scored against different ground truth (a
+  relabel between the evals). `choose-op` refuses a target sensitivity outside
+  (0, 1] and a t* below a fold run's `--conf` floor; the op JSON records
+  `allow_smoke`.
 
 ### Commands
 
