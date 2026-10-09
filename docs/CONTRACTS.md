@@ -37,6 +37,8 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 - If `verifier` is null, `conf_floor <= threshold` (export writes them equal). Otherwise `conf_floor == verifier.candidate_floor`.
 - `tiler_version`, `tile_size` and `stride` equal `infer.tiling`'s constants.
 
+**`validation.test_eval_run` (checked by `cli.py export`, not by the reader):** a **detector** eval run (`source.kind == "detector"`; a run without `kind` is a v1 detector run) of exactly `model_sha256` on the `test` bucket, whose `metrics.json` recorded `operating_point.sha256` equal to the card's `operating_point.sha256` and the same threshold. A cascade run of the same detector (`source.kind == "cascade"`) is never the test eval and never the parity reference. `null` only with `--no-test-eval`, recorded in `validation.overrides`.
+
 **Why `conf_floor == threshold` is safe without a verifier.** Merging is greedy by descending score, and a kept box keeps its maximum score. So the verdict and the class set are identical at floor t and at 0.001, and so is `photo_score` for NiO photos. Only box outlines are tighter. For iO photos `photo_score` is **0.0** at floor t (no box below t is ever produced), so it is not a confidence and the UI never shows it.
 
 **Inspector behaviour:**
@@ -284,7 +286,7 @@ inspector/.env
   - `top_k: 50, candidate_floor: 0.001`, `detector_threshold`, `crop{...}`
   - `features: ["det_logit","ver_logit","log_area","seam_margin"]`
   - `classes: {<name>: {"mode":"stack", mean, std, coef, intercept, tau, hi_passthrough} | {"mode":"passthrough"}}`
-  - `anchor: "piecewise_linear"`, `knn: null`, `provenance{...}`, `exit{decision: ship|no-ship|invalid-smoke, report}`
+  - `anchor: "piecewise_linear"`, `knn: null`, `provenance{...}`, `exit{decision: ship|no-ship|invalid-smoke, report, reasons, decided, run_decision, binding_from, earlier_decisions}` (`decision` = the first valid exit decision of the vrun, which binds; `run_decision` = the latest exit's own outcome)
 - **Features:**
   - `det_logit = logit(clip(s,1e-6,1-1e-6))`
   - `ver_logit` = the logit of the candidate's class head
@@ -298,8 +300,11 @@ inspector/.env
 - **`ml/infer/verifier.py`** (numpy, onnxruntime and Pillow only; importing it must not load torch):
   `extract_window(photo_rgb, box)`, `crops_from_window(win, dx=0, dy=0)`, `seam_margin(box, width, height)`, `anchor_map(p, tau, t_star)`, `class Stacker` (`from_dict`, `features`, `proba`, `final`), `class Verifier(stacker_path, threads=0)` with `rescore(photo_rgb, det: Detections) -> Detections`.
 - **Plug-in point:** `TiledDetector(conf_floor=0.001).detect(rgb)` → `verifier.rescore(rgb, det)` → `photo_verdict(threshold=t*)`.
-- **Working files** (internal to WP-verifier), in `ml_data/verifier/<vrun>/`: `candidates.json`, `windows.npy` (+ index), `oof_scores.json`, `verifier.onnx`, `stacker.json`, `exit_report.{md,json}`, `train_log.json`.
+- **Working files** (internal to WP-verifier), in `ml_data/verifier/<vrun>/`: `candidates.json`, `windows.npy` (+ index), `oof_scores.json`, `verifier.onnx`, `stacker.json`, `exit_report.{md,json}` (an earlier report is moved to `exit_archive/<UTC stamp>/`, never overwritten), `train_log.json`.
 - **Entry point:** `verifier.cli.main(argv: list[str]) -> int`; module CLI `python verifier/cli.py`.
+- **Anchor t\*:** `crossfit` reads the family's `operating_point.json` and refuses it (a smoke run only warns) unless it matches the candidates' family, has `target_sensitivity` equal to the verifier config's `exit.target_sensitivity` (pre-registered 0.95), and its `sources[*].model_sha256` are exactly the candidates' three fold models.
+- **`cascade-eval` buckets:** only `test`, `probe_xprod` and `future` (all with `--operating-point`, threshold = the stacker's t*). A dev fold is refused (S_final, tau_final and V_final were fitted on fold0..2, so stage 2 would be in-sample; the cross-fit runs `<F>+<vrun>_fold<k>` are the out-of-fold numbers), and so is `train_always`. The detector must pass `run_eval.check_eval_guards` without override (test: the dev_all model only) and belong to the verifier's family.
+- **Exit decision:** `invalid-smoke` unless the run is the pre-registered one: config = the committed `verifier/configs/mnv3s_2crop.yaml` (path, no overrides, sha256 of its LF text = `verifier.config.PREREGISTERED_CONFIG_SHA256`) at mine, crossfit and exit; `git_dirty == false` (ml/ minus ml/reports/) recorded at all three steps; exit with `--threads 0` and the config's `latency_photos`; every model in `train_log.json` and V_final with `weights_source == "imagenet1k_v1"`; out-of-fold candidates, fraction 1. Gate (b) is compared exactly (`casc_fa <= (1 − 3/10)·det_fa` in rationals).
 - **Test policy:** a cascade test evaluation requires `stacker.json.exit.decision == "ship"`; its ledger key is `sha256("cascade:<detector sha>:<stacker sha>")`, so evaluating the cascade after the detector's own test look counts as a second look and needs `--second-look "<reason>"`. `stacker.json.exit` is null until the exit rule has run.
 
 ### 8.5 Colab and Drive layout

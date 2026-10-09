@@ -7,18 +7,26 @@ scores the decision uses, `det_scores` = the detector scores of the same
 candidates, `source.kind = "cascade"`, per-photo width/height.
 
     python verifier/cli.py cascade-eval --run-name v1 --model <detector.onnx> \
-        --schema def3 --bucket fold0 [--operating-point op.json]
+        --schema def3 --bucket test --operating-point op.json
 
+- Buckets: only test / probe_xprod / future (CASCADE_BUCKETS). A dev fold is
+  refused: stacker.json (S_final, tau_final) and V_final were fitted on
+  fold0..2, so stage 2 would be in-sample there — the cross-fit's
+  <F>+<vrun>_fold<k> runs are the out-of-fold numbers. train_always is the
+  detector's training data. The detector passes run_eval.check_eval_guards
+  (schema, adapter, split; test only for the dev_all model) without override,
+  and must belong to the verifier's family.
 - The cascade's decision threshold is the stacker's anchor t* by construction;
-  buckets that need a frozen threshold (test / probe_xprod / future) also
-  require --operating-point, whose threshold must equal that t*.
+  every allowed bucket needs a frozen threshold, so --operating-point is
+  required and its threshold must equal that t*.
 - The test bucket is refused until run_eval.check_test_ledger exists
   (WP-eval), and for any verifier whose exit decision is not "ship". The
   ledger key of a cascade is sha256("cascade:<detector sha>:<stacker sha>"), so
   evaluating the cascade after the detector alone is a second look
   (--second-look "<reason>", recorded).
 - Cross-fit runs are written without a results row or gallery; cascade-eval
-  runs record a row unless the verifier is a smoke run.
+  runs record a row unless the verifier is a smoke run (and only ever for a
+  frozen-threshold bucket).
 """
 from __future__ import annotations
 
@@ -41,7 +49,7 @@ from eval.photo_scorer import score_all
 from infer.pipeline import TiledDetector, load_photo_rgb
 from infer.verifier import Verifier
 from verifier.common import (
-    STACKER, Refusal, read_json, sha256_file, vrun_dir, write_bytes_atomic,
+    CASCADE_BUCKETS, STACKER, Refusal, read_json, sha256_file, vrun_dir, write_bytes_atomic,
 )
 
 logger = logging.getLogger("ml.verifier.cascade")
@@ -228,17 +236,38 @@ def check_test_bucket(decision: Optional[str], smoke: bool, **known):
     return _call_with_known(fn, known)
 
 
+def check_bucket(bucket: Optional[str]) -> str:
+    if bucket in CASCADE_BUCKETS:
+        return bucket
+    if bucket and (bucket.startswith("fold") or bucket == "train_always"):
+        why = ("stacker.json (S_final, tau_final) and V_final were fitted on fold0..2, so "
+               "stage 2 is in-sample on every dev fold — the out-of-fold cascade numbers are "
+               "the cross-fit's <F>+<vrun>_fold<k> runs (exit_report)"
+               if bucket != "train_always" else "train_always is the detector's training data")
+        raise Refusal(f"cascade-eval refused on bucket {bucket!r}: {why}")
+    raise Refusal(f"cascade-eval needs --bucket, one of {list(CASCADE_BUCKETS)} (got {bucket!r})")
+
+
 def run(
     vrun: str,
     model_path: Path,
     adapter: str = "ultralytics",
     schema: str = "def3",
-    bucket: str = "fold0",
+    bucket: Optional[str] = None,
     operating_point: Optional[Path] = None,
     run_name: Optional[str] = None,
     threads: int = 0,
     second_look: Optional[str] = None,
 ) -> dict:
+    # ---- guards: nothing below reads a photo or opens an ONNX session first ----
+    bucket = check_bucket(bucket)
+    model_path = Path(model_path)
+    if not model_path.is_file():
+        raise Refusal(f"detector model not found: {model_path}")
+    try:  # the detector's own honesty guards, never overridden for a cascade
+        info, _ = run_eval.check_eval_guards(model_path, adapter, schema, bucket)
+    except run_eval.EvalGuardError as e:
+        raise Refusal(f"cascade-eval: {e}") from None
     stacker_path = vrun_dir(vrun) / STACKER
     ver = Verifier(stacker_path, threads=threads)
     sdoc = ver.stacker.doc
@@ -246,8 +275,13 @@ def run(
         raise ValueError(f"verifier {vrun} is for schema {sdoc.get('schema')!r}, not {schema!r}")
     prov = sdoc.get("provenance") or {}
     smoke = bool(prov.get("smoke")) or ver.stacker.exit_decision == "invalid-smoke"
+    if info and prov.get("family") and info["family"] != prov["family"]:
+        msg = (f"detector {info['run_name']} is family {info['family']!r}, the verifier "
+               f"{vrun} was fitted on {prov['family']!r} candidates")
+        if not smoke:
+            raise Refusal(msg)
+        logger.warning("SMOKE: " + msg)
     t_star = ver.stacker.t_star
-    model_path = Path(model_path)
     bundle_run = _bundle_run_name(model_path)
     run_name = run_name or f"{bundle_run}+{vrun}__{bucket}"
     model_sha = sha256_file(model_path)
@@ -319,8 +353,9 @@ def run(
         "snapshot_id": manifest["snapshot_id"],
         "dataset_fingerprint": meta_doc.get("dataset_fingerprint"), "host": platform.node(),
     }
+    record = not smoke and bucket in run_eval.FROZEN_OP_BUCKETS
     metrics = write_run(run_name, photos, ver.class_names, bucket, t_star, threshold_source,
-                        base, source, smoke, probe=probe, record=not smoke, gallery=True)
+                        base, source, smoke, probe=probe, record=record, gallery=True)
     if look is not None and hasattr(run_eval, "record_test_look"):
         _call_with_known(run_eval.record_test_look, {"look": look, **ledger})
     return metrics

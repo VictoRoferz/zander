@@ -246,6 +246,51 @@ def test_smoke_run_artifacts_respect_the_nesting_when_present():
             assert k not in doc["plan"]["models"][scorer]["train"]
 
 
+def test_operating_point_must_be_the_preregistered_anchor():
+    """t*: the candidates' family, the pre-registered target sensitivity and
+    the op frozen on exactly the three fold models that proposed them."""
+    from verifier.common import Refusal
+    from verifier.crossfit import load_operating_point
+
+    shas = [c * 64 for c in "abc"]
+    cand = {"schema": "def3", "family": "opfam", "class_names": NAMES, "smoke": False,
+            "runs": [{"eval_run": f"opfam_{k}", "bucket": k, "model_sha256": s}
+                     for k, s in zip(FOLDS, shas)]}
+
+    def op(name, **over):
+        doc = {"schema": "def3", "class_names": NAMES, "threshold": 0.31, "family": "opfam",
+               "runs": [f"opfam_{k}" for k in FOLDS], "target_sensitivity": 0.95,
+               "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
+               "sources": [{"eval_run": f"opfam_{k}", "fold": k, "model_sha256": s}
+                           for k, s in zip(FOLDS, shas)]}
+        doc.update(over)
+        for key in [k for k, v in over.items() if v is None]:
+            del doc[key]
+        path = TMP / "ops" / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    t, info = load_operating_point(op("good"), cand, 0.95)
+    assert t == 0.31 and info["target_sensitivity"] == 0.95 and info["source_model_sha256s"] == shas
+    bad = {
+        "other_target": op("t90", target_sensitivity=0.9),
+        "no_target": op("t_none", target_sensitivity=None),
+        "other_model": op("sha", sources=[{"eval_run": "x", "fold": "fold0", "model_sha256": "d" * 64},
+                                          *[{"model_sha256": s} for s in shas[1:]]]),
+        "v1_no_sources": op("v1", sources=None),
+        "other_family": op("fam", family="otherfam"),
+    }
+    for why, path in bad.items():
+        try:
+            load_operating_point(path, cand, 0.95)
+            raise AssertionError(f"{why}: must be refused")
+        except Refusal:
+            pass
+    # a smoke run only warns (its op is a smoke op by construction)
+    assert load_operating_point(bad["other_model"], {**cand, "smoke": True}, 0.95)[0] == 0.31
+
+
 # ------------------------------------------------------------------ cascade runs
 
 
@@ -373,6 +418,69 @@ def test_test_bucket_gate():
             run_eval.check_test_ledger = saved
         elif hasattr(run_eval, "check_test_ledger"):
             del run_eval.check_test_ledger
+
+
+def test_cascade_eval_guards_run_before_anything_is_loaded():
+    """cascade-eval: dev folds / train_always / no bucket are refused (stage 2
+    was fitted on fold0..2), and the detector passes run_eval's guards — all
+    before the verifier or a photo is loaded (no stacker.json exists here)."""
+    from dataprep.split import load_split
+    from eval import run_eval
+    from verifier import cascade_eval
+    from verifier.common import Refusal
+
+    split_id = load_split()["split_id"]
+
+    def bundle(name, fold, **over):
+        d = settings.bundles_dir / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.onnx").write_bytes(f"model-{name}".encode())
+        meta = {"bundle_version": 2, "run_name": name, "family": "cfam_def3", "fold": fold,
+                "framework": "ultralytics", "adapter": "ultralytics", "schema": "def3",
+                "classes": NAMES, "split_id": split_id, **over}
+        (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return d / "model.onnx"
+
+    def refused(model, bucket, *needles, schema="def3"):
+        try:
+            cascade_eval.run("no_such_vrun", model, schema=schema, bucket=bucket,
+                             operating_point=TMP / "op.json")
+        except Refusal as e:
+            for n in needles:
+                assert n in str(e), f"{n!r} not in: {e}"
+            return
+        raise AssertionError(f"bucket {bucket!r} with {model.parent.name} must be refused")
+
+    devall, fold0 = bundle("cfam_def3_devall", "dev_all"), bundle("cfam_def3_fold0", "fold0")
+    for b in ("fold0", "fold1", "fold2"):
+        refused(fold0, b, "in-sample", "fold")
+    refused(devall, "train_always", "training data")
+    refused(devall, None, "--bucket")
+    refused(fold0, "test", "dev_all")  # test is the dev_all model's one-shot look
+    other = bundle("cfam_def3_devall_s1", "dev_all", split_id="split_v1")
+    refused(other, "probe_xprod", "split")
+    nal = bundle("cfam_nal1_devall", "dev_all", schema="nal1", classes=NAMES[:1])
+    refused(nal, "future", "schema")
+    refused(TMP / "missing" / "model.onnx", "test", "not found")
+    # the dev_all model passes the detector guards and only then reaches the verifier
+    try:
+        cascade_eval.run("no_such_vrun", devall, bucket="test", operating_point=TMP / "op.json")
+        raise AssertionError("no stacker.json: must fail")
+    except Refusal as e:
+        raise AssertionError(f"the dev_all model must pass the detector guards: {e}")
+    except (FileNotFoundError, ValueError):
+        pass
+    from verifier.cli import build_parser
+
+    for argv in (["--bucket", "fold0"], []):  # the CLI has no default bucket
+        try:
+            build_parser().parse_args(["cascade-eval", "--model", "m.onnx", *argv])
+            raise AssertionError(f"cascade-eval {argv} must be a usage error")
+        except SystemExit as e:
+            assert e.code == 2
+    csv = settings.reports_dir / run_eval.RESULTS_FILE
+    assert not any(settings.eval_dir.glob("cfam*")), "nothing may be written"
+    assert csv.exists() is False or "cfam" not in csv.read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":

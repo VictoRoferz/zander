@@ -7,7 +7,8 @@ Verifier CLI — run from ml/ (like every toolchain step):
     python verifier/cli.py export --run-name v1
     python verifier/cli.py exit --run-name v1
     python verifier/cli.py all --family yolo26n_def3 --run-name v1 --device mps
-    python verifier/cli.py cascade-eval --run-name v1 --model m.onnx --bucket fold0
+    python verifier/cli.py cascade-eval --run-name v1 --model m.onnx --bucket test \
+        --operating-point op.json
 
 `python cli.py verifier <args>` (ml/cli.py) delegates here: main(argv) -> int.
 Smoke (no GPU, the smoke fold runs share one model, so they are NOT out-of-fold):
@@ -54,7 +55,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--run-name", default="v1", help="verifier run name (ml_data/verifier/<name>/)")
     p.add_argument("--config", default=None, help="verifier config YAML (default: the pre-registered one)")
     p.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE",
-                   help="config override (recorded; makes the run exploratory)")
+                   help="config override (recorded; makes the run exploratory — also at exit "
+                        "time: the exit decision is then invalid-smoke)")
 
 
 def _add_mine(p: argparse.ArgumentParser) -> None:
@@ -76,11 +78,17 @@ def _add_crossfit(p: argparse.ArgumentParser) -> None:
 
 
 def _add_exit(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--latency-photos", type=int, default=None)
-    p.add_argument("--threads", type=int, default=0, help="ORT intra-op threads (0 = default)")
+    p.add_argument("--latency-photos", type=int, default=None,
+                   help="latency bench photos (default: the config's 20; another count makes "
+                        "the exit exploratory)")
+    p.add_argument("--threads", type=int, default=0,
+                   help="ORT intra-op threads (0 = ORT default, pre-registered; anything else "
+                        "makes the exit exploratory)")
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from verifier.common import CASCADE_BUCKETS
+
     parser = argparse.ArgumentParser(prog="verifier", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -102,12 +110,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mine(p)
     _add_crossfit(p)
     _add_exit(p)
-    p = sub.add_parser("cascade-eval", help="detector + verifier on any bucket")
+    p = sub.add_parser("cascade-eval", help="detector + verifier on test / probe_xprod / future")
     _add_common(p)
     p.add_argument("--model", required=True, help="detector .onnx")
     p.add_argument("--adapter", default="ultralytics", choices=["ultralytics", "deim"])
     p.add_argument("--schema", default="def3", choices=["def3", "nal1"])
-    p.add_argument("--bucket", default="fold0")
+    p.add_argument("--bucket", required=True, choices=list(CASCADE_BUCKETS),
+                   help="never a dev fold: stage 2 was fitted on them (the cross-fit runs "
+                        "are the out-of-fold numbers)")
     p.add_argument("--operating-point", default=None)
     p.add_argument("--eval-run-name", default=None)
     p.add_argument("--threads", type=int, default=0)

@@ -92,3 +92,52 @@ seated and handheld iO photos, rescued photos.
   their exit numbers; re-tuning tau, hi-passthrough, C, epochs or the
   configuration on the folds; any test-bucket evaluation before a "ship" and
   the test ledger.
+
+## Implementation corrections before the first real run, 2026-10-09
+
+A code review found places where the code did not enforce what this file
+already says. They were fixed **before any real (non-smoke) verifier run**. No
+threshold, metric, endpoint or decision rule above changed; each item only
+makes the code do what the text says.
+
+- **Anchor = the family's frozen operating point** (Frozen protocol,
+  "anchor"). `crossfit` matched the operating point by family only. It now
+  also refuses one whose `target_sensitivity` differs from the pre-registered
+  0.95 (or is missing) and one not frozen on exactly the three fold models
+  that proposed the candidates (`sources[*].model_sha256`).
+- **The test bucket is not touched** (Scope) and the cross-fit numbers are the
+  out-of-fold ones. `cascade-eval` defaulted to `fold0`, where the final
+  stacker, tau and verifier (fitted on fold0..2) are in-sample, recorded a
+  results row there, and never ran the detector's eval guards. It now accepts
+  only `test` / `probe_xprod` / `future`, runs `run_eval.check_eval_guards`
+  (test: the dev_all detector only) and checks the detector's family.
+- **Configuration "as committed, no overrides"** (Frozen protocol, Decision
+  rule). Only the mine and crossfit configs were checked, and only by path.
+  Now (1) the exit step's own config counts too: the gates are read from it,
+  and `exit --set exit.latency_verifier_p50_ms=500 --set
+  exit.latency_total_p50_s=2 --set exit.fa_reduction=0` had turned a no-ship
+  into a ship; (2) "as committed" is the content: the sha256 of
+  `configs/mnv3s_2crop.yaml` as committed with this file (1c28a8c, unchanged
+  since) is pinned in `verifier/config.py`, so an in-place edit is no longer
+  the default config; (3) uncommitted code under `ml/` (`git_dirty`, recorded
+  at mine, crossfit and exit; the appended rows in `ml/reports/` excluded)
+  makes the run exploratory. Any of these → invalid-smoke.
+- **Gate (c) "default threads, 20 photos"**. `exit --threads N` and
+  `--latency-photos N` were accepted silently. Now `--threads` other than 0
+  (= ONNX Runtime's default intra-op threads) or a photo count other than the
+  config's 20 → invalid-smoke. The bench model is picked as the fold-0 run by
+  bucket, not by list position.
+- **"Every run is reported"**. A second `exit` overwrote the first report.
+  Now an existing report moves to `exit_archive/<UTC stamp>/`, and the new
+  report and `stacker.json.exit.earlier_decisions` list every earlier one.
+  Re-running `exit` only re-measures the latency (everything else is
+  deterministic), so the **first valid decision binds**: a later exit is
+  reported (`run_decision`) but cannot change `stacker.json.exit.decision`,
+  which gates the cascade test bucket.
+- **Secondary (b) "≥ 30 % fewer"**. `casc_fa <= (1 - 0.30) * det_fa` in
+  floating point made exactly 30 % fail (0.7 × 90 = 62.999…); it is now
+  compared exactly in rationals (10 × cascade ≤ 7 × detector).
+- **"The backbone fell back to random initialisation"**. Only V_final's
+  backbone was checked; a random-init fallback in any U_fold* / V_fold* model
+  passed. Every model in `train_log.json` is checked now (a missing log or
+  model is invalid too).

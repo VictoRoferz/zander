@@ -25,8 +25,10 @@ python verifier/cli.py crops --run-name v1
 python verifier/cli.py crossfit --run-name v1 --device mps   # op: ml_data/eval/operating_point_<schema>_<F>.json
 python verifier/cli.py export --run-name v1
 python verifier/cli.py exit --run-name v1
-# detector + verifier on any bucket (test refused until run_eval.check_test_ledger exists):
-python verifier/cli.py cascade-eval --run-name v1 --model <detector.onnx> --bucket fold0
+# detector + verifier on test / probe_xprod / future only (dev folds are refused: stage 2
+# was fitted on them, the cross-fit runs are the out-of-fold numbers; test only after "ship"):
+python verifier/cli.py cascade-eval --run-name v1 --model <dev_all detector.onnx> --bucket test \
+  --operating-point ../ml_data/eval/operating_point_def3_<F>.json
 ```
 
 `python cli.py verifier ...` (ml/cli.py) delegates to `verifier.cli.main(argv)`.
@@ -78,7 +80,16 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python verifier/cli.py all \
 7. **Export** (`export_onnx.py`). V_final to `verifier.onnx` (opset 17,
    dynamic N, parity ≤ 1e-4 on 32 cached windows) plus `stacker.json`.
 8. **Exit** (`exit_rule.py`), as pre-registered, into `exit_report.{md,json}`
-   and `stacker.json.exit`.
+   and `stacker.json.exit`. Only the pre-registered run can decide: the
+   config must be the committed file byte for byte (`PREREGISTERED_CONFIG_SHA256`,
+   no `--set` / `--config`) at mine, crossfit **and** exit time, the code under
+   `ml/` committed at all three steps (`git_dirty`, `ml/reports/` excluded), the
+   exit run with `--threads 0` and the pre-registered 20 latency photos, and all
+   seven cross-fit models ImageNet-initialised (`train_log.json`). Anything else
+   is `invalid-smoke`. An earlier report is never overwritten: it moves to
+   `exit_archive/<UTC stamp>/` and the new report lists it. The first valid
+   decision (ship / no-ship) of a vrun binds: a later exit only re-measures the
+   latency, so it is reported but cannot change `stacker.json.exit.decision`.
 
 ## Why nested
 
@@ -128,7 +139,8 @@ AUROC.
 sha) · `oof_scores.json` (per-candidate inner/outer scores, per-fold t(k),
 tau(k), stackers) · `stacker_fold<k>.json` (S_k, referenced by the cascade
 runs' `source.stacker_sha256`) · `verifier_final.pt` · `verifier.onnx` ·
-`stacker.json` · `exit_report.{md,json}` · `train_log.json`.
+`stacker.json` · `exit_report.{md,json}` (earlier ones in `exit_archive/<UTC stamp>/`) ·
+`train_log.json`.
 Cascade eval runs go to `ml_data/eval/<F>+<vrun>_fold<k>/` (predictions.json
 v2, `source.kind = cascade`). Smoke and fractional runs never append to
 `ml/reports/results_v2.csv`.

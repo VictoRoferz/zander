@@ -267,6 +267,47 @@ def test_test_eval_required_unless_waived():
     _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x11"), export.ExportError, "another operating point")
 
 
+def test_cascade_run_is_not_the_detectors_test_eval():
+    """A cascade test run (detector + verifier) records the detector's sha but
+    no operating_point block: it is neither the test eval nor a parity
+    reference; a detector test run must have recorded this op's sha."""
+    fresh = _bundle("tiny3_def3_devall", "dev_all", family="tiny_def3")
+    _tiny_onnx(fresh / "model.onnx", rows=ROWS[:-1] + [(610, 30, 20, 20, 0.43, 0.1, 0.1)])  # own sha
+    export._dev_photo_ids = lambda n: list(PHOTO_IDS)
+
+    def rewrite(run, fn):
+        for f in ("metrics.json", "predictions.json"):
+            path = settings.eval_dir / run / f
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            fn(doc)
+            path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+    def as_cascade(doc):
+        doc["source"] = {**doc["source"], "kind": "cascade", "verifier_run": "v1",
+                         "stacker_sha256": "e" * 64}
+        doc.pop("operating_point", None)
+        if "level1_verdict" in doc:
+            doc["level1_verdict"] = {"n_positive": 99}
+
+    _eval_run("tiny3_def3_devall+v1__test", fresh, "test", OP)
+    rewrite("tiny3_def3_devall+v1__test", as_cascade)
+    _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x15"), export.ExportError, "no test evaluation")
+    export.run(fresh, OP, out_dir=TMP / "x16", no_test_eval=True)
+    raw = json.loads((TMP / "x16" / "detector.json").read_text(encoding="utf-8"))
+    assert raw["validation"]["test_eval_run"] is None and raw["validation"]["test_level1"] is None
+    assert raw["validation"]["parity"]["mode"].startswith("floor-equivalence"), raw["validation"]["parity"]
+    # a detector test run at the right threshold that did not record the op's sha does not count
+    _eval_run("tiny3_def3_devall__test", fresh, "test", OP)
+    rewrite("tiny3_def3_devall__test", lambda doc: doc.pop("operating_point", None))
+    _raises(lambda: export.run(fresh, OP, out_dir=TMP / "x17"), export.ExportError,
+            "another operating point", "not recorded")
+    _eval_run("tiny3_def3_devall__test", fresh, "test", OP)  # with the op block: it counts
+    export.run(fresh, OP, out_dir=TMP / "x18")
+    raw = json.loads((TMP / "x18" / "detector.json").read_text(encoding="utf-8"))
+    assert raw["validation"]["test_eval_run"] == "tiny3_def3_devall__test"
+    assert raw["validation"]["test_level1"]["n_positive"] == 3
+
+
 def test_fold_model_and_v1_op_only_with_allow_fold_model():
     fold0 = settings.bundles_dir / "tiny_def3_fold0"
     export._dev_photo_ids = lambda n: list(PHOTO_IDS)  # no eval of this model: live floor mode
