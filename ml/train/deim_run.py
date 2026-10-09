@@ -67,8 +67,9 @@ batch 32) do not transfer:
     scores float [N,300] = layout "deim". DEIM's onnxsim step is skipped (no
     CPU gain measured; onnxsim 0.4.x has no wheel for Colab's Python) and the
     TorchScript exporter is forced (dynamo=False), which DEIM targets. A
-    5-tile torch-vs-ONNX parity check (tie-tolerant) must pass; its numbers
-    go into meta.json.
+    5-tile torch-vs-ONNX parity check (tie-tolerant; boxes match by IoU or
+    within 0.5 px, because D-FINE also decodes inverted boxes) must pass; its
+    numbers go into meta.json.
 
 Resume (Colab disconnects). With `mirror_dir`, the parent process polls
 DEIM's output/log.txt (one JSON line per finished epoch) and copies log.txt,
@@ -245,6 +246,10 @@ PARITY_TILES = 5
 PARITY_SCORE_FLOOR = 0.01
 PARITY_SCORE_TOL = 1e-3
 PARITY_MIN_IOU = 0.98
+# ... or every coordinate within this many pixels: D-FINE decodes inverted and
+# zero-area boxes (x2 < x1, ...), whose IoU is 0 even against their own twin
+# 0.02 px away (measured torch vs ONNX: <= 0.08 px on every box).
+PARITY_BOX_TOL_PX = 0.5
 
 ENV_POLL = "ZANDER_DEIM_POLL_S"
 DEFAULT_POLL_S = 10.0
@@ -1313,42 +1318,58 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else (1.0 if list(a) == list(b) else 0.0)
 
 
+def _proper(box) -> bool:
+    return box[2] > box[0] and box[3] > box[1]
+
+
 def compare_detections(ref: tuple, test: tuple, *, score_floor: float = PARITY_SCORE_FLOOR,
-                       score_tol: float = PARITY_SCORE_TOL, min_iou: float = PARITY_MIN_IOU) -> dict:
+                       score_tol: float = PARITY_SCORE_TOL, min_iou: float = PARITY_MIN_IOU,
+                       box_tol_px: float = PARITY_BOX_TOL_PX) -> dict:
     """Tie-tolerant parity of two (labels, boxes, scores) top-k outputs: the
     sorted scores must agree, and every reference detection >= score_floor
     needs a partner with the same label, a score within score_tol and IoU >=
-    min_iou (queries with equal scores may come out of TopK in any order).
-    Detections within score_tol of either side's k-th score are skipped: a
-    near-tie there can drop a query out of one top-k but not the other."""
+    min_iou or every coordinate within box_tol_px (queries with equal scores
+    may come out of TopK in any order; an inverted or zero-area box has IoU 0
+    with everything, its own twin included). Detections within score_tol of
+    either side's k-th score are skipped: a near-tie there can drop a query
+    out of one top-k but not the other. `min_iou` reports proper boxes only;
+    `degenerate` counts the matched pairs with an improper box."""
     rl, rb, rs = (list(x) for x in ref)
     tl, tb, ts = (list(x) for x in test)
     n = min(len(rs), len(ts))
     s_ref, s_test = sorted(map(float, rs), reverse=True)[:n], sorted(map(float, ts), reverse=True)[:n]
     max_score = max((abs(a - b) for a, b in zip(s_ref, s_test)), default=0.0)
     cutoff = max(s_ref[-1], s_test[-1]) + score_tol if n else float("inf")
-    used, mismatches, compared, min_seen, max_box = set(), 0, 0, 1.0, 0.0
+    used, ious, mismatches, compared, degenerate, max_box = set(), [], 0, 0, 0, 0.0
     for i in sorted(range(len(rs)), key=lambda k: -float(rs[k])):
         if float(rs[i]) < score_floor or float(rs[i]) <= cutoff:
             break
         compared += 1
-        best, best_iou = None, -1.0
+        a = [float(v) for v in rb[i]]
+        best, best_key, best_iou = None, None, -1.0
         for j in range(len(ts)):
             if j in used or int(tl[j]) != int(rl[i]) or abs(float(ts[j]) - float(rs[i])) > score_tol:
                 continue
-            iou = _iou([float(v) for v in rb[i]], [float(v) for v in tb[j]])
-            if iou > best_iou:
-                best, best_iou = j, iou
-        if best is None or best_iou < min_iou:
+            b = [float(v) for v in tb[j]]
+            iou, dist = _iou(a, b), max(abs(x - y) for x, y in zip(a, b))
+            best_iou = max(best_iou, iou)
+            key = (iou >= min_iou or dist <= box_tol_px, -dist)  # a partner, then the nearest one
+            if best_key is None or key > best_key:
+                best, best_key = j, key
+        if best is None or not best_key[0]:
             mismatches += 1
-            min_seen = min(min_seen, max(best_iou, 0.0))
+            ious.append(max(best_iou, 0.0))
             continue
         used.add(best)
-        min_seen = min(min_seen, best_iou)
-        max_box = max(max_box, max(abs(float(a) - float(b)) for a, b in zip(rb[i], tb[best])))
-    return {"compared": compared, "mismatches": mismatches, "max_score_diff": max_score,
-            "min_iou": round(min_seen, 6) if compared else None, "max_box_diff_px": max_box,
-            "ok": mismatches == 0 and max_score <= score_tol}
+        b = [float(v) for v in tb[best]]
+        if _proper(a) and _proper(b):
+            ious.append(_iou(a, b))
+        else:
+            degenerate += 1
+        max_box = max(max_box, -best_key[1])
+    return {"compared": compared, "mismatches": mismatches, "degenerate": degenerate,
+            "max_score_diff": max_score, "min_iou": round(min(ious), 6) if ious else None,
+            "max_box_diff_px": max_box, "ok": mismatches == 0 and max_score <= score_tol}
 
 
 def parity_images(layout: DatasetLayout, k: int = PARITY_TILES) -> list:
@@ -1811,7 +1832,9 @@ def _worker_parity(deim_dir: str, config: str, checkpoint: str, onnx_path: str, 
     summary = {
         "tiles": len(rows), "reference": "torch fp32 CPU, EMA weights, deploy mode",
         "score_floor": PARITY_SCORE_FLOOR, "score_tol": PARITY_SCORE_TOL, "min_iou_required": PARITY_MIN_IOU,
+        "box_tol_px": PARITY_BOX_TOL_PX,
         "compared": sum(r["compared"] for r in rows), "mismatches": sum(r["mismatches"] for r in rows),
+        "degenerate": sum(r["degenerate"] for r in rows),
         "max_score_diff": max((r["max_score_diff"] for r in rows), default=0.0),
         "max_box_diff_px": max((r["max_box_diff_px"] for r in rows), default=0.0),
         "min_iou": min((r["min_iou"] for r in rows if r["min_iou"] is not None), default=None),

@@ -761,6 +761,37 @@ def test_compare_detections_is_tie_tolerant():
     assert r["ok"] and r["compared"] == 0, r
 
 
+def test_parity_matches_degenerate_and_tiny_boxes_by_coordinates():
+    # D-FINE decodes inverted and zero-area boxes. Torch and ONNX agree on them
+    # to ~0.02 px, but their IoU is 0 even against their own twin: a 1-epoch
+    # fine-tune from the COCO init failed the gate with 12 such "mismatches".
+    labels = [0, 1, 2, 0, 1, 2]
+    boxes = [[609.8, 556.5, 639.2, 465.4],    # y inverted (seen in that run)
+             [100.0, 100.0, 100.0, 130.0],    # zero width
+             [50.0, 60.0, 40.0, 50.0],        # both inverted: positive "area", IoU 0
+             [10.0, 10.0, 38.0, 40.0],        # proper
+             [300.0, 300.0, 302.0, 302.0],    # proper but 2 px: a 0.05 px shift is IoU 0.91
+             [0.0, 0.0, 1.0, 1.0]]
+    scores = [0.9, 0.8, 0.7, 0.6, 0.5, 0.001]
+    near = [[v + 0.05 for v in b] for b in boxes]
+    r = D.compare_detections((labels, boxes, scores), (labels, near, [s + 1e-6 for s in scores]))
+    assert r["ok"] and (r["compared"], r["mismatches"], r["degenerate"]) == (5, 0, 3), r
+    assert abs(r["max_box_diff_px"] - 0.05) < 1e-6 and 0.9 < r["min_iou"] < 0.92, r
+    # still strict: a box that is genuinely elsewhere (1 px), or another label, is a mismatch
+    for k in (0, 1, 4):
+        far = [list(b) for b in boxes]
+        far[k] = [v + 1.0 for v in far[k]]
+        r = D.compare_detections((labels, boxes, scores), (labels, far, scores))
+        assert not r["ok"] and r["mismatches"] == 1, (k, r)
+    relabel = list(labels)
+    relabel[0] = 1
+    assert D.compare_detections((labels, boxes, scores), (relabel, boxes, scores))["mismatches"] == 1
+    # only degenerate pairs: min_iou has nothing to report
+    r = D.compare_detections((labels[:2] + [0], boxes[:2] + [boxes[5]], [0.9, 0.8, 0.001]),
+                             (labels[:2] + [0], near[:2] + [near[5]], [0.9, 0.8, 0.001]))
+    assert r["ok"] and r["degenerate"] == 2 and r["min_iou"] is None, r
+
+
 def test_deim_adapter_decodes_a_deim_graph_with_labels_unchanged():
     from infer.onnx_adapters import DeimAdapter, load_adapter
     from infer.pipeline import TiledDetector
