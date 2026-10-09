@@ -102,6 +102,18 @@ RESULTS_FIELDS = [
     "exact_set_acc", "ap50_nal", "probe_found", "mean_ms_per_photo",
     "tiler_version", "split_id", "snapshot_id", "dataset_fingerprint", "host",
 ]
+# results_v2.csv holds honest evals only (README): train_always is memorisation;
+# on probe_xprod only the per-box probe counts are honest (probe boxes are held
+# out of every training view, the photos' other defects may be trained), so its
+# photo/defect-level columns stay empty.
+NOT_RECORDED_BUCKETS = {"train_always"}
+PROBE_ONLY_BUCKETS = {"probe_xprod"}
+_NOT_HONEST_ON_PROBE = (
+    "n_positive", "n_negative_seated", "photo_auroc", "escape", "escape_ci_lo", "escape_ci_hi",
+    "fcr_seated", "fcr_seated_ci_lo", "fcr_seated_ci_hi", "fcr_handheld",
+    "recall_nal_0.5fppi", "recall_nal_ci_lo", "recall_nal_ci_hi", "recall_bruecke_0.5fppi",
+    "recall_fahne_0.5fppi", "recall_any_0.5fppi", "exact_set_acc", "ap50_nal",
+)
 TEST_LEDGER_FIELDS = [
     "date", "run_name", "model_sha256", "operating_point_sha256", "bundle_run",
     "family", "schema", "threshold", "look", "reason",
@@ -736,7 +748,7 @@ def _write_outputs(
     doc["photos"] = [_photo_record(p) for p in photos]
     _atomic_write_text(out_dir / "predictions.json", json.dumps(doc, ensure_ascii=False))
     report = format_report(metrics)
-    (out_dir / "report.md").write_text(report, encoding="utf-8")
+    _atomic_write_text(out_dir / "report.md", report)
     if gallery:
         _gallery(out_dir, metrics, photos)
     if record:
@@ -945,6 +957,8 @@ def choose_operating_point(
     family with equivalent training configs. Writes
     ml_data/eval/operating_point_<schema>_<family>.json (+ .md); an existing
     file is frozen — `force` archives it to ml_data/eval/archive/ first."""
+    if not valid_threshold(target_sensitivity):
+        raise EvalGuardError(f"--target-sensitivity {target_sensitivity!r} must be a number in (0, 1]")
     split = load_split()
     k = len(split["folds"])
     runs = list(runs or [])
@@ -1025,6 +1039,13 @@ def choose_operating_point(
     t = threshold_for_sensitivity(photos, target_sensitivity)
     if t is None:
         raise RuntimeError("no positive photos with a detection — cannot set t*")
+    cut = [f"{r} (conf_floor {s['conf_floor']})" for r, s in zip(runs, sources)
+           if isinstance(s.get("conf_floor"), (int, float)) and s["conf_floor"] > t]
+    if cut:  # scores between t* and their floor were never stored: t* is not reproducible
+        raise EvalGuardError(
+            f"choose-op refused: t*={t:.6g} lies below the confidence floor of {cut} — their "
+            "detections under the floor were cut off; re-evaluate with a lower --conf"
+        )
     metrics = score_all(
         photos, docs[0]["class_names"], t,
         threshold_source=f"pooled out-of-fold {buckets} (t* fitted here → mildly optimistic)",
@@ -1043,6 +1064,7 @@ def choose_operating_point(
         "oof_level1": metrics["level1_verdict"],
         "family": fam,
         "target_sensitivity": target_sensitivity,
+        "allow_smoke": bool(smoke),  # frozen from smoke runs under --allow-smoke: plumbing only
         "sources": [
             {"eval_run": r, "bundle_run": i["run_name"], "fold": i["fold"],
              "model_sha256": s["model_sha256"], "config_sha256": i["config_sha256"],
@@ -1070,7 +1092,7 @@ def choose_operating_point(
                f"`{s['model_sha256'][:12]}`" for s in op["sources"]]
     if smoke:
         header.append("- ⚠ **smoke runs (allow_smoke)** — plumbing only, not a real operating point")
-    md.write_text("\n".join(header) + "\n\n" + report, encoding="utf-8")
+    _atomic_write_text(md, "\n".join(header) + "\n\n" + report)
     logger.info("\n" + report)
     logger.info(f"operating point frozen: t*={t:.6g} -> {out}")
     return out
@@ -1216,7 +1238,14 @@ def _gallery(out_dir: Path, m: dict, photos: list[dict]) -> None:
     )
 
 
+def results_path() -> Path:
+    return settings.reports_dir / RESULTS_FILE
+
+
 def _append_results_row(m: dict) -> None:
+    if m["bucket"] in NOT_RECORDED_BUCKETS:
+        logger.info(f"not recorded in {RESULTS_FILE}: {m['bucket']} is a memorisation check")
+        return
     l1, l3 = m["level1_verdict"], m["level3_defects"]
     names = m["class_names"]
 
@@ -1254,8 +1283,10 @@ def _append_results_row(m: dict) -> None:
         "dataset_fingerprint": (m.get("dataset_fingerprint") or "")[:16] or None,
         "host": m["host"],
     }
-    settings.reports_dir.mkdir(parents=True, exist_ok=True)
-    path = settings.reports_dir / RESULTS_FILE
+    if m["bucket"] in PROBE_ONLY_BUCKETS:
+        row.update({k: None for k in _NOT_HONEST_ON_PROBE})
+    path = results_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     new = not path.exists()
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RESULTS_FIELDS)

@@ -676,6 +676,56 @@ def test_ledger_header_migration_keeps_rows_and_appends_are_fsynced():
     assert run_eval.check_test_ledger("a" * 64, "b" * 64)["look"] == "rerun"  # the old row still counts
 
 
+def test_choose_op_records_allow_smoke_checks_floor_and_target():
+    _fold_family("lowsm_smoke_def3")
+    op = json.loads(run_eval.choose_operating_point([], family="lowsm_smoke_def3",
+                                                    allow_smoke=True).read_text(encoding="utf-8"))
+    assert op["allow_smoke"] is True  # the .md said so; consumers read the JSON
+    _fold_family("lowns_def3")
+    op = json.loads(run_eval.choose_operating_point([], family="lowns_def3").read_text(encoding="utf-8"))
+    assert op["allow_smoke"] is False
+    for bad in (0, -0.5, 1.5, None, True, float("nan")):
+        _raises(lambda: run_eval.choose_operating_point([], family="lowsm_smoke_def3", allow_smoke=True,
+                                                        target_sensitivity=bad, force=True),
+                EvalGuardError, "--target-sensitivity")
+    # t* = 0.4 here; a fold run scored with --conf 0.5 lost every score in [0.4, 0.5)
+    _fold_family("lowfl_def3")
+    path = settings.eval_dir / "lowfl_def3_fold1" / "predictions.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["source"]["conf_floor"] = 0.5
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    _raises(lambda: run_eval.choose_operating_point([], family="lowfl_def3"), EvalGuardError,
+            "lowfl_def3_fold1 (conf_floor 0.5)", "cut off")
+    doc["source"]["conf_floor"] = 0.4  # a floor at t* keeps every score >= t*
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert json.loads(run_eval.choose_operating_point([], family="lowfl_def3")
+                      .read_text(encoding="utf-8"))["threshold"] == 0.4
+
+
+def test_results_rows_only_for_honest_buckets():
+    """train_always is memorisation; on probe_xprod only the probe counts are honest."""
+    path = TMP / "results_v2_test.csv"
+    saved = run_eval.results_path
+    run_eval.results_path = lambda: path
+    try:
+        m = score_all(_photos(), NAMES, 0.1, "explicit", probe=[])
+        m.update({"model": "m.onnx", "adapter": "ultralytics", "schema": "def3", "n_photos": 2,
+                  "mean_ms_per_photo": 1.0, "tiler_version": "v2", "split_id": "split_v2",
+                  "snapshot_id": "s", "dataset_fingerprint": None, "host": "h"})
+        for bucket in ("train_always", "probe_xprod", "fold0"):
+            run_eval._append_results_row({**m, "bucket": bucket, "run_name": f"r_{bucket}"})
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [r["bucket"] for r in rows] == ["probe_xprod", "fold0"], rows
+        probe, fold = rows
+        for col in ("escape", "photo_auroc", "recall_nal_0.5fppi", "ap50_nal", "fcr_seated"):
+            assert probe[col] == "", (col, probe[col])
+        assert probe["n_photos"] == "2" and probe["threshold"] == "0.1"
+        assert fold["escape"] != "" and fold["photo_auroc"] != ""
+    finally:
+        run_eval.results_path = saved
+
+
 def test_zz_results_csv_untouched():
     now = RESULTS.read_bytes() if RESULTS.exists() else None
     assert now == RESULTS_BEFORE, "tests must never append to ml/reports/results_v2.csv"

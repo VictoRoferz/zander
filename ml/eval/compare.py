@@ -24,8 +24,10 @@ excludes 0; otherwise the faster/simpler model wins. With `--margin δ` the
 non-inferiority verdict is added: A is non-inferior to B iff the CI's lower
 bound of (A − B) > −δ.
 
-Paired = both models are scored on identical photos, so photo-to-photo
-difficulty cancels out. Uncertainty comes from a cluster bootstrap over the
+Paired = both models are scored on identical photos against identical ground
+truth (per-photo verdict + boxes, and the label snapshot when recorded — a
+relabel between the evals is refused), so photo-to-photo difficulty cancels
+out. Uncertainty comes from a cluster bootstrap over the
 split_v2 board GROUPS (re-shots of one board are not independent) and, for the
 photo verdicts, an exact McNemar test on the discordant photos. With few
 discordant photos McNemar cannot reach significance (<= 5 discordant: never at
@@ -54,6 +56,7 @@ from dataprep.split import load_split
 from eval.photo_scorer import class_records, is_negative, is_positive, pscore
 from eval.run_eval import (
     EvalGuardError,
+    _atomic_write_text,
     check_op_sources,
     config_differences,
     load_predictions,
@@ -187,6 +190,40 @@ def resolve(name: str) -> dict:
             "photos": photos, "docs": docs}
 
 
+def _gt_signature(p: dict) -> tuple:
+    """Schema-independent ground truth of one photo: verdict + every labelled box
+    (def3 `gt` vs nal1 `gt` + `other_gt` hold the same boxes)."""
+    boxes = [b for _, b in list(p["gt"]) + list(p["other_gt"])]
+    return p["gt_verdict"], sorted(tuple(round(float(v), 1) for v in b) for b in boxes)
+
+
+def _snapshot_ids(res: dict) -> set[str]:
+    out = set()
+    for r in res["runs"]:
+        mpath = settings.eval_dir / r / "metrics.json"
+        if mpath.is_file():
+            snap = json.loads(mpath.read_text(encoding="utf-8")).get("snapshot_id")
+            if snap:
+                out.add(snap)
+    return out
+
+
+def check_same_ground_truth(A: dict, B: dict) -> None:
+    """Paired = scored against the SAME labels: a relabel between the two evals
+    would turn label changes into a model difference."""
+    bad = [pa["capture_id"] for pa, pb in zip(A["photos"], B["photos"])
+           if _gt_signature(pa) != _gt_signature(pb)]
+    if bad:
+        raise CompareError(
+            f"{A['name']} and {B['name']} were scored against different ground truth on "
+            f"{len(bad)} photo(s) (e.g. {bad[:3]}) — re-evaluate both on the same label snapshot"
+        )
+    sa, sb = _snapshot_ids(A), _snapshot_ids(B)
+    if sa and sb and sa != sb:
+        raise CompareError(f"{A['name']} used label snapshot(s) {sorted(sa)}, {B['name']} "
+                           f"{sorted(sb)} — re-evaluate both on the same snapshot")
+
+
 def _family_of(res: dict) -> str | None:
     if res["kind"] == "family":
         return res["name"]
@@ -260,6 +297,7 @@ def compare(
             f"({A['name']}: {A['bucket']}, {len(ids_a)} photos; "
             f"{B['name']}: {B['bucket']}, {len(B['photos'])} photos)"
         )
+    check_same_ground_truth(A, B)
     ia, cname = resolve_class(cls, A["class_names"])
     if ia is None:
         if A["class_names"] != B["class_names"]:
@@ -358,7 +396,7 @@ def compare(
         result["non_inferior"] = bool(lo is not None and lo > -margin)
     if write:
         out = settings.eval_dir / f"compare_{A['name']}__{B['name']}__{class_slug(cname)}.json"
-        out.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
+        _atomic_write_text(out, json.dumps(result, indent=1, ensure_ascii=False))
         result["file"] = str(out)
     logger.info(json.dumps(result, indent=1, ensure_ascii=False))
     return result

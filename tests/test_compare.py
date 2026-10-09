@@ -257,6 +257,28 @@ def test_a_stale_frozen_operating_point_is_never_applied():
             (EVAL / f"famA2_fold{k}" / "metrics.json").unlink()
 
 
+def test_both_sides_must_share_the_ground_truth():
+    """A relabel between two evals would read as a model difference."""
+    for k, order in enumerate((["P1", "P2"], ["P3", "P4"])):
+        _write_run(f"famR_fold{k}", f"fold{k}", "def3", A, order)
+    path = EVAL / "famR_fold1" / "predictions.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["photos"][1]["gt_verdict"] = "NiO"  # P4 relabelled: a Fahne found on review
+    doc["photos"][1]["gt"] = [[2, [5, 5, 9, 9]]]
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    _raises(lambda: compare.compare("famA", "famR", write=False), compare.CompareError,
+            "different ground truth", "P4")
+    # same photos and labels, but the evals recorded different label snapshots
+    for fam, snap in (("famS1", "v2_2026-08-17_yolo"), ("famS2", "v3_2026-10-01_json")):
+        for k, order in enumerate((["P1", "P2"], ["P3", "P4"])):
+            _write_run(f"{fam}_fold{k}", f"fold{k}", "def3", A, order)
+            (EVAL / f"{fam}_fold{k}" / "metrics.json").write_text(json.dumps(
+                {"bucket": f"fold{k}", "snapshot_id": snap}), encoding="utf-8")
+    _raises(lambda: compare.compare("famS1", "famS2", write=False), compare.CompareError, "snapshot")
+    # def3 vs nal1 hold the same boxes in gt / other_gt: still comparable
+    assert compare.compare("famA", "famB", write=False)["n_photos"] == 4
+
+
 def test_missing_operating_point_is_na():
     (EVAL / "operating_point_nal1_famB.json").rename(EVAL / "moved_op.json")
     try:

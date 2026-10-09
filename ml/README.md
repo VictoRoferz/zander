@@ -180,8 +180,13 @@ verifier ...` — see **`verifier/README.md`**.
   look lands in `<bundle_run>__test__look<k>`; a look's eval dir is never
   overwritten.
 - `reports/results_v2.csv` gets one row per honest eval (never smoke or
-  overridden runs). Smoke rows are never committed — `git checkout --
-  reports/results_v2.csv` after experiments.
+  overridden runs, never `train_always`; a `probe_xprod` row keeps only the
+  probe hit counts — the photo-level columns stay empty). Smoke rows are never
+  committed — `git checkout -- reports/results_v2.csv` after experiments.
+- `compare` refuses two sides scored against different ground truth (a
+  relabel between the evals). `choose-op` refuses a target sensitivity outside
+  (0, 1] and a t* below a fold run's `--conf` floor; the op JSON records
+  `allow_smoke`.
 
 ### Commands
 

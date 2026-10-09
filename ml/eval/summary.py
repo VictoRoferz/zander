@@ -41,6 +41,7 @@ from eval import compare
 from eval.photo_scorer import score_all, threshold_for_sensitivity
 from eval.run_eval import (
     EvalGuardError,
+    _atomic_write_text,
     check_op_sources,
     load_predictions,
     run_source,
@@ -235,7 +236,7 @@ def run(
     }
     out_json = Path(out_json) if out_json else settings.eval_dir / "summary_v2.json"
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(doc, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
+    _atomic_write_text(out_json, json.dumps(doc, indent=1, ensure_ascii=False, default=str))
 
     md = [
         "# Model selection v2 — pooled out-of-fold",
@@ -286,7 +287,7 @@ def run(
         md += ["", "_⚠ Smoke families included (`--include-smoke`): plumbing checks, not models._"]
     out_md = Path(out_md) if out_md else settings.reports_dir / "model_selection_v2.md"
     out_md.parent.mkdir(parents=True, exist_ok=True)
-    out_md.write_text("\n".join(md) + "\n", encoding="utf-8")
+    _atomic_write_text(out_md, "\n".join(md) + "\n")
     logger.info(f"summary: {len(candidates)} ranked, {len(incomplete)} incomplete, "
                 f"{len(excluded)} excluded -> {out_md}, {out_json}")
     return doc
