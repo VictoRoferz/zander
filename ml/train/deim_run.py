@@ -107,6 +107,7 @@ import argparse
 import contextlib
 import dataclasses
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -943,14 +944,25 @@ MIRROR_MEMBERS = ((LOCAL_LOG, "log.txt"), (LOCAL_CKPT, "last.pt"), (Path(U.SIDEC
 
 
 def probe_checkpoint(path: Path, total_epochs: int) -> CkptState:
-    """Classify a DEIM training checkpoint by its `last_epoch` (0-based)."""
+    """Classify a DEIM training checkpoint by its `last_epoch` (0-based).
+
+    An OSError while READING the file (a dropped Drive mount: ENOTCONN, EIO)
+    is raised, never reported as "corrupt": plan_start would move a good
+    mirror aside and the run would start over (ultralytics_run.probe_checkpoint
+    has the same rule). The bytes are parsed from memory, because torch.load
+    itself raises OSError(EINVAL) for a tail-truncated file — that one is
+    corrupt."""
     path = Path(path)
     if not path.is_file():
         return CkptState("missing")
-    try:
-        import torch
+    import torch
 
-        state = torch.load(str(path), map_location="cpu", weights_only=False)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return CkptState("missing")
+    try:
+        state = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
         last = int(state["last_epoch"])
         if not (state.get("model") or state.get("ema")):
             raise KeyError("no model/ema weights")
@@ -1035,7 +1047,9 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
     this run cannot use (another config or dataset, no provenance, a corrupt
     checkpoint) is moved aside, never deleted: left under the run's name, this
     attempt's first copies (log + sidecar, while its checkpoint is still being
-    written) would pair a new sidecar with the old checkpoint."""
+    written) would pair a new sidecar with the old checkpoint. An OSError while
+    reading a candidate (Drive) propagates before anything is moved: unknown
+    is not unusable (the attempt fails and is retried)."""
     probe = probe or probe_checkpoint  # looked up at call time
     run_dir = Path(run_dir)
     local, local_why = (None, "no run_dir")
@@ -1643,6 +1657,8 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
             "final_weights": "last",
             "runtime": B.to_jsonable(p.runtime),
             "export_seconds": export_seconds,
+            # CONTRACTS §8.1: DEIM never changes the batch (Ultralytics may halve it after an OOM)
+            "batch_effective": eff["batch"],
             "toolchain": f"{settings.toolchain_name} {settings.toolchain_version}",
             "deim": {"repo": DEIM_REPO, "commit": DEIM_COMMIT, "base_config": spec["base_config"],
                      "license": LICENSE_NAME, "license_sha256": license_sha,
