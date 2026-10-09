@@ -306,8 +306,13 @@ def test_optional_deim_step():
     runbook = RUNBOOK.read_text(encoding="utf-8")
     for needle in ("Optional: DEIM", "DEIM_MATRIX", "--install-deps", "--fetch-weights", "1.5–3.5 h",
                    "MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth", "LICENSE_DEIM",
-                   "configs/deim_smoke_def3.yaml", "--dry-run"):
+                   "configs/deim_smoke_def3.yaml", "--dry-run",
+                   # the troubleshooting rows quote the runner's real messages
+                   "is not the init checkpoint of deim_hgnetv2_s_coco", "fills only N/M tensors",
+                   "transformers, accelerate, huggingface_hub", ".stale-"):
         assert needle in runbook, needle
+    assert "!= recorded" not in runbook and "pinned on first use" not in text, \
+        "the init checkpoint's sha256 is pinned in train/deim_run.py, not recorded on first use"
 
 
 def test_runbook_exists_and_covers_the_steps():

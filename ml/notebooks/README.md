@@ -70,7 +70,7 @@ The notebook creates `bundles/`, `mirror/`, `logs/` and `matrix_log.jsonl` next 
 4. Keep the browser tab open. Colab disconnects idle sessions, and background execution needs Pro+.
 5. The **last cell** runs `drive.flush_and_unmount()`. Google Drive uploads in the background, so this waits until everything the session wrote (bundles, mirror, logs) is really on Drive. If you stop a session early, run that cell by hand before you disconnect.
 
-A run's `mirror/<run>/` is **not** deleted when its bundle is written: Drive may still be uploading the bundle. The next session that reads the bundle back from Drive and verifies its sha deletes the mirror.
+A run's `mirror/<run>/` is **not** deleted when its bundle is written: Drive may still be uploading the bundle. The next session that reads the bundle back from Drive and verifies its sha deletes the mirror, together with that run's set-aside `mirror/<run>.stale-<time>/` folders.
 
 **After a disconnect:** choose **Reconnect → Runtime → Run all**.
 - Runs whose bundle and `.sha256` are on Drive are skipped.
@@ -130,7 +130,7 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 - The schedule follows from the epochs and the view size: 8 epochs without photometric aug at the end, LR warm-up over 2 epochs, EMA memory of about 2.7 epochs.
 - The **last** epoch is bundled. DEIM's own "stage 2", which reloads the checkpoint that scored best on the fold's validation photos, is switched off. That would be a selection leak into the out-of-fold evaluation.
 - The augmentation mirrors the YOLO policy: flips plus ColorJitter at the Ultralytics HSV strengths. Mosaic, zoom-out and IoU crops are off, because they shrink or rotate 28-px defects.
-- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. A mirror left by a different config is moved aside to `mirror/<run>.stale-<time>/` (never deleted: remove it on Drive by hand once it is not needed). The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
+- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. A mirror the run cannot use (another config or tiles, no `zander_run.json`, a corrupt checkpoint) is moved aside to `mirror/<run>.stale-<time>/`, also when the run resumes from a local checkpoint. The runner never deletes it; the first later session that finds the run's bundle verified on Drive does. A checkpoint Drive cannot **read** (a dropped mount) is not moved aside: that attempt fails and is retried. The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
 
 ## Troubleshooting
 
@@ -143,18 +143,19 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 | `missing .../ds_v2_*_tiles.zip` | Upload the zip to `MyDrive/ZanderML/` without renaming it |
 | `WARNING ... config_sha256 differs` | A finished bundle was trained with a different effective config (an edited config or `EXTRA_SET`). It is **kept, never overwritten**. Delete the bundle and its `.sha256` on Drive to retrain |
 | `WARNING ... dataset_fingerprint` | A finished bundle was trained on other tiles (the zips were rebuilt since). It is **kept, never overwritten**. Delete the bundle and its `.sha256` on Drive to retrain it on the new tiles |
-| `unusable mirror moved aside -> mirror/<run>.stale-<time>` | The resume state belonged to another config, other tiles or a checkpoint that does not match its `zander_run.json`, so the run started fresh. The old state is kept; delete the `.stale-` folder once you do not need it |
+| `unusable mirror moved aside -> mirror/<run>.stale-<time>` | The resume state belonged to another config, other tiles or a checkpoint that does not match its `zander_run.json`, so the run started fresh. The old state is kept until the run's bundle is verified on Drive: the next session that skips the finished run deletes the run's `.stale-` folders (never another run's) |
 | a run `FAILED` with `Drive unreadable` / `NOT retrained` | Drive could not be read while checking a finished bundle. Nothing was moved or retrained; Run all again once Drive works |
 | `final_weights: best ...` / `WARNING extra.patience ...` (selection leak) | An override switched on best-epoch selection or early stopping. Both choose the model on the fold's validation photos, so the out-of-fold evaluation refuses such fold bundles; remove the override (`EXTRA_SET`). A dev_all run refuses both outright |
 | a run `FAILED` twice | Read the error in the summary or in `logs/<run>.log`, then Run all again. A partial run resumes |
 | `config/data error (not retried)` | Exit code 2 is a configuration or dataset problem. Fix it first, because retrying won't help |
 | CUDA out of memory | Should not happen on an L4 at batch 16. Do not lower `batch`: it is part of the compared config. Report the problem, or use an A100 |
 | very slow epochs, few vCPUs | With ≤ 4 vCPUs the GPU profile turns on `cache=disk`, so the first epoch is slower while it caches. Prefer L4 with High-RAM |
-| Drive storage full | Replaced mirror checkpoints can end up in the Drive trash, about 1 GB per run. Empty the trash |
+| Drive storage full | Replaced mirror checkpoints, and the mirrors and `.stale-` folders the matrix deletes, can end up in the Drive trash (about 1 GB per run). Empty the trash |
 | two notebooks at once | Never train the **same** run in two sessions on one Drive folder, because they would share `mirror/<run>/`. Split `MATRIX` into disjoint lists instead |
 | `DEIM runtime modules missing` | The DEIM cell did not run or its install failed. Run `python train/deim_run.py --install-deps`, then `--check-deps` |
 | `init checkpoint ... missing` | The COCO checkpoint is not in place. Run the DEIM cell again, or upload it to `MyDrive/ZanderML/pretrained/` (section 8) |
-| `... sha256 ... != recorded` | A different init checkpoint than in earlier sessions. Delete the `.sha256` record only if that is intended |
+| `... is not the init checkpoint of deim_hgnetv2_s_coco` | The init file is not the pinned COCO checkpoint (sha256 `a089c9eb798f…`), e.g. the file of the DEIM README's other "S" row (RT-DETRv2 R18, another network). Download `deim_dfine_hgnetv2_s_coco_120e.pth` (row S of the **D-FINE** table) and upload it renamed as `MyDrive/ZanderML/pretrained/deim_hgnetv2_s_coco.pth`, replacing the wrong file (section 8). `--fetch-weights` replaces a wrong local copy by itself but never uses a wrong Drive copy; the DEIM runs then fail as a config error (this message or `init checkpoint ... missing`; not retried) |
+| `fills only N/M tensors` | DEIM's tuning load matched less than 90 % of the model's tensors: the init checkpoint is another network than the base config, and DEIM would fine-tune from mostly random weights without an error, so the train worker stops before the first epoch (the matrix retries once; it fails the same way). With the sha256 pin this means the pinned DEIM commit and `MODELS` in `train/deim_run.py` disagree: report it, never lower `MIN_TUNING_MATCH` |
 | `LICENSE ... != pinned` | The pinned DEIM commit's licence no longer matches. Stop and re-check the licence; never just update the pin |
 | `ONNX export does not match the torch model` | The parity gate caught an export problem. The training is safe in the mirror; report the numbers from the log |
 | `DEIM training exited 0 but ...` | DEIM stopped early without an error code. The log above it says why; the run resumes from its last checkpoint |
@@ -185,4 +186,4 @@ python train/deim_run.py --config configs/matrix/deim_s_def3_fold0.yaml --dry-ru
 python train/deim_run.py --check-deps                                                # DEIM's extra deps are NOT in ml/.venv (by design)
 python train/dispatch.py --config configs/deim_smoke_def3.yaml --device cpu          # 2 CPU epochs, random init -> bundle
 ```
-The CPU smoke needs DEIM's extra deps (faster-coco-eval, calflops, tensorboard) in the interpreter that runs it.
+The CPU smoke needs DEIM's extra deps in the interpreter that runs it: faster-coco-eval, calflops and the modules calflops imports at start-up (transformers, accelerate, huggingface_hub), plus scipy, tensorboard and onnx; torch and torchvision must already be there. `python train/deim_run.py --install-deps` installs them into the interpreter it runs under (faster-coco-eval, calflops and onnxruntime pinned, the others only if missing; torch is not in its list), and `--check-deps` lists what is still missing. The smoke config uses random init, so it needs no `--fetch-weights`.
