@@ -76,14 +76,16 @@ batch 32) do not transfer:
 
 Resume (Colab disconnects). With `mirror_dir`, the parent process polls
 DEIM's output/log.txt (one JSON line per finished epoch) and copies log.txt,
-zander_run.json and output/last.pth (as last.pt, weights LAST, torn-write
-guarded) to <mirror_dir>/<name>/ at most every ZANDER_MIRROR_INTERVAL_S
-seconds plus the final epoch. On start the most advanced usable checkpoint
-(local output/last.pth, then the mirror) whose zander_run.json records this
-config sha wins: resumable -> DEIM `train.py -r last.pth` (last_epoch, model,
-EMA, optimizer and AMP scaler are restored; the LR schedule is a pure function
-of the iteration), finished -> export + bundle only, none -> fresh (an
-existing run_dir is moved aside, never deleted). A resumed run is
+output/last.pth (as last.pt, torn-write guarded) and zander_run.json (LAST:
+it vouches for the checkpoint) to <mirror_dir>/<name>/ at most every
+ZANDER_MIRROR_INTERVAL_S seconds plus the final epoch. On start the most
+advanced usable checkpoint (local output/last.pth, then the mirror) whose
+zander_run.json records this config sha wins: resumable -> DEIM `train.py -r
+last.pth` (last_epoch, model, EMA, optimizer and AMP scaler are restored; the
+LR schedule is a pure function of the iteration), finished -> export + bundle
+only, none -> fresh (an existing run_dir is moved aside, never deleted). An
+unusable mirror is moved aside to <mirror_dir>/<name>.stale-<UTC stamp>, so
+a new sidecar never meets an old run's checkpoint. A resumed run is
 statistically equivalent to an uninterrupted one, not bit-identical (no RNG
 state in DEIM checkpoints). Every DEIM subprocess leads its own process
 group: stopping a run (SIGINT -> SIGTERM -> SIGKILL, also on a SIGTERM from
@@ -925,14 +927,19 @@ class StartPlan:
     epochs_done: Optional[int] = None
     moved_aside: Optional[Path] = None
     reason: str = ""
+    mirror_moved_aside: Optional[Path] = None
 
 
 LOCAL_CKPT = Path("output") / "last.pth"
 LOCAL_LOG = Path("output") / "log.txt"
-# (run_dir relative path, mirror name) in copy order — the weights LAST, so a
-# mirror's log.txt is never behind its checkpoint. last.pt is DEIM's full
-# training checkpoint under the Drive layout's name (docs/CONTRACTS.md §8.5).
-MIRROR_MEMBERS = ((LOCAL_LOG, "log.txt"), (Path(U.SIDECAR), U.SIDECAR), (LOCAL_CKPT, "last.pt"))
+# (run_dir relative path, mirror name) in copy order: log.txt before the
+# weights, so a mirror's log is never behind its checkpoint, and the sidecar
+# LAST: its config sha is what makes a mirror usable, so it never vouches for
+# a checkpoint that is not there yet. (plan_start moves an unusable mirror
+# aside, so the checkpoint a new sidecar meets is always one of this run's.)
+# last.pt is DEIM's full training checkpoint under the Drive layout's name
+# (docs/CONTRACTS.md §8.5).
+MIRROR_MEMBERS = ((LOCAL_LOG, "log.txt"), (LOCAL_CKPT, "last.pt"), (Path(U.SIDECAR), U.SIDECAR))
 
 
 def probe_checkpoint(path: Path, total_epochs: int) -> CkptState:
@@ -1024,7 +1031,11 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
                *, probe: Optional[Callable] = None, stamp: Optional[str] = None,
                fingerprint: Optional[str] = None) -> StartPlan:
     """fresh / resume / finished, and make run_dir match the decision (same
-    rules as ultralytics_run.prepare_run_dir, DEIM's file layout)."""
+    rules as ultralytics_run.prepare_run_dir, DEIM's file layout). A mirror
+    this run cannot use (another config or dataset, no provenance, a corrupt
+    checkpoint) is moved aside, never deleted: left under the run's name, this
+    attempt's first copies (log + sidecar, while its checkpoint is still being
+    written) would pair a new sidecar with the old checkpoint."""
     probe = probe or probe_checkpoint  # looked up at call time
     run_dir = Path(run_dir)
     local, local_why = (None, "no run_dir")
@@ -1036,6 +1047,10 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
         mirror, mirror_why = _usable(Path(mirror_run) / "last.pt", Path(mirror_run), config_sha,
                                      total_epochs, probe, fingerprint)
     reason = f"local: {local_why}; mirror: {mirror_why}"
+    mirror_moved = None
+    if mirror is None and mirror_run is not None and Path(mirror_run).is_dir() and any(Path(mirror_run).iterdir()):
+        mirror_moved = U.move_aside(Path(mirror_run), stamp)
+        reason += f"; unusable mirror moved aside -> {mirror_moved.name}"
     moved = None
     if mirror is not None and (local is None or _rank(mirror) > _rank(local)):
         if run_dir.exists():
@@ -1047,10 +1062,10 @@ def plan_start(run_dir: Path, config_sha: str, total_epochs: int, mirror_run: Op
     else:
         if run_dir.exists():
             moved = U.move_aside(run_dir, stamp)
-        return StartPlan("fresh", "none", moved_aside=moved, reason=reason)
+        return StartPlan("fresh", "none", moved_aside=moved, reason=reason, mirror_moved_aside=mirror_moved)
     truncate_log(run_dir / LOCAL_LOG, state.epochs_done or 0)
     kind = "resume" if state.kind == "resumable" else "finished"
-    return StartPlan(kind, source, state.epochs_done, moved, reason)
+    return StartPlan(kind, source, state.epochs_done, moved, reason, mirror_moved)
 
 
 def copy_if_stable(src: Path, dst: Path, settle_s: float = 2.0) -> bool:
@@ -1539,6 +1554,8 @@ def run_from_config(config_path: Path, device: Optional[str] = None, overrides: 
     logger.info(f"{name}: {plan.kind} (source {plan.source}, epochs done {plan.epochs_done}; {plan.reason})")
     if plan.moved_aside:
         logger.warning(f"previous run_dir moved aside -> {plan.moved_aside}")
+    if plan.mirror_moved_aside:
+        logger.warning(f"unusable mirror moved aside -> {plan.mirror_moved_aside}")
     # the dataset layout + override are regenerated every attempt (paths move between VMs)
     prepare_dataset_layout(eff, p.run_dir / "dataset", p.provenance["classes"], write=True)
     B.atomic_write_text(p.override_path, render_override(p.override, _override_header(p)))

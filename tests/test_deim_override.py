@@ -619,6 +619,66 @@ def test_plan_start_resume_rules():
     assert D.truncate_log(_tmp() / "none.txt", 3) == 0
 
 
+def test_a_stale_mirror_never_pairs_a_new_sidecar_with_its_old_checkpoint():
+    sha_a, sha_b = "a" * 64, "b" * 64
+    side = lambda sha: {"format": 1, "config_sha256": sha, "attempts": [], "dataset_fingerprint": FP}  # noqa: E731
+    root = _tmp()
+    run, mirror = root / "run", root / "mirror" / "deim_x"
+    # config A trained 5 of 10 epochs on an earlier VM; its mirror is still on Drive
+    _fake_ckpt(mirror / "last.pt", 4)
+    _log(mirror / "log.txt", range(5))
+    U.write_sidecar(mirror, side(sha_a))
+    plan = D.plan_start(run, sha_b, 10, mirror, probe=_fake_probe, stamp="S", fingerprint=FP)
+    assert plan.kind == "fresh", plan
+    # config B's first epoch: its checkpoint is still being written (copy skipped),
+    # its log and sidecar reach the mirror
+    _fake_ckpt(run / "output" / "last.pth", 0)
+    _log(run / "output" / "log.txt", [0])
+    U.write_sidecar(run, side(sha_b))
+    order: list = []
+    real_copy = B.atomic_copy
+    os.environ["ZANDER_MIRROR_INTERVAL_S"] = "0"
+    try:
+        with patched((B, "atomic_copy", lambda src, dst: (order.append(Path(dst).name), real_copy(src, dst)))):
+            sup = D.Supervisor(run, mirror, side(sha_b), {"n": 1}, total_epochs=10, start_epoch=0)
+            assert sup.observe() is None and sup.pending_ckpt
+    finally:
+        os.environ.pop("ZANDER_MIRROR_INTERVAL_S", None)
+    assert U.read_sidecar(mirror)["config_sha256"] == sha_b
+    # the VM dies: a new one must not resume config A's weights under config B
+    shutil.rmtree(run)
+    plan2 = D.plan_start(run, sha_b, 10, mirror, probe=_fake_probe, stamp="T", fingerprint=FP)
+    assert plan2.kind == "fresh", plan2
+    # ... because the unusable mirror was moved aside (never deleted) at the start
+    stale = mirror.with_name("deim_x.stale-S")
+    assert plan.mirror_moved_aside == stale and "unusable mirror moved aside" in plan.reason, plan
+    assert json.loads((stale / "last.pt").read_text())["last_epoch"] == 4
+    assert U.read_sidecar(stale)["config_sha256"] == sha_a
+    # the sidecar is copied LAST: it vouches for the checkpoint
+    assert [m for _, m in D.MIRROR_MEMBERS][-1] == U.SIDECAR and order == ["log.txt", U.SIDECAR], order
+    order.clear()
+    ck = _fake_ckpt(_tmp() / "run" / "output" / "last.pth", 0)
+    os.utime(ck, (time.time() - 60, time.time() - 60))
+    _log(ck.parent / "log.txt", [0])
+    U.write_sidecar(ck.parent.parent, side(sha_b))
+    with patched((B, "atomic_copy", lambda src, dst: (order.append(Path(dst).name), real_copy(src, dst)))):
+        D.Supervisor(ck.parent.parent, _tmp() / "m", side(sha_b), {"n": 1}, 10, 0).mirror_now()
+    assert order == ["log.txt", "last.pt", U.SIDECAR], order
+    # resuming from a local checkpoint moves an unusable mirror aside too; a usable,
+    # older mirror of the same config is kept
+    for mirror_sha, moved in ((sha_a, True), (sha_b, False)):
+        r = _tmp()
+        _fake_ckpt(r / "run" / "output" / "last.pth", 6)
+        U.write_sidecar(r / "run", side(sha_b))
+        _fake_ckpt(r / "m" / "x" / "last.pt", 2)
+        U.write_sidecar(r / "m" / "x", side(mirror_sha))
+        p = D.plan_start(r / "run", sha_b, 10, r / "m" / "x", probe=_fake_probe, stamp="U", fingerprint=FP)
+        assert (p.kind, p.source) == ("resume", "local") and (p.mirror_moved_aside is not None) == moved, p
+        assert (r / "m" / "x").exists() != moved
+    assert D.plan_start(_tmp() / "run", sha_b, 10, _tmp(), probe=_fake_probe).mirror_moved_aside is None, \
+        "an empty mirror dir is left alone"
+
+
 def test_supervisor_mirrors_every_epoch_and_the_abort_hook():
     run, mirror = _tmp() / "run", _tmp() / "mirror"
     ck = _fake_ckpt(run / "output" / "last.pth", 0)

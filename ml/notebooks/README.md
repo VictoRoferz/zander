@@ -127,7 +127,7 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 - The schedule follows from the epochs and the view size: 8 epochs without photometric aug at the end, LR warm-up over 2 epochs, EMA memory of about 2.7 epochs.
 - The **last** epoch is bundled. DEIM's own "stage 2", which reloads the checkpoint that scored best on the fold's validation photos, is switched off. That would be a selection leak into the out-of-fold evaluation.
 - The augmentation mirrors the YOLO policy: flips plus ColorJitter at the Ultralytics HSV strengths. Mosaic, zoom-out and IoU crops are off, because they shrink or rotate 28-px defects.
-- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
+- The mirror holds `last.pt` (DEIM's full checkpoint), `log.txt` and `zander_run.json`. A mirror left by a different config is moved aside to `mirror/<run>.stale-<time>/` (never deleted: remove it on Drive by hand once it is not needed). The bundle also holds `LICENSE_DEIM` and `deim_override.yml`; its `last.pt` is the EMA checkpoint the ONNX was exported from.
 
 ## Troubleshooting
 

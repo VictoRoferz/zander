@@ -308,7 +308,7 @@ inspector/.env
 - `ds_v2_{def3,nal1}_tiles.zip`: input.
 - `bundles/<run>_bundle.zip` plus `.sha256`: the "finished" marker.
 - `mirror/<run>/{last.pt, results.csv, args.yaml, zander_run.json}` (+ `best.pt` only when `final_weights: best`): for resume; `zander_run.json` holds the attempt log and the config sha (a checkpoint trained under a different config is never resumed). Copied at most every 300 s (`ZANDER_MIRROR_INTERVAL_S`) and always at the final epoch; deleted once the bundle is safe.
-- For DEIM runs the mirror holds `{last.pt (DEIM's full checkpoint), log.txt, zander_run.json}`.
+- For DEIM runs the mirror holds `{last.pt (DEIM's full checkpoint), log.txt, zander_run.json}`, copied in that order (`zander_run.json` last: it vouches for the checkpoint). At the start a mirror the run cannot use (another config sha or dataset fingerprint, no `zander_run.json`, a corrupt checkpoint) is moved aside to `mirror/<run>.stale-<UTC stamp>/`, never deleted.
 - `logs/<run>.log`.
 - `matrix_log.jsonl` (one line per start, interruption and result).
 
