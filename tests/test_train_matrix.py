@@ -86,6 +86,7 @@ class FakeLauncher:
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "zander_run.json").write_text(json.dumps(side))
             meta = {"run_name": name, "bundle_version": 2, "config_sha256": req.item.config_sha,
+                    "dataset_fingerprint": req.item.fingerprint,
                     "epochs_completed": 2, "attempts": side["attempts"]}
             zip_path, _ = B.write_bundle(req.run_root / f"{name}_bundle.zip", {
                 "config.yaml": "name: x\n", "meta.json": json.dumps(meta), "metrics.json": "{}",
@@ -173,6 +174,30 @@ def test_finished_bundle_is_skipped_never_retrained():
     assert last["status"] == "skipped" and "config_sha256" in last["warning"]
     assert "WARNING" in out
     assert B.sha256_file(drive / "bundles" / "yolo26n_def3_fold0_bundle.zip") == sha_before
+
+
+def test_skip_warns_when_the_tiles_changed_since_the_bundle():
+    # T2: a finished bundle trained on other tiles is kept (never overwritten) but WARNED about
+    prov = settings.tiles_dir / "ds_v2_def3" / "provenance.json"
+    prov.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prov.write_text(json.dumps({"dataset_id": "ds_v2_def3", "dataset_fingerprint": "1" * 64}))
+        drive, cfgs = _fresh("yolo26n_def3_fold0")
+        items, _ = M.load_items(cfgs, {})
+        assert items[0].fingerprint == "1" * 64
+        assert _run(_argv(drive, cfgs), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))[0] == 0
+        rc, out = _run(_argv(drive, cfgs), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))
+        assert rc == 0 and _log(drive)[-1]["warning"] is None, out
+        prov.write_text(json.dumps({"dataset_id": "ds_v2_def3", "dataset_fingerprint": "2" * 64}))
+        fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
+        rc, out = _run(_argv(drive, cfgs), fake)
+        assert rc == 0 and fake.calls == [], out
+        last = _log(drive)[-1]
+        assert last["status"] == "skipped" and "dataset_fingerprint" in last["warning"], last
+        assert "WARNING" in out
+    finally:
+        prov.unlink()
+    assert M.tiles_fingerprint("ds_v2_def3") is None  # tiles not built: no check, no crash
 
 
 def test_retry_resumes_after_a_disconnect():

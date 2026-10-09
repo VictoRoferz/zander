@@ -9,13 +9,15 @@ Drive layout (docs/CONTRACTS.md §8.5), under --drive:
     bundles/<run>_bundle.zip + .sha256   finished marker (the .sha256 is written last)
     mirror/<run>/                        resume state; a LATER session deletes it once
                                          it has read the bundle back from Drive
+    mirror/<run>.stale-<UTC>/            unusable resume state set aside (never deleted)
     logs/<run>.log                       full training output (appended per attempt)
     matrix_log.jsonl                     one line per started/finished/skipped attempt
 
 Per config, in the given (priority) order:
   1. skip when bundles/<run>_bundle.zip has a matching .sha256 — even if its
-     config_sha256 differs from today's effective config (warned): results are
-     never overwritten. A zip without a valid marker is moved aside and redone. If Drive cannot be READ (an I/O error, not a bad
+     config_sha256 or dataset_fingerprint differs from today's (warned):
+     results are never overwritten. A zip without a valid marker is moved
+     aside and redone. If Drive cannot be READ (an I/O error, not a bad
      bundle) the run is reported as failed and left alone: never moved aside,
      never retrained.
   2. run train/dispatch.py as a SUBPROCESS with --mirror-dir <drive>/mirror
@@ -137,6 +139,7 @@ class Item:
     arch: str
     epochs: int
     config_sha: Optional[str]
+    fingerprint: Optional[str] = None  # dataset_fingerprint of today's local tiles (None: not built)
 
 
 @dataclass
@@ -181,6 +184,20 @@ def resolve_config_path(path: str) -> Path:
     raise B.ConfigError(f"config not found: {path}")
 
 
+def tiles_fingerprint(dataset_id) -> Optional[str]:
+    """dataset_fingerprint of the local tiles a run would train on today
+    (tiles/<dataset_id>/provenance.json), or None when they are not built."""
+    try:
+        from config.settings import settings
+
+        doc = json.loads((settings.tiles_dir / str(dataset_id) / "provenance.json")
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    fp = doc.get("dataset_fingerprint") if isinstance(doc, dict) else None
+    return fp if isinstance(fp, str) and fp else None
+
+
 def load_items(configs: list, overrides: dict) -> tuple[list, list]:
     """Resolve every config up front: a typo must fail now, not 8 GPU-hours in."""
     items, errors, seen = [], [], {}
@@ -192,8 +209,9 @@ def load_items(configs: list, overrides: dict) -> tuple[list, list]:
             if eff is None:  # runner without a resolver: identity from the raw config
                 name = raw.get("name")
                 epochs = (overrides or {}).get("epochs", raw.get("epochs", 0))
+                ds_id = raw.get("dataset_id")
             else:
-                name, epochs = eff["name"], eff["epochs"]
+                name, epochs, ds_id = eff["name"], eff["epochs"], eff.get("dataset_id")
             if not isinstance(name, str) or not name:
                 raise B.ConfigError("config has no `name`")
             if name in seen:
@@ -203,6 +221,7 @@ def load_items(configs: list, overrides: dict) -> tuple[list, list]:
                 config=path, name=name, family=B.family_of(name), arch=B.arch_of(name),
                 epochs=int(epochs or 0),
                 config_sha=B.config_sha256(eff) if eff is not None else None,
+                fingerprint=tiles_fingerprint(ds_id) if ds_id else None,
             ))
         except Exception as e:
             errors.append(f"{c}: {type(e).__name__}: {e}")
@@ -578,6 +597,11 @@ class Matrix:
             if item.config_sha and have and have != item.config_sha:
                 warnings.append(f"existing bundle was trained with config_sha256 {have[:12]} but today's "
                                 f"effective config is {item.config_sha[:12]} — kept, NOT retrained "
+                                "(delete the bundle to retrain)")
+            have = meta.get("dataset_fingerprint")
+            if item.fingerprint and have and have != item.fingerprint:
+                warnings.append(f"existing bundle was trained on dataset_fingerprint {have[:12]} but "
+                                f"today's tiles are {item.fingerprint[:12]} — kept, NOT retrained "
                                 "(delete the bundle to retrain)")
             for w in warnings:
                 _say(f"[matrix] WARNING {item.name}: {w}")

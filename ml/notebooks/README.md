@@ -140,6 +140,9 @@ The Ultralytics models are AGPL-3.0. D-FINE-S trained with **DEIM v1** is the li
 | `fingerprint mismatch` | The zip and the branch were built from different data or code. Rebuild the zips from the pushed commit |
 | `missing .../ds_v2_*_tiles.zip` | Upload the zip to `MyDrive/ZanderML/` without renaming it |
 | `WARNING ... config_sha256 differs` | A finished bundle was trained with a different effective config (an edited config or `EXTRA_SET`). It is **kept, never overwritten**. Delete the bundle and its `.sha256` on Drive to retrain |
+| `WARNING ... dataset_fingerprint` | A finished bundle was trained on other tiles (the zips were rebuilt since). It is **kept, never overwritten**. Delete the bundle and its `.sha256` on Drive to retrain it on the new tiles |
+| `unusable mirror moved aside -> mirror/<run>.stale-<time>` | The resume state belonged to another config, other tiles or a checkpoint that does not match its `zander_run.json`, so the run started fresh. The old state is kept; delete the `.stale-` folder once you do not need it |
+| a run `FAILED` with `Drive unreadable` / `NOT retrained` | Drive could not be read while checking a finished bundle. Nothing was moved or retrained; Run all again once Drive works |
 | a run `FAILED` twice | Read the error in the summary or in `logs/<run>.log`, then Run all again. A partial run resumes |
 | `config/data error (not retried)` | Exit code 2 is a configuration or dataset problem. Fix it first, because retrying won't help |
 | CUDA out of memory | Should not happen on an L4 at batch 16. Do not lower `batch`: it is part of the compared config. Report the problem, or use an A100 |
