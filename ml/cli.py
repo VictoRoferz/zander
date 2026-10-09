@@ -173,7 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("choose-op", help="freeze t* from a family's out-of-fold runs")
     p.add_argument("runs", nargs="*", help="fold eval runs (default: <family>_fold0..2)")
     p.add_argument("--family", default=None, help="family name, e.g. yolo26n_def3")
-    p.add_argument("--target-sensitivity", type=float, default=0.95)
+    p.add_argument("--target-sensitivity", type=float, default=0.95,
+                   help="pooled out-of-fold photo sensitivity t* must reach, 0 < x <= 1")
     p.add_argument("--out", default=None,
                    help="default: ml_data/eval/operating_point_<schema>_<family>.json")
     p.add_argument("--force", action="store_true",

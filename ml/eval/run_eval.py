@@ -47,8 +47,9 @@ Writes ml_data/eval/<run_name>/{metrics.json, predictions.json (v2), report.md,
 gallery.html} and appends one row to the committed ml/reports/results_v2.csv
 (never for smoke or guard-overridden runs). Default run names follow
 CONTRACTS §8.2: `<family>_fold<k>` on the model's own fold, else
-`<bundle_run>__<bucket>` (`__look<k>` appended for a further test look). Model-vs-model decisions use ONLY these photo-level
-numbers — never per-tile or in-training validation metrics.
+`<bundle_run>__<bucket>` (`__look<k>` appended for a further test look).
+Model-vs-model decisions use ONLY these photo-level numbers — never per-tile
+or in-training validation metrics.
 
 predictions.json v2 = v1 + format_version, source{…}, per-photo width/height
 (and det_scores for cascade runs). Scores are stored at full float precision,
