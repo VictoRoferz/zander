@@ -948,6 +948,32 @@ def test_the_export_worker_runs_deims_export_without_autograd():
     assert "optimizer" not in stripped and stripped["zander"]["weights"] == "ema"
 
 
+def test_deim_adapter_keeps_one_label_per_box():
+    # DEIM's top-300 runs over query x class, so one query's box comes out once
+    # per class above the floor (the COCO DEIM-S model: an owl box as class 14
+    # at 0.684 AND class 15 at 0.239). Stitching merges per class, so the
+    # second label would become a phantom class in the photo's class set.
+    from infer.onnx_adapters import load_adapter
+    from infer.pipeline import TiledDetector
+
+    b1, b2, b3 = [100, 100, 130, 128], [300, 40, 330, 70], [5, 5, 20, 20]
+    labels = [1, 2, 0, 2, 0, 1]
+    boxes = [b1, b1, b2, b2, b3, b1]
+    scores = [0.80, 0.45, 0.40, 0.35, 0.30, 0.02]
+    path = _fake_deim_onnx(_tmp() / "dup.onnx", labels, boxes, scores, names=CLASSES)
+    ad = load_adapter("deim", str(path))
+    tile = np.zeros((640, 640, 3), dtype=np.uint8)
+    kept = [(1, 0.80, b1), (0, 0.40, b2), (0, 0.30, b3)]
+    for floor in (0.001, 0.3, 0.42, 0.9):  # the floor and the dedup commute
+        boxes_, scores_, labels_ = ad.run(tile, conf_floor=floor)
+        want = [k for k in kept if k[1] >= floor]
+        assert labels_.dtype == np.int64 and labels_.tolist() == [k[0] for k in want], (floor, labels_)
+        assert np.allclose(scores_, [k[1] for k in want])
+        assert np.allclose(boxes_.reshape(-1, 4), np.asarray([k[2] for k in want], dtype=np.float32).reshape(-1, 4))
+    det = TiledDetector(path, "deim", conf_floor=0.3).detect(tile)
+    assert sorted(set(det.labels)) == [0, 1], "class 2 only ever was a second label"
+
+
 # ------------------------------------------------------- the bundle
 
 FAKE_INIT = b"coco-init"
