@@ -80,13 +80,15 @@ class FakeLauncher:
             (mirror / "last.pt").write_bytes(b"ckpt")
             shutil.rmtree(run_dir)  # a new VM: nothing local survives
             return M.LaunchResult(75, "epoch 1/2 done\nsimulated disconnect")
-        if action == "ok":
+        if action in ("ok", "ok_halved"):
             side["attempts"].append({"started": B.utc_now(), "start_epoch": start, "end_epoch": 2,
                                      "resumed": resumed, "gpu": "fake", "seconds": 120.0})
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "zander_run.json").write_text(json.dumps(side))
             meta = {"run_name": name, "bundle_version": 2, "config_sha256": req.item.config_sha,
-                    "epochs_completed": 2, "attempts": side["attempts"]}
+                    "dataset_fingerprint": req.item.fingerprint,
+                    "epochs_completed": 2, "attempts": side["attempts"], "batch": 8,
+                    "batch_effective": 4 if action == "ok_halved" else 8}
             zip_path, _ = B.write_bundle(req.run_root / f"{name}_bundle.zip", {
                 "config.yaml": "name: x\n", "meta.json": json.dumps(meta), "metrics.json": "{}",
                 "model.onnx": b"onnx", "last.pt": b"weights"})
@@ -95,6 +97,8 @@ class FakeLauncher:
             return M.LaunchResult(1, "Traceback (most recent call last):\nRuntimeError: CUDA out of memory")
         if action == "config":
             return M.LaunchResult(2, "configuration/data error (not retryable): tiles missing")
+        if action == "boom":  # the driver itself fails around the run (a bug, Drive gone, ...)
+            raise OSError(107, "Transport endpoint is not connected")
         raise AssertionError(action)
 
 
@@ -116,7 +120,7 @@ def _argv(drive, configs, *extra):
 # -------------------------------------------------------------------- flows
 
 
-def test_ok_run_is_published_logged_and_mirror_deleted():
+def test_ok_run_is_published_and_logged():
     drive, cfgs = _fresh("yolo26n_def3_fold0")
     fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
     rc, out = _run(_argv(drive, cfgs), fake)
@@ -136,6 +140,18 @@ def test_ok_run_is_published_logged_and_mirror_deleted():
     assert ok["resumed"] is False and ok["epochs_completed"] == 2 and ok["epochs_this_attempt"] == 2
     assert ok["gpu"] and ok["git_sha"] and ok["error_tail"] is None
     assert "yolo26n_def3_fold0" in out and " ok " in out  # summary table
+
+
+def test_an_oom_halved_batch_is_warned_about():
+    # T6: the runner records batch_effective; the matrix makes a mismatch visible
+    drive, cfgs = _fresh("yolo26n_def3_fold0", "yolo26n_def3_fold1")
+    fake = FakeLauncher({"yolo26n_def3_fold0": ["ok_halved"], "yolo26n_def3_fold1": ["ok"]})
+    rc, out = _run(_argv(drive, cfgs), fake)
+    assert rc == 0, out
+    ok = {r["run_name"]: r for r in _log(drive) if r["status"] == "ok"}
+    assert "batch 4" in ok["yolo26n_def3_fold0"]["warning"] and ok["yolo26n_def3_fold1"]["warning"] is None
+    assert "WARNING yolo26n_def3_fold0" in out and "WARNING yolo26n_def3_fold1" not in out
+    assert M.batch_warning({"batch": 16}) is None and M.batch_warning({"batch": 16, "batch_effective": 16}) is None
 
 
 def test_failure_never_stops_the_loop_and_exits_1():
@@ -173,6 +189,30 @@ def test_finished_bundle_is_skipped_never_retrained():
     assert B.sha256_file(drive / "bundles" / "yolo26n_def3_fold0_bundle.zip") == sha_before
 
 
+def test_skip_warns_when_the_tiles_changed_since_the_bundle():
+    # T2: a finished bundle trained on other tiles is kept (never overwritten) but WARNED about
+    prov = settings.tiles_dir / "ds_v2_def3" / "provenance.json"
+    prov.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prov.write_text(json.dumps({"dataset_id": "ds_v2_def3", "dataset_fingerprint": "1" * 64}))
+        drive, cfgs = _fresh("yolo26n_def3_fold0")
+        items, _ = M.load_items(cfgs, {})
+        assert items[0].fingerprint == "1" * 64
+        assert _run(_argv(drive, cfgs), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))[0] == 0
+        rc, out = _run(_argv(drive, cfgs), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))
+        assert rc == 0 and _log(drive)[-1]["warning"] is None, out
+        prov.write_text(json.dumps({"dataset_id": "ds_v2_def3", "dataset_fingerprint": "2" * 64}))
+        fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
+        rc, out = _run(_argv(drive, cfgs), fake)
+        assert rc == 0 and fake.calls == [], out
+        last = _log(drive)[-1]
+        assert last["status"] == "skipped" and "dataset_fingerprint" in last["warning"], last
+        assert "WARNING" in out
+    finally:
+        prov.unlink()
+    assert M.tiles_fingerprint("ds_v2_def3") is None  # tiles not built: no check, no crash
+
+
 def test_retry_resumes_after_a_disconnect():
     drive, cfgs = _fresh("yolo26n_def3_fold0")
     fake = FakeLauncher({"yolo26n_def3_fold0": ["partial", "ok"]})
@@ -183,7 +223,21 @@ def test_retry_resumes_after_a_disconnect():
         ("started", 1, False), ("failed", 1, False), ("started", 2, True), ("ok", 2, True)], log
     assert log[1]["returncode"] == 75 and log[1]["epochs_completed"] == 1
     assert log[-1]["epochs_this_attempt"] == 1 and log[-1]["epochs_completed"] == 2
-    assert not (drive / "mirror" / "yolo26n_def3_fold0").exists(), "mirror deleted once the bundle is safe"
+
+
+def test_mirror_is_kept_until_a_later_session_verified_the_bundle():
+    # T5: Drive uploads in the background — deleting the mirror seconds after
+    # writing the bundle could leave neither copy if the VM dies now
+    drive, cfgs = _fresh("yolo26n_def3_fold0")
+    rc, out = _run(_argv(drive, cfgs, "--max-attempts", "2"),
+                   FakeLauncher({"yolo26n_def3_fold0": ["partial", "ok"]}))
+    assert rc == 0, out
+    mirror = drive / "mirror" / "yolo26n_def3_fold0"
+    assert (mirror / "last.pt").is_file() and (mirror / "zander_run.json").is_file(), "mirror kept"
+    # the next session reads the bundle back from Drive (sha verified) — only then the mirror goes
+    fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
+    rc, out = _run(_argv(drive, cfgs), fake)
+    assert rc == 0 and fake.calls == [] and not mirror.exists(), out
 
 
 def test_next_session_resumes_from_the_drive_mirror():
@@ -218,6 +272,73 @@ def test_zip_without_marker_is_not_a_result():
     fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
     rc, _ = _run(_argv(drive, cfgs), fake)
     assert rc == 0 and len(fake.calls) == 1
+
+
+def test_a_driver_error_fails_the_run_never_the_matrix():
+    # T1: anything but Ctrl-C raised around one run is a failed attempt; the loop goes on
+    drive, cfgs = _fresh("yolo26n_def3_fold0", "yolo26n_def3_fold1")
+    fake = FakeLauncher({"yolo26n_def3_fold0": ["boom", "boom"], "yolo26n_def3_fold1": ["ok"]})
+    rc, out = _run(_argv(drive, cfgs, "--max-attempts", "2"), fake)
+    assert rc == 1, out
+    assert fake.calls == [("yolo26n_def3_fold0", 1), ("yolo26n_def3_fold0", 2), ("yolo26n_def3_fold1", 1)]
+    failed = [r for r in _log(drive) if r["status"] == "failed"]
+    assert len(failed) == 2 and all(r["returncode"] is None and "matrix driver error" in r["error_tail"]
+                                    and "Transport endpoint" in r["error_tail"] for r in failed), failed
+    assert "driver error" in out and "1 run(s) failed" in out
+    assert B.verify_bundle(drive / "bundles" / "yolo26n_def3_fold1_bundle.zip").ok
+
+
+def test_an_unwritable_matrix_log_never_stops_training():
+    # T1: matrix_log.jsonl is bookkeeping — a Drive error there is warned about once
+    drive, cfgs = _fresh("yolo26n_def3_fold0", "yolo26n_def3_fold1")
+    (drive / "matrix_log.jsonl").mkdir(parents=True)  # every append now raises an OSError
+    fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"], "yolo26n_def3_fold1": ["ok"]})
+    rc, out = _run(_argv(drive, cfgs), fake)
+    assert rc == 0 and len(fake.calls) == 2, out
+    assert out.count("cannot append") == 1, out
+    for n in ("yolo26n_def3_fold0", "yolo26n_def3_fold1"):
+        assert B.verify_bundle(drive / "bundles" / f"{n}_bundle.zip").ok
+
+
+def test_an_unreadable_bundle_is_never_moved_aside_or_retrained():
+    # T1: an I/O error while CHECKING a finished bundle says nothing about the
+    # bundle — it must not be moved aside as invalid, and not be trained again
+    drive, cfgs = _fresh("yolo26n_def3_fold0", "yolo26n_def3_fold1")
+    assert _run(_argv(drive, cfgs[:1]), FakeLauncher({"yolo26n_def3_fold0": ["ok"]}))[0] == 0
+    bundles = drive / "bundles"
+    zip0 = bundles / "yolo26n_def3_fold0_bundle.zip"
+    sha_before = B.sha256_file(zip0)
+    real_sha = B.sha256_file
+
+    def eio(path, *a, **kw):  # the Drive read of the zip fails mid-way
+        if Path(path) == zip0:
+            raise OSError(5, "Input/output error")
+        return real_sha(path, *a, **kw)
+
+    B.sha256_file = eio
+    try:
+        fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"], "yolo26n_def3_fold1": ["ok"]})
+        rc, out = _run(_argv(drive, cfgs), fake)
+    finally:
+        B.sha256_file = real_sha
+    assert fake.calls == [("yolo26n_def3_fold1", 1)], (fake.calls, out)
+    assert rc == 1 and "NOT retrained" in out, out
+    assert not [p for p in bundles.iterdir() if ".invalid-" in p.name]
+    assert B.sha256_file(zip0) == sha_before and B.verify_bundle(zip0).ok
+    last0 = [r for r in _log(drive) if r["run_name"] == "yolo26n_def3_fold0"][-1]
+    assert last0["status"] == "failed" and "Input/output error" in last0["error_tail"], last0
+    # an unreadable marker (here: no read permission) is the same case, never "no marker"
+    if os.geteuid() != 0:  # root reads anything
+        marker = B.sha_path_for(zip0)
+        marker.chmod(0)
+        try:
+            fake = FakeLauncher({"yolo26n_def3_fold0": ["ok"]})
+            rc, out = _run(_argv(drive, cfgs[:1]), fake)
+        finally:
+            marker.chmod(0o644)
+        assert rc == 1 and fake.calls == [], out
+        assert not [p for p in bundles.iterdir() if ".invalid-" in p.name]
+        assert B.verify_bundle(zip0).ok
 
 
 def test_config_errors_are_not_retried():
@@ -338,6 +459,55 @@ def test_tee_subprocess_streams_to_log_and_keeps_a_tail():
     assert res.tail.splitlines()[-1] == f"{dispatch.BUNDLE_MARKER}/tmp/r_bundle.zip"
     assert "progress 2/2" in res.tail and len(res.tail.splitlines()) <= M.TAIL_LINES
     assert M._bundle_from_tail(res.tail) == Path("/tmp/r_bundle.zip")
+
+
+def test_tee_survives_a_dead_drive_log():
+    # T1: logs/<run>.log on Drive failing (mount dropped) must never stop the child
+    d = Path(tempfile.mkdtemp(dir=_TMP_ROOT))
+    done = d / "child_finished"
+    item = M.Item(Path("x.yaml"), "r", "r", "r", 1, None)
+    code = ("import pathlib, sys\nfor i in range(50): print('line', i, flush=True)\n"
+            f"pathlib.Path({str(done)!r}).write_text('ok')\nprint('the end'); sys.exit(0)")
+
+    class Dropping:  # accepts the header, then the mount goes away
+        def __init__(self):
+            self.writes, self.closed = 0, False
+
+        def write(self, data):
+            self.writes += 1
+            if self.writes > 1:
+                raise OSError(107, "Transport endpoint is not connected")
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    log = Dropping()
+    real_open = getattr(M, "_open_log", None)
+    M._open_log = lambda path: log
+    try:
+        req = M.RunRequest(item, 1, [sys.executable, "-c", code], dict(os.environ), d,
+                           d / "logs" / "r.log", d / "mirror", d / "run_dirs")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            res = M.tee_subprocess(req)
+    finally:
+        M._open_log = real_open
+    assert res.returncode == 0 and done.read_text() == "ok", "the child ran to its end"
+    assert "the end" in res.tail and "line 49" in out.getvalue()
+    assert out.getvalue().count("WARNING") == 1 and log.closed, out.getvalue()
+    # a log that cannot even be opened (its folder is a file) is the same case
+    blocker = d / "not_a_dir"
+    blocker.write_text("x")
+    done.unlink()
+    req = M.RunRequest(item, 2, [sys.executable, "-c", code], dict(os.environ), d,
+                       blocker / "r.log", d / "mirror", d / "run_dirs")
+    out = io.StringIO()
+    with redirect_stdout(out):
+        res = M.tee_subprocess(req)
+    assert res.returncode == 0 and done.read_text() == "ok" and "WARNING" in out.getvalue()
 
 
 def test_publish_refuses_an_invalid_local_bundle():

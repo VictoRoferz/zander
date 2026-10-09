@@ -237,6 +237,40 @@ def test_dev_all_refuses_best():
     _raises(B.ConfigError, lambda: U.resolve_config(dict(MATRIX_CFG, final_weights="ema")), "final_weights")
 
 
+def test_early_stopping_is_a_selection_leak():
+    # T7: patience != 0 stops at an epoch chosen on the fold's val photos — the
+    # ones it is evaluated on later. Same policy as `best`: loud on folds,
+    # refused on dev_all (its val is inside its training data).
+    import logging
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    grab = Grab()
+    U.logger.addHandler(grab)
+    try:
+        U.resolve_config(dict(MATRIX_CFG))
+        assert not [m for m in grab.lines if "patience" in m], grab.lines
+        eff = U.resolve_config(dict(MATRIX_CFG), {"extra.patience": 30})
+        assert eff["extra"]["patience"] == 30
+        loud = [m for m in grab.lines if "patience" in m]
+        assert len(loud) == 1 and "WARNING" in loud[0] and "fold0_val" in loud[0] and "leak" in loud[0], loud
+        assert U.resolve_config(dict(MATRIX_CFG), {"extra.patience": None})["extra"]["patience"] is None
+        assert len([m for m in grab.lines if "patience" in m]) == 1, "None = never stop: no warning"
+    finally:
+        U.logger.removeHandler(grab)
+    devall = dict(MATRIX_CFG, name="yolo26n_def3_devall", fold="dev_all")
+    _raises(B.ConfigError, lambda: U.resolve_config(devall, {"extra.patience": 30}),
+            "dev_all refuses extra.patience")
+    _raises(B.ConfigError, lambda: U.resolve_config(dict(devall, extra={"patience": 5})), "patience")
+    assert U.resolve_config(devall)["extra"]["patience"] == 0
+
+
 def test_runner_rejects_inconsistent_configs():
     _raises(B.ConfigError, lambda: U.resolve_config(dict(MATRIX_CFG, fold="fold1")), "says fold0")
     _raises(B.ConfigError, lambda: U.resolve_config(dict(MATRIX_CFG, extra={"data": "x.yaml"})), "data")
@@ -357,6 +391,36 @@ def test_write_and_verify_bundle():
     assert B.verify_bundle(d / "nope.zip").reason == "missing"
 
 
+def test_verify_bundle_separates_io_errors_from_bad_bundles():
+    # the matrix moves an INVALID bundle aside and retrains it; an unreadable
+    # one (Drive mount dropped) must come back as io_error, never as invalid
+    d = _tmp()
+    zip_path, _ = B.write_bundle(d / "r_bundle.zip", {"config.yaml": "", "meta.json": "{}",
+                                                       "metrics.json": "{}", "model.onnx": b""})
+    marker = B.sha_path_for(zip_path)
+    assert B.verify_bundle(zip_path).ok and not B.verify_bundle(zip_path).io_error
+    real_sha = B.sha256_file
+    B.sha256_file = lambda *a, **kw: (_ for _ in ()).throw(OSError(5, "Input/output error"))
+    try:
+        check = B.verify_bundle(zip_path)
+    finally:
+        B.sha256_file = real_sha
+    assert not check.ok and check.io_error and "Input/output error" in check.reason, check
+    if os.geteuid() != 0:  # root reads anything
+        marker.chmod(0)
+        try:
+            check = B.verify_bundle(zip_path)
+        finally:
+            marker.chmod(0o644)
+        assert not check.ok and check.io_error, check
+    # real content problems stay "invalid" (io_error False)
+    marker.write_text("0" * 64 + "  r_bundle.zip\n")
+    assert not B.verify_bundle(zip_path).ok and not B.verify_bundle(zip_path).io_error
+    marker.unlink()
+    assert "marker" in B.verify_bundle(zip_path).reason and not B.verify_bundle(zip_path).io_error
+    assert not B.verify_bundle(d / "nope.zip").io_error
+
+
 def test_write_bundle_rejects_bad_members():
     d = _tmp()
     ok = {"config.yaml": "", "meta.json": "{}", "metrics.json": "{}", "model.onnx": b""}
@@ -368,10 +432,10 @@ def test_write_bundle_rejects_bad_members():
 # -------------------------------------------------------- resume state machine
 
 
-def _fake_ckpt(path: Path, kind: str, epochs_done=None, epochs=10, stripped=False):
+def _fake_ckpt(path: Path, kind: str, epochs_done=None, epochs=10, stripped=False, train_args=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"kind": kind, "epochs_done": epochs_done, "epochs": epochs,
-                                "stripped": stripped}))
+                                "stripped": stripped, "train_args": train_args}))
 
 
 def fake_probe(pt: Path) -> "U.CkptState":
@@ -381,17 +445,23 @@ def fake_probe(pt: Path) -> "U.CkptState":
         d = json.loads(Path(pt).read_text())
     except ValueError:
         return U.CkptState("corrupt", detail="unreadable")
-    return U.CkptState(d["kind"], d["epochs_done"], d["epochs"], d["stripped"])
+    return U.CkptState(d["kind"], d["epochs_done"], d["epochs"], d["stripped"],
+                       train_args=d.get("train_args"))
 
 
-def _run_dir_with(d: Path, name: str, sha: str, kind=None, epochs_done=None, rows=0, stripped=False):
+def _run_dir_with(d: Path, name: str, sha: str, kind=None, epochs_done=None, rows=0, stripped=False,
+                  fp=None, train_args=None):
     run_dir = d / name
     run_dir.mkdir(parents=True)
     if kind:
-        _fake_ckpt(run_dir / "weights" / "last.pt", kind, epochs_done, stripped=stripped)
+        _fake_ckpt(run_dir / "weights" / "last.pt", kind, epochs_done, stripped=stripped,
+                   train_args=train_args)
     if sha:
-        U.write_sidecar(run_dir, {"format": 1, "run_name": name, "config_sha256": sha,
-                                  "attempts": [{"n": 1, "status": "running"}]})
+        side = {"format": 1, "run_name": name, "config_sha256": sha,
+                "attempts": [{"n": 1, "status": "running"}]}
+        if fp:
+            side["dataset_fingerprint"] = fp
+        U.write_sidecar(run_dir, side)
     if rows:
         (run_dir / "results.csv").write_text(
             "epoch,time,loss\n" + "".join(f"{i},{i * 10},{1 / i:.3f}\n" for i in range(1, rows + 1)))
@@ -476,6 +546,289 @@ def test_finished_runs_skip_to_bundling():
     run_dir = _run_dir_with(d, "r3", sha="c" * 64, kind="finished", stripped=True)
     plan = U.prepare_run_dir(run_dir, "c" * 64, mirror_run=mirror, probe=fake_probe)
     assert (plan.kind, plan.source) == ("finished", "local")
+
+
+def test_resume_requires_the_same_dataset_fingerprint():
+    # T2: the config sha does not cover the data — a checkpoint from before a
+    # tile rebuild is never resumed (nor bundled as "finished") on the new data
+    d = _tmp()
+    run_dir = _run_dir_with(d, "r1", sha="c" * 64, kind="resumable", epochs_done=4, fp="f1")
+    plan = U.prepare_run_dir(run_dir, "c" * 64, probe=fake_probe, fingerprint="f1")
+    assert (plan.kind, plan.source) == ("resume", "local"), plan
+    run_dir = _run_dir_with(d, "r2", sha="c" * 64, kind="finished", stripped=True, fp="f1")
+    plan = U.prepare_run_dir(run_dir, "c" * 64, probe=fake_probe, fingerprint="f2")
+    assert plan.kind == "fresh" and "dataset changed" in plan.reason and plan.moved_aside, plan
+    run_dir = _run_dir_with(d, "r3", sha="c" * 64, kind="resumable", epochs_done=4)  # no fingerprint
+    plan = U.prepare_run_dir(run_dir, "c" * 64, probe=fake_probe, fingerprint="f1")
+    assert plan.kind == "fresh" and "provenance unknown" in plan.reason, plan
+    # a mirror from the old data is not used either, and is set aside (never deleted)
+    mirror_root = d / "mirror"
+    U.mirror_run_dir(_run_dir_with(d / "vm1", "r4", sha="c" * 64, kind="finished", stripped=True, fp="f1"),
+                     mirror_root / "r4")
+    plan = U.prepare_run_dir(d / "vm2" / "r4", "c" * 64, mirror_run=mirror_root / "r4", probe=fake_probe,
+                             fingerprint="f2", stamp="20261009T120000Z")
+    assert plan.kind == "fresh" and "dataset changed" in plan.reason, plan
+    assert not (mirror_root / "r4").exists()
+    assert plan.mirror_moved_aside == mirror_root / "r4.stale-20261009T120000Z"
+    assert (plan.mirror_moved_aside / "last.pt").is_file() and (plan.mirror_moved_aside / U.SIDECAR).is_file()
+
+
+def test_resume_checks_the_checkpoints_own_train_args():
+    # T2: Ultralytics resumes with the CHECKPOINT's arguments, so a last.pt that
+    # does not belong to its sidecar (a VM died between the mirror copies) must
+    # not be resumed under the sidecar's identity
+    eff = U.resolve_config(dict(MATRIX_CFG, epochs=10))
+    ok = {"epochs": 10, "imgsz": 640, "seed": MATRIX_CFG["seed"], "batch": 16}
+    assert U.train_args_mismatch(ok, eff) is None
+    assert U.train_args_mismatch(None, eff) is None and U.train_args_mismatch({}, eff) is None
+    assert "epochs=60" in U.train_args_mismatch(dict(ok, epochs=60), eff)
+    assert "seed" in U.train_args_mismatch(dict(ok, seed=1), eff)
+    assert "imgsz" in U.train_args_mismatch(dict(ok, imgsz=1280), eff)
+    assert U.train_args_mismatch(dict(ok, imgsz=672), dict(eff, imgsz=650)) is None  # check_imgsz rounding
+    for halved in (8, 4, 2, 1):  # Ultralytics' first-epoch OOM recovery halves the batch
+        assert U.train_args_mismatch(dict(ok, batch=halved), eff) is None, halved
+    for wrong in (12, 32):
+        assert "batch=" in U.train_args_mismatch(dict(ok, batch=wrong), eff), wrong
+    assert U.train_args_mismatch(dict(ok, batch=12), dict(eff, batch=-1)) is None  # AutoBatch
+    d = _tmp()
+    sha = B.config_sha256(eff)
+    run_dir = _run_dir_with(d, "r1", sha=sha, kind="resumable", epochs_done=4, fp="f1",
+                            train_args=dict(ok, epochs=60))
+    plan = U.prepare_run_dir(run_dir, sha, probe=fake_probe, fingerprint="f1", eff=eff)
+    assert plan.kind == "fresh" and "epochs=60" in plan.reason, plan
+    run_dir = _run_dir_with(d, "r2", sha=sha, kind="resumable", epochs_done=4, fp="f1",
+                            train_args=dict(ok, batch=8))
+    plan = U.prepare_run_dir(run_dir, sha, probe=fake_probe, fingerprint="f1", eff=eff)
+    assert plan.kind == "resume", plan
+
+
+def test_mirror_copies_the_sidecar_last():
+    # T2: the sidecar vouches for the checkpoint next to it, so it must never
+    # land before that checkpoint (a VM dying between two copies)
+    order = [rel for rel, _ in U._mirror_members(best=True)]
+    assert order[-1] == U.SIDECAR and order.index("weights/last.pt") < order.index(U.SIDECAR), order
+    assert order.index("results.csv") < order.index("weights/last.pt")
+    d = _tmp()
+    src = _run_dir_with(d / "vm", "r", sha="c" * 64, kind="resumable", epochs_done=3, rows=3, fp="f1")
+    copied = []
+    real_copy = B.atomic_copy
+    B.atomic_copy = lambda a, b: (copied.append(Path(b).name), real_copy(a, b))[1]
+    try:
+        U.mirror_run_dir(src, d / "mirror" / "r")
+    finally:
+        B.atomic_copy = real_copy
+    assert copied[-1] == U.SIDECAR and copied.index("last.pt") < copied.index(U.SIDECAR), copied
+
+
+def test_unusable_mirror_is_set_aside_usable_one_kept():
+    d = _tmp()
+    mirror_root = d / "mirror"
+    # a mirror from another config next to a resumable local run: local wins, mirror set aside
+    U.mirror_run_dir(_run_dir_with(d / "old", "r", sha="a" * 64, kind="resumable", epochs_done=9, fp="f1"),
+                     mirror_root / "r")
+    run_dir = _run_dir_with(d / "vm", "r", sha="c" * 64, kind="resumable", epochs_done=2, fp="f1")
+    plan = U.prepare_run_dir(run_dir, "c" * 64, mirror_run=mirror_root / "r", probe=fake_probe,
+                             fingerprint="f1", stamp="20261009T130000Z")
+    assert (plan.kind, plan.source) == ("resume", "local") and plan.mirror_moved_aside is not None
+    assert not (mirror_root / "r").exists() and (mirror_root / "r.stale-20261009T130000Z").is_dir()
+    # a usable mirror that loses to a more advanced local run stays where it is
+    U.mirror_run_dir(_run_dir_with(d / "old2", "q", sha="c" * 64, kind="resumable", epochs_done=1, fp="f1"),
+                     mirror_root / "q")
+    run_dir = _run_dir_with(d / "vm", "q", sha="c" * 64, kind="resumable", epochs_done=5, fp="f1")
+    plan = U.prepare_run_dir(run_dir, "c" * 64, mirror_run=mirror_root / "q", probe=fake_probe,
+                             fingerprint="f1")
+    assert plan.source == "local" and plan.mirror_moved_aside is None and (mirror_root / "q").is_dir()
+    # an empty mirror folder is left alone
+    (mirror_root / "e").mkdir()
+    plan = U.prepare_run_dir(d / "vm" / "e", "c" * 64, mirror_run=mirror_root / "e", probe=fake_probe)
+    assert plan.kind == "fresh" and plan.mirror_moved_aside is None
+
+
+def test_drive_read_errors_never_discard_a_candidate():
+    # an unreadable mirror (Drive) is unknown, not unusable: the attempt fails
+    # (and is retried) instead of setting the mirror aside and starting over
+    if os.geteuid() == 0:
+        return  # root reads anything
+    d = _tmp()
+    mirror = d / "mirror" / "r"
+    U.mirror_run_dir(_run_dir_with(d / "old", "r", sha="c" * 64, kind="resumable", epochs_done=7, fp="f1"),
+                     mirror)
+    (mirror / U.SIDECAR).chmod(0)
+    try:
+        _raises(OSError, lambda: U.prepare_run_dir(d / "vm" / "r", "c" * 64, mirror_run=mirror,
+                                                   probe=fake_probe, fingerprint="f1"))
+    finally:
+        (mirror / U.SIDECAR).chmod(0o644)
+    assert (mirror / "last.pt").is_file() and not list((d / "mirror").glob("r.stale-*"))
+    assert U.read_sidecar(d / "nowhere") is None  # absent is still just None
+
+
+# ------------------------------------------------- run() with a fake trainer
+
+
+class FakeYOLO:
+    """Stands in for ultralytics.YOLO in run(): trains by writing REAL torch
+    checkpoints (the real probe_checkpoint reads them) and calling the hooks."""
+
+    trains: list = []
+    batch_used = None    # set: the trainer "halved" the batch (first-epoch OOM)
+    stop_after = None    # set: the VM dies after this epoch
+
+    def __init__(self, src):
+        self.src, self.hooks = str(src), []
+
+    def add_callback(self, event, fn):
+        assert event == "on_model_save"
+        self.hooks.append(fn)
+
+    def train(self, **kw):
+        import torch
+        from types import SimpleNamespace
+
+        FakeYOLO.trains.append(kw)
+        if kw.get("resume"):
+            save_dir = Path(kw["save_dir"])
+            ckpt = torch.load(self.src, weights_only=False)
+            args, start = dict(ckpt["train_args"]), ckpt["epoch"] + 1
+        else:
+            save_dir = Path(kw["project"]) / kw["name"]
+            args, start = {k: kw[k] for k in U.TRAIN_ARG_KEYS}, 0
+            if FakeYOLO.batch_used:
+                args["batch"] = FakeYOLO.batch_used
+        (save_dir / "weights").mkdir(parents=True, exist_ok=True)
+        (save_dir / "args.yaml").write_text("epochs: %d\n" % args["epochs"])
+        results = save_dir / "results.csv"
+        for ep in range(start, args["epochs"]):
+            torch.save({"epoch": ep, "ema": {"w": 1}, "optimizer": {"s": 1}, "train_args": args},
+                       save_dir / "weights" / "last.pt")
+            if not results.exists():
+                results.write_text("epoch,loss\n")
+            with open(results, "a") as f:
+                f.write(f"{ep + 1},{1 / (ep + 1):.3f}\n")
+            for hook in self.hooks:
+                hook(SimpleNamespace(epoch=ep, epochs=args["epochs"]))
+            if FakeYOLO.stop_after is not None and ep + 1 >= FakeYOLO.stop_after:
+                raise RuntimeError("simulated disconnect")
+        torch.save({"epoch": -1, "ema": None, "model": {"w": 1}, "optimizer": None, "train_args": args},
+                   save_dir / "weights" / "last.pt")  # final_eval strips the optimizer
+
+
+class FakeRunner:
+    """Patches run()'s heavy collaborators; `prov` is today's provenance.json."""
+
+    def __init__(self, fingerprint):
+        self.prov = dict(PROVENANCE, dataset_fingerprint=fingerprint)
+        self.saved = {}
+
+    def __enter__(self):
+        def export(weights_pt, export_dir, **kw):
+            Path(export_dir).mkdir(parents=True, exist_ok=True)
+            (Path(export_dir) / "model.onnx").write_bytes(b"onnx")
+            return _onnx_info(layout="raw"), None
+
+        def data_yaml(ds_id, fold, out):
+            Path(out).write_text("path: x\n")
+            return Path(out)
+
+        patches = {"_import_yolo": lambda: FakeYOLO, "export_onnx": export, "_pip_freeze": lambda: "x==1\n",
+                   "_versions": lambda: {"python": "3", "torch": "2", "cuda": None, "ultralytics": "8"},
+                   "load_provenance": lambda ds: self.prov, "_write_data_yaml": data_yaml,
+                   "_git_meta": lambda: {"git_sha": "abc", "git_dirty": False}}
+        for k, v in patches.items():
+            self.saved[k] = getattr(U, k)
+            setattr(U, k, v)
+        self.env = {k: os.environ.get(k) for k in (U.ENV_MIRROR_INTERVAL, U.ENV_ABORT)}
+        os.environ[U.ENV_MIRROR_INTERVAL] = "0"
+        os.environ.pop(U.ENV_ABORT, None)
+        FakeYOLO.trains, FakeYOLO.batch_used, FakeYOLO.stop_after = [], None, None
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            setattr(U, k, v)
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _run_cfg(d: Path) -> Path:
+    cfg = d / "yolo26n_def3_fold0.yaml"
+    cfg.write_text("name: yolo26n_def3_fold0\nmodel: yolo26n.pt\ndataset_id: ds_v2_def3\nfold: fold0\n"
+                   "epochs: 2\nimgsz: 640\nbatch: 16\nseed: 1\n")
+    return cfg
+
+
+def _new_vm(name="yolo26n_def3_fold0"):
+    shutil.rmtree(U.settings.run_dirs_dir / name, ignore_errors=True)
+
+
+def test_run_records_the_fingerprint_and_never_bundles_old_data():
+    import logging
+
+    d = _tmp()
+    cfg, mirror_root = _run_cfg(d), d / "mirror"
+    name = "yolo26n_def3_fold0"
+    logging.disable(logging.WARNING)
+    try:
+        with FakeRunner("f1" * 32):
+            _new_vm()
+            FakeYOLO.stop_after = 1  # the VM dies after epoch 1 (mirrored)
+            _raises(RuntimeError, lambda: U.run(cfg, device="cpu", mirror_dir=mirror_root), "disconnect")
+            assert U.read_sidecar(mirror_root / name)["dataset_fingerprint"] == "f1" * 32
+            _new_vm()  # a new VM: only the mirror survives
+            FakeYOLO.stop_after = None
+            zip1 = U.run(cfg, device="cpu", mirror_dir=mirror_root)
+            assert FakeYOLO.trains[-1].get("resume") is True, "same data: resumed from the mirror"
+            assert B.read_bundle_meta(zip1)["dataset_fingerprint"] == "f1" * 32
+            assert len(B.read_bundle_meta(zip1)["attempts"]) == 2
+        # the tiles were rebuilt (new fingerprint): the finished old-data mirror
+        # must not be bundled under the new fingerprint — it is set aside and retrained
+        with FakeRunner("f2" * 32):
+            _new_vm()
+            zip2 = U.run(cfg, device="cpu", mirror_dir=mirror_root)
+            assert len(FakeYOLO.trains) == 1 and not FakeYOLO.trains[0].get("resume"), FakeYOLO.trains
+            meta = B.read_bundle_meta(zip2)
+            assert meta["dataset_fingerprint"] == "f2" * 32 and len(meta["attempts"]) == 1
+            assert U.read_sidecar(mirror_root / name)["dataset_fingerprint"] == "f2" * 32
+            assert len(list(mirror_root.glob(f"{name}.stale-*"))) == 1, "old mirror kept aside"
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+def test_run_records_the_batch_the_trainer_really_used():
+    # T6: Ultralytics halves the batch after a first-epoch CUDA OOM without
+    # failing; meta.json must say so (batch_effective) and the log must shout
+    import logging
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    d = _tmp()
+    cfg = _run_cfg(d)
+    grab = Grab()
+    U.logger.addHandler(grab)
+    try:
+        with FakeRunner("f3" * 32):
+            _new_vm()
+            meta = B.read_bundle_meta(U.run(cfg, device="cpu"))
+            assert meta["batch"] == 16 and meta["batch_effective"] == 16, meta
+            assert not [m for m in grab.lines if "batch_effective" in m]
+            _new_vm()
+            FakeYOLO.batch_used = 8
+            meta = B.read_bundle_meta(U.run(cfg, device="cpu"))
+            assert meta["batch"] == 16 and meta["batch_effective"] == 8, meta
+            assert meta["config_sha256"] == B.config_sha256(U.resolve_config(B.load_config(cfg)))
+    finally:
+        U.logger.removeHandler(grab)
+    loud = [m for m in grab.lines if "batch_effective" in m]
+    assert len(loud) == 1 and "WARNING" in loud[0] and "batch 8" in loud[0], grab.lines
 
 
 def test_truncate_results_csv():

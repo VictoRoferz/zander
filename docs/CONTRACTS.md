@@ -233,6 +233,7 @@ inspector/.env
   - `attempts: [{gpu, started, seconds, resumed}]`, `config_sha256`, `overrides`
   - `onnx: {file, sha256, opset, layout: raw|e2e|deim, output_shapes}`, `onnx_raw: {...}|null`
   - `versions: {python, torch, cuda, ultralytics | deim_commit}`, `created`
+  - `batch_effective` (Ultralytics bundles): the batch `last.pt` says it trained with. Ultralytics halves the batch after a CUDA OOM in a process's first epoch without failing, so it can be lower than `batch`; the runner and the matrix warn loudly then. Missing or null = unknown (older bundles, DEIM); readers then fall back to `batch`.
 - **Naming:**
   - Config `name`: `<arch>_<schema>_fold<k>` or `<arch>_<schema>_devall`.
   - Family: `<arch>_<schema>`, e.g. `yolo26n_def3`.
@@ -325,10 +326,11 @@ inspector/.env
 `MyDrive/ZanderML/`:
 - `ds_v2_{def3,nal1}_tiles.zip`: input.
 - `bundles/<run>_bundle.zip` plus `.sha256`: the "finished" marker.
-- `mirror/<run>/{last.pt, results.csv, args.yaml, zander_run.json}` (+ `best.pt` only when `final_weights: best`): for resume; `zander_run.json` holds the attempt log and the config sha (a checkpoint trained under a different config is never resumed). Copied at most every 300 s (`ZANDER_MIRROR_INTERVAL_S`) and always at the final epoch; deleted once the bundle is safe.
+- `mirror/<run>/{last.pt, results.csv, args.yaml, zander_run.json}` (+ `best.pt` only when `final_weights: best`): for resume; `zander_run.json` holds the attempt log, the config sha and the `dataset_fingerprint` (a checkpoint trained under a different config or on other tiles is never resumed or bundled, and the checkpoint's own `train_args` — epochs, imgsz, seed, batch or an OOM-halved batch — must match the config). `zander_run.json` is copied **last**, after `last.pt`. On a start that cannot use the mirror, an unusable `mirror/<run>/` is moved aside to `mirror/<run>.stale-<UTC stamp>/` (never deleted). Copied at most every 300 s (`ZANDER_MIRROR_INTERVAL_S`) and always at the final epoch. Kept after the bundle is written (Drive uploads in the background); a **later** session deletes it once it has read the bundle back and verified its sha. The notebook's last cell runs `drive.flush_and_unmount()`.
 - For DEIM runs the mirror holds `{last.pt (DEIM's full checkpoint), log.txt, zander_run.json}`.
 - `logs/<run>.log`.
 - `matrix_log.jsonl` (one line per start, interruption and result).
+- Drive trouble never stops a healthy run or the matrix loop: a failing write to `logs/<run>.log` or `matrix_log.jsonl` is warned about once and training goes on; an error in the driver around one run is a failed attempt of that run. A bundle that cannot be **read** (I/O error, `BundleCheck.io_error`) is logged as `failed` and left alone: never moved aside as invalid, never retrained.
 
 `train/dispatch.py` exit codes: 0 ok, 1 failure (retried by the matrix), 2 config/data error (not retried), 130 interrupted.
 

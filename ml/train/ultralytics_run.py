@@ -19,6 +19,12 @@ the bundle records, and its sha256 is the run's identity):
     leak) — so every run bundles its LAST epoch. dev_all refuses `best`
     outright: its "val" (fold0_val) is inside dev_all_train.
   - extra.patience: 0 — early stopping off (0 = never stop in Ultralytics).
+    Early stopping picks the final epoch on fold{i}_val, the same leak as
+    `best`: a fold run with patience != 0 gets a loud warning (the
+    out-of-fold eval refuses such bundles), dev_all refuses it outright.
+  - batch: Ultralytics silently halves it after a CUDA OOM in the first epoch
+    of a process; meta.json records what last.pt says it trained with as
+    `batch_effective`, and a mismatch is logged as a loud WARNING.
   - deterministic: true (configurable).
   - export: {opset: 17, raw_variant: auto}. model.onnx is the default export
     (YOLO26: the NMS-free one-to-one head (1,300,6) = layout "e2e"; YOLO11: the
@@ -26,19 +32,27 @@ the bundle records, and its sha256 is the run's identity):
     model_raw.onnx (end2end=False). `off` skips it.
 
 Resume (Colab disconnects). With `mirror_dir`, an `on_model_save` callback
-copies results.csv, args.yaml, zander_run.json (the attempt log) and last.pt
-to `<mirror_dir>/<name>/` — each atomically, last.pt last, at most every
-ZANDER_MIRROR_INTERVAL_S seconds plus the final epoch; failures are logged,
-never fatal. On start the runner picks the most advanced usable checkpoint
-(local run_dir first, then the mirror) whose recorded config sha matches the
-effective config:
+copies results.csv, args.yaml, last.pt and zander_run.json (the attempt log)
+to `<mirror_dir>/<name>/` — each atomically, the sidecar LAST (a VM dying
+mid-copy leaves the old sidecar, which then refuses the new checkpoint if it
+belongs to another config or dataset — never a new sidecar vouching for an
+old checkpoint), at most every ZANDER_MIRROR_INTERVAL_S seconds plus the
+final epoch; failures are logged, never fatal. On start the runner picks the
+most advanced usable checkpoint (local run_dir first, then the mirror): its
+zander_run.json must record the effective config's sha AND today's
+dataset_fingerprint, and the checkpoint's own train_args (epochs, imgsz,
+seed, batch — or a batch Ultralytics halved after an OOM) must agree with
+the config, because a resume trains with the checkpoint's arguments, not ours:
   - resumable -> YOLO(last).train(resume=True, data=<rewritten yaml>, ...)
   - finished  -> straight to export + bundle
   - none      -> fresh start; an existing run_dir is moved aside to
                  `<name>.stale-<UTC stamp>` first (never deleted, never merged:
-                 Ultralytics appends to results.csv).
-A resumed run is statistically equivalent to an uninterrupted one, not
-bit-identical (dataloader RNG state is not checkpointed).
+                 Ultralytics appends to results.csv), and so is an unusable
+                 mirror (`<mirror_dir>/<name>.stale-<UTC stamp>`).
+An I/O error while reading a candidate (Drive) fails the attempt (retried)
+instead of discarding the candidate. A resumed run is statistically
+equivalent to an uninterrupted one, not bit-identical (dataloader RNG state
+is not checkpointed).
 
 Environment (runtime knobs: recorded per attempt, NOT part of the config):
   ZANDER_WORKERS=<n>           dataloader workers          (dispatch.py --workers)
@@ -173,6 +187,13 @@ def resolve_config(raw: dict, overrides: Optional[dict] = None) -> dict:
             "dev_all refuses final_weights: best — its validation view (fold0_val) is inside "
             "dev_all_train, so best.pt would be selected on training data; use last"
         )
+    patience = eff["extra"].get("patience") if isinstance(eff.get("extra"), dict) else None
+    early_stop = patience not in (0, None)  # Ultralytics: 0/None = never stop
+    if fold == "dev_all" and early_stop:
+        errors.append(
+            f"dev_all refuses extra.patience: {patience!r} — early stopping would choose the final "
+            "epoch on fold0_val, which is inside dev_all_train; use 0"
+        )
     for key in ("augment", "extra", "export"):
         need(isinstance(eff.get(key), dict), f"`{key}` must be a mapping")
     if not errors:
@@ -207,6 +228,12 @@ def resolve_config(raw: dict, overrides: Optional[dict] = None) -> dict:
             "final_weights: best selects the checkpoint on %s_val — the photos this model is "
             "later evaluated on out-of-fold (selection leak); prefer last", fold,
         )
+    if early_stop:
+        logger.warning(
+            "WARNING extra.patience: %r turns early stopping on: the run ends at an epoch chosen on "
+            "%s_val — the photos this model is later evaluated on out-of-fold (selection leak; the "
+            "out-of-fold evaluation refuses such bundles); keep 0", patience, fold,
+        )
     return eff
 
 
@@ -237,6 +264,7 @@ class CkptState:
     epochs: Optional[int] = None       # the run's target epochs
     stripped: bool = False             # final_eval already stripped the optimizer
     detail: str = ""
+    train_args: Optional[dict] = None  # TRAIN_ARG_KEYS the checkpoint trained with (None: unknown)
 
 
 @dataclass(frozen=True)
@@ -247,37 +275,91 @@ class StartPlan:
     stripped: bool = False
     moved_aside: Optional[Path] = None
     reason: str = ""
+    mirror_moved_aside: Optional[Path] = None
+
+
+# The checkpoint's own arguments a resume trains with (Ultralytics restores
+# them from last.pt and ignores ours); they must match the effective config.
+TRAIN_ARG_KEYS = ("epochs", "imgsz", "seed", "batch")
+OOM_HALVINGS = 8  # Ultralytics halves the batch after a first-epoch OOM (up to 3x per process)
+MAX_STRIDE = 32   # YOLO's largest stride: train_args.imgsz is rounded up to a multiple of it
 
 
 def probe_checkpoint(pt: Path) -> CkptState:
-    """Classify an Ultralytics last.pt without building a trainer."""
+    """Classify an Ultralytics last.pt without building a trainer.
+
+    An OSError while READING the file (Drive mount dropped, EIO) is raised,
+    never reported as "corrupt": a checkpoint we could not read is not a bad
+    checkpoint. The bytes are parsed from memory, because torch.load itself
+    raises OSError(EINVAL) for some truncated files — those are corrupt."""
     pt = Path(pt)
     if not pt.is_file():
         return CkptState("missing")
-    try:
-        import torch
-        from ultralytics.utils.patches import torch_load
+    import io
 
-        ckpt = torch_load(pt, map_location=torch.device("cpu"))
+    import torch
+    from ultralytics.utils.patches import torch_load
+
+    try:
+        data = pt.read_bytes()
+    except FileNotFoundError:
+        return CkptState("missing")
+    try:
+        ckpt = torch_load(io.BytesIO(data), map_location=torch.device("cpu"))
     except Exception as e:  # truncated write, foreign file, ...
         return CkptState("corrupt", detail=f"{type(e).__name__}: {e}")
     if not isinstance(ckpt, dict) or not (ckpt.get("ema") or ckpt.get("model")):
         return CkptState("corrupt", detail="not an Ultralytics training checkpoint")
+    raw_args = ckpt.get("train_args") if isinstance(ckpt.get("train_args"), dict) else {}
+    train_args = {k: raw_args[k] for k in TRAIN_ARG_KEYS if k in raw_args}
     epoch = ckpt.get("epoch", -1)
-    epochs = (ckpt.get("train_args") or {}).get("epochs")
+    epochs = raw_args.get("epochs")
     epochs = int(epochs) if isinstance(epochs, (int, float)) else None
     if epoch is None or int(epoch) < 0 or ckpt.get("optimizer") is None:
-        return CkptState("finished", None, epochs, stripped=True)
+        return CkptState("finished", None, epochs, stripped=True, train_args=train_args)
     done = int(epoch) + 1
     if epochs is not None and done >= epochs:  # loop done, final_eval never ran
-        return CkptState("finished", done, epochs, stripped=False)
-    return CkptState("resumable", done, epochs)
+        return CkptState("finished", done, epochs, stripped=False, train_args=train_args)
+    return CkptState("resumable", done, epochs, train_args=train_args)
+
+
+def train_args_mismatch(train_args: Optional[dict], eff: dict) -> Optional[str]:
+    """Why a checkpoint's train_args disagree with the effective config, or None.
+
+    batch may be the config's batch halved k times (Ultralytics' first-epoch
+    OOM recovery; the bundle records it as batch_effective). An auto batch
+    (batch < 1) is resolved by Ultralytics and not compared. imgsz may be
+    rounded up to the model stride (check_imgsz stores the rounded value)."""
+    if not train_args:
+        return None
+    for key in ("epochs", "imgsz", "seed"):
+        have, want = train_args.get(key), eff.get(key)
+        if have is None or want is None or have == want:
+            continue
+        if key == "imgsz" and isinstance(want, int) and have == -(-want // MAX_STRIDE) * MAX_STRIDE:
+            continue
+        return f"checkpoint trained with {key}={have!r}, the config says {want!r}"
+    have, want = train_args.get("batch"), eff.get("batch")
+    if (have is not None and isinstance(want, int) and not isinstance(want, bool) and want >= 1):
+        allowed = {max(want >> k, 1) for k in range(OOM_HALVINGS)}
+        if have not in allowed:
+            return f"checkpoint trained with batch={have!r}, the config says {want!r}"
+    return None
+
+
+def batch_trained(pt: Path) -> Optional[int]:
+    """The batch a checkpoint says it trained with (train_args.batch), or None."""
+    state = probe_checkpoint(pt)
+    batch = (state.train_args or {}).get("batch")
+    return int(batch) if isinstance(batch, (int, float)) and not isinstance(batch, bool) else None
 
 
 def read_sidecar(directory: Path) -> Optional[dict]:
+    """zander_run.json, or None when absent / not an attempt log. Any other
+    OSError (Drive) is raised: unknown is not the same as missing."""
     try:
         doc = json.loads((Path(directory) / SIDECAR).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (FileNotFoundError, NotADirectoryError, ValueError):
         return None
     return doc if isinstance(doc, dict) and isinstance(doc.get("attempts"), list) else None
 
@@ -287,12 +369,15 @@ def write_sidecar(directory: Path, doc: dict) -> None:
 
 
 def _mirror_members(best: bool) -> list[tuple[str, str]]:
-    """(run_dir relative path, mirror name) in copy order — the weights LAST, so
-    a mirror's results.csv is never behind its checkpoint."""
-    members = [("results.csv", "results.csv"), ("args.yaml", "args.yaml"), (SIDECAR, SIDECAR)]
+    """(run_dir relative path, mirror name) in copy order: results.csv before
+    the weights (a mirror's results.csv is never behind its checkpoint), and
+    the sidecar LAST — it vouches for the checkpoint next to it (config sha,
+    dataset fingerprint), so it may never arrive before that checkpoint."""
+    members = [("results.csv", "results.csv"), ("args.yaml", "args.yaml")]
     if best:
         members.append(("weights/best.pt", "best.pt"))
     members.append(("weights/last.pt", "last.pt"))
+    members.append((SIDECAR, SIDECAR))
     return members
 
 
@@ -354,7 +439,8 @@ def move_aside(path: Path, stamp: Optional[str] = None) -> Path:
     return target
 
 
-def _usable(pt: Path, sidecar_dir: Path, config_sha: str, probe) -> tuple[Optional[CkptState], str]:
+def _usable(pt: Path, sidecar_dir: Path, config_sha: str, probe, fingerprint: Optional[str] = None,
+            eff: Optional[dict] = None) -> tuple[Optional[CkptState], str]:
     state = probe(pt)
     if state.kind in ("missing", "corrupt"):
         return None, f"checkpoint {state.kind}" + (f" ({state.detail})" if state.detail else "")
@@ -363,7 +449,21 @@ def _usable(pt: Path, sidecar_dir: Path, config_sha: str, probe) -> tuple[Option
         return None, f"no {SIDECAR} (provenance unknown)"
     if side.get("config_sha256") != config_sha:
         return None, "config changed (config_sha256 differs)"
+    # the config sha does not cover the data: never resume (or bundle) across a tile rebuild
+    if fingerprint is not None and side.get("dataset_fingerprint") != fingerprint:
+        have = side.get("dataset_fingerprint")
+        return None, ("dataset changed (dataset_fingerprint differs)" if have
+                      else f"no dataset_fingerprint in {SIDECAR} (data provenance unknown)")
+    if eff is not None:
+        why = train_args_mismatch(state.train_args, eff)
+        if why:
+            return None, f"{why} (checkpoint and {SIDECAR} do not belong together)"
     return state, f"{state.kind} checkpoint"
+
+
+def _has_entries(directory: Path) -> bool:
+    directory = Path(directory)
+    return directory.is_dir() and any(directory.iterdir())
 
 
 def _rank(state: CkptState) -> tuple[int, int]:
@@ -375,25 +475,36 @@ def prepare_run_dir(
     config_sha: str,
     mirror_run: Optional[Path] = None,
     *,
-    probe: Callable[[Path], CkptState] = probe_checkpoint,
+    probe: Optional[Callable[[Path], CkptState]] = None,
     stamp: Optional[str] = None,
+    fingerprint: Optional[str] = None,
+    eff: Optional[dict] = None,
 ) -> StartPlan:
     """Decide fresh / resume / finished and make run_dir match the decision.
 
     Candidates: the local run_dir, then the mirror; a candidate is usable when
     its last.pt is resumable or finished AND its zander_run.json records this
-    config sha. The most advanced one wins (finished > higher epoch; local on a
-    tie). Using the mirror, or starting fresh, first moves an existing run_dir
-    aside."""
+    config sha (and, when given, this dataset `fingerprint`) AND the
+    checkpoint's train_args agree with `eff`. The most advanced one wins
+    (finished > higher epoch; local on a tie). Using the mirror, or starting
+    fresh, first moves an existing run_dir aside; a mirror that is not used and
+    not usable is moved aside too (`<mirror>.stale-<stamp>`, never deleted),
+    so the new run's mirror never mixes with old files. OSErrors while reading
+    a candidate propagate (the attempt fails and is retried)."""
+    probe = probe or probe_checkpoint  # looked up at call time
     run_dir = Path(run_dir)
     local, local_why = (None, "no run_dir")
     if run_dir.exists():
-        local, local_why = _usable(run_dir / "weights" / "last.pt", run_dir, config_sha, probe)
+        local, local_why = _usable(run_dir / "weights" / "last.pt", run_dir, config_sha, probe,
+                                   fingerprint, eff)
     mirror, mirror_why = (None, "no mirror")
     if mirror_run is not None and (Path(mirror_run) / "last.pt").is_file():
-        mirror, mirror_why = _usable(Path(mirror_run) / "last.pt", Path(mirror_run), config_sha, probe)
+        mirror, mirror_why = _usable(Path(mirror_run) / "last.pt", Path(mirror_run), config_sha, probe,
+                                     fingerprint, eff)
     reason = f"local: {local_why}; mirror: {mirror_why}"
-    moved = None
+    moved = mirror_moved = None
+    if mirror is None and mirror_run is not None and _has_entries(mirror_run):
+        mirror_moved = move_aside(mirror_run, stamp)
     if mirror is not None and (local is None or _rank(mirror) > _rank(local)):
         if run_dir.exists():
             moved = move_aside(run_dir, stamp)
@@ -404,11 +515,11 @@ def prepare_run_dir(
     else:
         if run_dir.exists():
             moved = move_aside(run_dir, stamp)
-        return StartPlan("fresh", "none", moved_aside=moved, reason=reason)
+        return StartPlan("fresh", "none", moved_aside=moved, reason=reason, mirror_moved_aside=mirror_moved)
     if state.kind == "resumable":
         truncate_results_csv(run_dir / "results.csv", state.epochs_done or 0)
-        return StartPlan("resume", source, state.epochs_done, False, moved, reason)
-    return StartPlan("finished", source, state.epochs_done, state.stripped, moved, reason)
+        return StartPlan("resume", source, state.epochs_done, False, moved, reason, mirror_moved)
+    return StartPlan("finished", source, state.epochs_done, state.stripped, moved, reason, mirror_moved)
 
 
 def _env_number(name: str, default, cast):
@@ -749,17 +860,20 @@ def run(
     data_yaml = _write_data_yaml(ds_id, fold, run_root / f"{name}_data.yaml")
 
     YOLO = _import_yolo()
-    plan = prepare_run_dir(run_dir, cfg_sha, mirror_run)
+    fingerprint = provenance.get("dataset_fingerprint")
+    plan = prepare_run_dir(run_dir, cfg_sha, mirror_run, fingerprint=fingerprint, eff=eff)
     logger.info(
         f"{name}: {plan.kind} (source {plan.source}, epochs done {plan.epochs_done}; {plan.reason})"
     )
     if plan.moved_aside:
         logger.warning(f"previous run_dir moved aside -> {plan.moved_aside}")
+    if plan.mirror_moved_aside:
+        logger.warning(f"unusable mirror moved aside -> {plan.mirror_moved_aside}")
 
     sidecar = read_sidecar(run_dir) if plan.kind != "fresh" else None
     if sidecar is None:
         sidecar = {"format": 1, "run_name": name, "config_sha256": cfg_sha,
-                   "created": B.utc_now(), "attempts": []}
+                   "dataset_fingerprint": fingerprint, "created": B.utc_now(), "attempts": []}
     for a in sidecar["attempts"]:
         if a.get("status") == "running":  # its process is gone
             a["status"] = "interrupted"
@@ -823,6 +937,18 @@ def run(
     weights_pt = run_dir / "weights" / f"{final_weights}.pt"
     if not weights_pt.is_file():
         raise FileNotFoundError(f"{weights_pt} missing — cannot bundle final_weights={final_weights}")
+    if sidecar.get("dataset_fingerprint") != fingerprint:  # meta below is stamped with today's data
+        raise RuntimeError(
+            f"{name}: the checkpoint was trained on dataset_fingerprint "
+            f"{sidecar.get('dataset_fingerprint')!r}, today's tiles are {fingerprint!r} — not bundled"
+        )
+    batch_effective = batch_trained(run_dir / "weights" / "last.pt")
+    if batch_effective is not None and batch_effective != eff["batch"]:
+        logger.warning(
+            f"WARNING {name}: trained with batch {batch_effective}, but the config says {eff['batch']} "
+            "(Ultralytics halves the batch after a CUDA out-of-memory error). meta.json records "
+            "batch_effective; this model is NOT config-equivalent to its fold siblings"
+        )
 
     t_export = time.time()
     onnx_main, onnx_raw = export_onnx(
@@ -839,6 +965,7 @@ def run(
         extra={
             "deterministic": eff["deterministic"],
             "final_weights": final_weights,
+            "batch_effective": batch_effective,
             "runtime": B.to_jsonable(runtime),
             "export_seconds": export_seconds,
             "toolchain": f"{settings.toolchain_name} {settings.toolchain_version}",
