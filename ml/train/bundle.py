@@ -28,6 +28,7 @@ Stable API (keyword names are part of the API; additions are keyword-only):
     sha_path_for(zip_path) -> Path                "<zip>.sha256"
     read_sha256_file(path) -> str | None
     verify_bundle(zip_path) -> BundleCheck        marker present + sha matches + readable meta
+                                                  (io_error=True: the check itself failed)
     read_bundle_meta(zip_path) -> dict
     atomic_write_bytes / atomic_write_text / atomic_copy / utc_now
 
@@ -491,31 +492,47 @@ class BundleCheck:
     reason: str
     sha256: Optional[str] = None
     meta: Optional[dict] = None
+    # True when the check itself failed (Drive mount dropped, EIO, permission):
+    # the bundle is UNKNOWN, not invalid — never move it aside or retrain over it.
+    io_error: bool = False
 
 
 def verify_bundle(zip_path: Union[str, Path]) -> BundleCheck:
     """A bundle is valid when its .sha256 marker exists and matches the zip, the
-    zip is flat and readable, and it carries meta.json + config.yaml + model.onnx."""
+    zip is flat and readable, and it carries meta.json + config.yaml + model.onnx.
+
+    An OSError while checking (other than "file not found") gives
+    `io_error=True`: the content was never judged."""
     zip_path = Path(zip_path)
-    if not zip_path.is_file():
-        return BundleCheck(False, "missing")
-    expected = read_sha256_file(sha_path_for(zip_path))
-    if expected is None:
-        return BundleCheck(False, "no valid .sha256 marker (incomplete copy?)")
-    actual = sha256_file(zip_path)
-    if actual != expected:
-        return BundleCheck(False, f"sha256 mismatch (marker {expected[:12]}, zip {actual[:12]})")
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            names = zf.namelist()
-            for n in names:
-                _check_arcname(n)
-            for r in ("meta.json", "config.yaml", "model.onnx"):
-                if r not in names:
-                    return BundleCheck(False, f"zip lacks {r}", actual)
-            meta = json.loads(zf.read("meta.json").decode("utf-8"))
-    except (zipfile.BadZipFile, ValueError, KeyError, OSError) as e:
-        return BundleCheck(False, f"unreadable zip: {e}", actual)
+        if not zip_path.is_file():
+            return BundleCheck(False, "missing")
+        try:
+            marker = sha_path_for(zip_path).read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, UnicodeDecodeError):  # absent / garbage = no marker
+            marker = ""
+        token = marker.split()[0].lower() if marker else ""
+        expected = token if _SHA_RE.match(token) else None
+        if expected is None:
+            return BundleCheck(False, "no valid .sha256 marker (incomplete copy?)")
+        actual = sha256_file(zip_path)
+        if actual != expected:
+            return BundleCheck(False, f"sha256 mismatch (marker {expected[:12]}, zip {actual[:12]})")
+        # the sha matched, so the bytes are the ones the writer verified: any
+        # OSError below is the medium, not the content
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+                for n in names:
+                    _check_arcname(n)
+                for r in ("meta.json", "config.yaml", "model.onnx"):
+                    if r not in names:
+                        return BundleCheck(False, f"zip lacks {r}", actual)
+                meta = json.loads(zf.read("meta.json").decode("utf-8"))
+        except (zipfile.BadZipFile, ValueError, KeyError) as e:
+            return BundleCheck(False, f"unreadable zip: {e}", actual)
+    except OSError as e:
+        return BundleCheck(False, f"I/O error while checking: {type(e).__name__}: {e}", io_error=True)
     return BundleCheck(True, "ok", actual, meta)
 
 

@@ -14,13 +14,18 @@ Drive layout (docs/CONTRACTS.md §8.5), under --drive:
 Per config, in the given (priority) order:
   1. skip when bundles/<run>_bundle.zip has a matching .sha256 — even if its
      config_sha256 differs from today's effective config (warned): results are
-     never overwritten. A zip without a valid marker is moved aside and redone.
+     never overwritten. A zip without a valid marker is moved aside and redone. If Drive cannot be READ (an I/O error, not a bad
+     bundle) the run is reported as failed and left alone: never moved aside,
+     never retrained.
   2. run train/dispatch.py as a SUBPROCESS with --mirror-dir <drive>/mirror
      (the runner restores mirror/<run>/ into its run_dir and resumes), output
      teed to logs/<run>.log; a failure is retried up to --max-attempts times
      (not for exit code 2 = configuration/data error) and never stops the loop.
   3. on success copy the bundle, verify its sha, write the .sha256, then
      delete mirror/<run>/.
+Drive trouble never stops a healthy run: a failing logs/<run>.log or
+matrix_log.jsonl write is warned about once and the training goes on; an
+error in the driver around one run fails that run, not the loop.
 After every run: an ETA from the measured minutes/epoch (per family, else per
 architecture; seeded from earlier sessions' matrix_log.jsonl). At the end: a
 summary table; exit 1 if any run failed, 2 on config errors, 130 on Ctrl-C.
@@ -210,11 +215,85 @@ def _tail_text(buf: bytes) -> str:
     return "\n".join(lines[-TAIL_LINES:])[-ERROR_TAIL_CHARS:]
 
 
+def _say(msg: str) -> None:
+    """print() that never raises: a dead notebook output must not stop a run."""
+    try:
+        print(msg, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _open_log(path: Path):
+    return open(path, "ab")
+
+
+class DriveLog:
+    """logs/<run>.log on Drive, best effort. The first OSError (mount dropped,
+    quota, EIO) closes it with ONE warning; the run it records goes on."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.f = None
+        self.error: Optional[str] = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.f = _open_log(self.path)
+        except OSError as e:
+            self._give_up(e)
+
+    def _give_up(self, e: BaseException) -> None:
+        f, self.f = self.f, None
+        self.error = f"{type(e).__name__}: {e}"
+        _say(f"[matrix] WARNING: cannot write {self.path} ({self.error}) — the run continues; "
+             "from here on its output is only in this cell")
+        if f is not None:
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
+
+    def write(self, data: bytes) -> None:
+        if self.f is not None:
+            try:
+                self.f.write(data)
+            except (OSError, ValueError) as e:
+                self._give_up(e)
+
+    def flush(self) -> None:
+        if self.f is not None:
+            try:
+                self.f.flush()
+            except (OSError, ValueError) as e:
+                self._give_up(e)
+
+    def close(self) -> None:
+        f, self.f = self.f, None
+        if f is not None:
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def tee_subprocess(req: RunRequest) -> LaunchResult:
-    """Run req.cmd, streaming its output to our stdout AND req.log_path."""
-    req.log_path.parent.mkdir(parents=True, exist_ok=True)
+    """Run req.cmd, streaming its output to our stdout AND req.log_path.
+
+    Neither copy may cost the run: a failing Drive log is dropped with one
+    warning (DriveLog), a dead stdout just stops the echo, and the child keeps
+    training. The child is stopped only when the driver itself is interrupted
+    (Ctrl-C, SystemExit) or this loop has a bug — an orphaned trainer would
+    race the retry on the same run_dir."""
     tail = bytearray()
-    with open(req.log_path, "ab") as log:
+    log = DriveLog(req.log_path)
+    try:
         header = (f"\n===== {utc_now()} {req.item.name} attempt {req.attempt}: "
                   f"{' '.join(shlex.quote(str(c)) for c in req.cmd)}\n")
         log.write(header.encode("utf-8"))
@@ -222,6 +301,7 @@ def tee_subprocess(req: RunRequest) -> LaunchResult:
         proc = subprocess.Popen(req.cmd, cwd=str(req.cwd), env=req.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         out = getattr(sys.stdout, "buffer", None)
+        echo = True
         last_flush = time.monotonic()
         try:
             fd = proc.stdout.fileno()
@@ -229,12 +309,16 @@ def tee_subprocess(req: RunRequest) -> LaunchResult:
                 chunk = os.read(fd, 65536)
                 if not chunk:
                     break
-                if out is not None:
-                    out.write(chunk)
-                    out.flush()
-                else:
-                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
-                    sys.stdout.flush()
+                if echo:
+                    try:
+                        if out is not None:
+                            out.write(chunk)
+                            out.flush()
+                        else:
+                            sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                            sys.stdout.flush()
+                    except (OSError, ValueError):
+                        echo = False  # the notebook output is gone; the log still gets everything
                 log.write(chunk)
                 if time.monotonic() - last_flush > 10:
                     log.flush()
@@ -243,15 +327,11 @@ def tee_subprocess(req: RunRequest) -> LaunchResult:
                 if len(tail) > TAIL_BYTES:
                     del tail[: len(tail) - TAIL_BYTES]
             rc = proc.wait()
-        except BaseException:
-            proc.terminate()
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        except BaseException:  # Ctrl-C / SystemExit, or a bug here (Drive + stdout errors never get here)
+            _stop(proc)
             raise
-        finally:
-            log.flush()
+    finally:
+        log.close()
     return LaunchResult(rc, _tail_text(bytes(tail)))
 
 
@@ -270,10 +350,15 @@ def append_jsonl(path: Path, record: dict) -> None:
 
 
 def read_jsonl(path: Path) -> list:
-    if not Path(path).is_file():
+    try:
+        if not Path(path).is_file():
+            return []
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:  # only seeds the ETA: never worth stopping the matrix for
+        _say(f"[matrix] WARNING: cannot read {path} ({type(e).__name__}: {e}); ETA starts unmeasured")
         return []
     out = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         try:
             rec = json.loads(line)
         except ValueError:
@@ -406,6 +491,15 @@ def _move_invalid(bundles_dir: Path, name: str, reason: str) -> None:
             print(f"[matrix] {name}: moved an invalid bundle file aside ({reason}): {target.name}", flush=True)
 
 
+def _is_file(path: Path) -> bool:
+    """Path.is_file() that answers False instead of raising on a dropped Drive
+    mount (ENOTCONN / EIO are not swallowed by pathlib)."""
+    try:
+        return Path(path).is_file()
+    except OSError:
+        return False
+
+
 class Matrix:
     def __init__(self, args, items: list, launcher: Launcher, run_root: Path):
         self.args = args
@@ -424,6 +518,7 @@ class Matrix:
         self.knobs = runtime_knobs(self.profile, os.cpu_count())
         self.git_sha = _git_sha()
         self.book = RateBook.from_log(read_jsonl(self.jsonl))
+        self.jsonl_error: Optional[str] = None
 
     def record(self, item: Item, **fields) -> dict:
         rec = {
@@ -437,7 +532,14 @@ class Matrix:
             "host": platform.node(), "warning": None,
         }
         rec.update(fields)
-        append_jsonl(self.jsonl, rec)
+        try:
+            append_jsonl(self.jsonl, rec)
+            self.jsonl_error = None
+        except (OSError, ValueError) as e:  # the log is bookkeeping: never stop the matrix for it
+            if self.jsonl_error is None:
+                _say(f"[matrix] WARNING: cannot append to {self.jsonl} ({type(e).__name__}: {e}) — "
+                     "the matrix continues; the bundles on Drive stay the record of what finished")
+            self.jsonl_error = f"{type(e).__name__}: {e}"
         return rec
 
     def command(self, item: Item) -> list:
@@ -453,30 +555,48 @@ class Matrix:
             cmd += ["--cache", str(self.knobs["cache"])]
         return cmd
 
+    def _unreadable(self, item: Item, why: str) -> Outcome:
+        """Drive could not be READ: the bundle is unknown, not invalid."""
+        note = f"{why} — NOT retrained, nothing moved (the bundle may be fine); rerun once Drive is readable"
+        _say(f"[matrix] WARNING {item.name}: {note}")
+        now = utc_now()
+        rec = self.record(item, status="failed", started=now, ended=now, error_tail=note)
+        return Outcome(item.name, "failed", note=f"Drive unreadable: {why}"[:120], records=[rec])
+
     def skip_if_done(self, item: Item) -> Optional[Outcome]:
         zip_path = self.bundles / f"{item.name}_bundle.zip"
         check = B.verify_bundle(zip_path)
+        if check.io_error:
+            return self._unreadable(item, f"checking {zip_path.name}: {check.reason}")
         if check.ok:
             meta = check.meta or {}
-            warning = None
+            warnings = []
             have = meta.get("config_sha256")
             if item.config_sha and have and have != item.config_sha:
-                warning = (f"existing bundle was trained with config_sha256 {have[:12]} but today's "
-                           f"effective config is {item.config_sha[:12]} — kept, NOT retrained "
-                           "(delete the bundle to retrain)")
-                print(f"[matrix] WARNING {item.name}: {warning}", flush=True)
+                warnings.append(f"existing bundle was trained with config_sha256 {have[:12]} but today's "
+                                f"effective config is {item.config_sha[:12]} — kept, NOT retrained "
+                                "(delete the bundle to retrain)")
+            for w in warnings:
+                _say(f"[matrix] WARNING {item.name}: {w}")
+            warning = "; ".join(warnings) or None
             leftover = self.mirror / item.name
-            if leftover.exists():
-                shutil.rmtree(leftover, ignore_errors=True)
+            try:
+                if leftover.exists():
+                    shutil.rmtree(leftover, ignore_errors=True)
+            except OSError:
+                pass
             now = utc_now()
             rec = self.record(item, status="skipped", started=now, ended=now,
                               epochs_completed=meta.get("epochs_completed"),
                               bundle_sha256=check.sha256, warning=warning)
-            print(f"[matrix] {item.name}: skipped (bundle exists, sha {check.sha256[:12]})", flush=True)
+            _say(f"[matrix] {item.name}: skipped (bundle exists, sha {check.sha256[:12]})")
             return Outcome(item.name, "skipped", epochs_completed=meta.get("epochs_completed"),
                            note=warning or "bundle exists", records=[rec])
-        if zip_path.exists() or B.sha_path_for(zip_path).exists():
-            _move_invalid(self.bundles, item.name, check.reason)
+        try:
+            if zip_path.exists() or B.sha_path_for(zip_path).exists():
+                _move_invalid(self.bundles, item.name, check.reason)
+        except OSError as e:  # retraining over a file we could not move aside would overwrite it
+            return self._unreadable(item, f"moving the invalid {zip_path.name} aside: {type(e).__name__}: {e}")
         return None
 
     def run_item(self, item: Item) -> Outcome:
@@ -486,8 +606,8 @@ class Matrix:
         outcome = Outcome(item.name, "failed")
         env = dict(os.environ, PYTHONUNBUFFERED="1")
         for attempt in range(1, self.args.max_attempts + 1):
-            resumed_hint = ((self.mirror / item.name / "last.pt").is_file()
-                            or (self.run_root / item.name / "weights" / "last.pt").is_file())
+            resumed_hint = (_is_file(self.mirror / item.name / "last.pt")
+                            or _is_file(self.run_root / item.name / "weights" / "last.pt"))
             started = utc_now()
             outcome.records.append(self.record(item, status="started", attempt=attempt,
                                                resumed=resumed_hint, started=started))
@@ -503,6 +623,8 @@ class Matrix:
                             started=started, ended=utc_now(),
                             minutes=round((time.monotonic() - t0) / 60, 2))
                 raise
+            except Exception as e:  # the driver failed around the run: a failed attempt, never a dead loop
+                result = LaunchResult(None, f"matrix driver error: {type(e).__name__}: {e}")
             minutes = round((time.monotonic() - t0) / 60, 2)
             epochs_completed, this_attempt, resumed = _attempt_facts(
                 _run_state(self.run_root, self.mirror, item.name), started, resumed_hint)
@@ -524,8 +646,7 @@ class Matrix:
                     outcome.status, outcome.epochs_completed = "ok", common["epochs_completed"]
                     outcome.note = f"bundle {sha[:12]}"
                     self.book.add(item.family, item.arch, minutes, this_attempt)
-                    print(f"[matrix] {item.name}: OK in {minutes:.1f} min -> {self.bundles / local_zip.name}",
-                          flush=True)
+                    _say(f"[matrix] {item.name}: OK in {minutes:.1f} min -> {self.bundles / local_zip.name}")
                     return outcome
                 except Exception as e:
                     error = f"publishing the bundle failed: {type(e).__name__}: {e}"
@@ -535,7 +656,8 @@ class Matrix:
                                                error_tail=error[-ERROR_TAIL_CHARS:], **common))
             outcome.epochs_completed = epochs_completed
             outcome.note = (error.strip().splitlines() or ["?"])[-1][:120]
-            print(f"[matrix] {item.name}: FAILED (exit {result.returncode}, attempt {attempt})", flush=True)
+            exit_txt = "driver error" if result.returncode is None else f"exit {result.returncode}"
+            _say(f"[matrix] {item.name}: FAILED ({exit_txt}, attempt {attempt})")
             if result.returncode == dispatch.EXIT_CONFIG:
                 outcome.note = "config/data error (not retried): " + outcome.note
                 break
@@ -591,20 +713,25 @@ def main(argv: Optional[list] = None, *, launcher: Optional[Launcher] = None) ->
           f"profile {matrix.profile or 'none'} {matrix.knobs}; git {matrix.git_sha[:12]}", flush=True)
     # cheap existence check for the plan/ETA; run_item re-verifies the sha before skipping
     pending = [it for it in items if not (
-        (matrix.bundles / f"{it.name}_bundle.zip").is_file()
-        and B.sha_path_for(matrix.bundles / f"{it.name}_bundle.zip").is_file())]
+        _is_file(matrix.bundles / f"{it.name}_bundle.zip")
+        and _is_file(B.sha_path_for(matrix.bundles / f"{it.name}_bundle.zip")))]
     print(f"[matrix] {len(items) - len(pending)} already bundled; {eta_line(pending, matrix.book)}",
           flush=True)
     if args.dry_run:
         for it in items:
             state = ("done" if it not in pending else
-                     "resume" if (matrix.mirror / it.name / "last.pt").is_file() else "fresh")
+                     "resume" if _is_file(matrix.mirror / it.name / "last.pt") else "fresh")
             print(f"  {it.name:<28} {state:<7} {it.epochs} epochs  {it.config}", flush=True)
         return 0
     outcomes = []
     try:
         for i, item in enumerate(items):
-            outcomes.append(matrix.run_item(item))
+            try:
+                outcomes.append(matrix.run_item(item))
+            except Exception as e:  # last resort: one run's trouble never ends the session
+                note = f"matrix driver error: {type(e).__name__}: {e}"
+                _say(f"[matrix] {item.name}: FAILED ({note})")
+                outcomes.append(Outcome(item.name, "failed", note=note[:120]))
             rest = [it for it in items[i + 1:] if it in pending]
             print(f"[matrix] {eta_line(rest, matrix.book)}", flush=True)
     except KeyboardInterrupt:

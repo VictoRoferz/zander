@@ -311,6 +311,7 @@ inspector/.env
 - For DEIM runs the mirror holds `{last.pt (DEIM's full checkpoint), log.txt, zander_run.json}`.
 - `logs/<run>.log`.
 - `matrix_log.jsonl` (one line per start, interruption and result).
+- Drive trouble never stops a healthy run or the matrix loop: a failing write to `logs/<run>.log` or `matrix_log.jsonl` is warned about once and training goes on; an error in the driver around one run is a failed attempt of that run. A bundle that cannot be **read** (I/O error, `BundleCheck.io_error`) is logged as `failed` and left alone: never moved aside as invalid, never retrained.
 
 `train/dispatch.py` exit codes: 0 ok, 1 failure (retried by the matrix), 2 config/data error (not retried), 130 interrupted.
 

@@ -357,6 +357,36 @@ def test_write_and_verify_bundle():
     assert B.verify_bundle(d / "nope.zip").reason == "missing"
 
 
+def test_verify_bundle_separates_io_errors_from_bad_bundles():
+    # the matrix moves an INVALID bundle aside and retrains it; an unreadable
+    # one (Drive mount dropped) must come back as io_error, never as invalid
+    d = _tmp()
+    zip_path, _ = B.write_bundle(d / "r_bundle.zip", {"config.yaml": "", "meta.json": "{}",
+                                                       "metrics.json": "{}", "model.onnx": b""})
+    marker = B.sha_path_for(zip_path)
+    assert B.verify_bundle(zip_path).ok and not B.verify_bundle(zip_path).io_error
+    real_sha = B.sha256_file
+    B.sha256_file = lambda *a, **kw: (_ for _ in ()).throw(OSError(5, "Input/output error"))
+    try:
+        check = B.verify_bundle(zip_path)
+    finally:
+        B.sha256_file = real_sha
+    assert not check.ok and check.io_error and "Input/output error" in check.reason, check
+    if os.geteuid() != 0:  # root reads anything
+        marker.chmod(0)
+        try:
+            check = B.verify_bundle(zip_path)
+        finally:
+            marker.chmod(0o644)
+        assert not check.ok and check.io_error, check
+    # real content problems stay "invalid" (io_error False)
+    marker.write_text("0" * 64 + "  r_bundle.zip\n")
+    assert not B.verify_bundle(zip_path).ok and not B.verify_bundle(zip_path).io_error
+    marker.unlink()
+    assert "marker" in B.verify_bundle(zip_path).reason and not B.verify_bundle(zip_path).io_error
+    assert not B.verify_bundle(d / "nope.zip").io_error
+
+
 def test_write_bundle_rejects_bad_members():
     d = _tmp()
     ok = {"config.yaml": "", "meta.json": "{}", "metrics.json": "{}", "model.onnx": b""}
