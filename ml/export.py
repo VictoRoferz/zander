@@ -424,6 +424,8 @@ def run(
     op_block = {
         "file": op_path.name, "sha256": op_sha, "family": op.get("family"),
         "rule": op.get("rule"), "target_sensitivity": op.get("target_sensitivity"),
+        # an op frozen before 2026-10-27 has no key: choose-op then used every positive
+        "sensitivity_scope": op.get("sensitivity_scope") or "all",
         "oof_level1": op.get("oof_level1"),
     }
     card = {

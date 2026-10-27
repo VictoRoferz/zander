@@ -28,6 +28,12 @@ Three levels (plan 2026-09-28, Step 8):
 The threshold is either FROZEN (operating_point.json from `cli.py choose-op`,
 mandatory for test/probe/future) or, on folds only, self-tuned as the highest
 t keeping photo sensitivity >= target (flagged `threshold_source`).
+
+Sensitivity scope (user decision 2026-10-27): t* is fitted on the positives in
+the production pose (`seated`) only. The handheld session is 9 NiO / 170 iO, so
+its NiO photos score ≈ 0 and pulled the pooled t* down to the conf floor (every
+seated iO flagged). Handheld photos are still scored and reported; they just
+do not set t*. `all` = the rule before 2026-10-27.
 """
 from __future__ import annotations
 
@@ -38,6 +44,8 @@ from eval.scorer import IOU_OPERATING, iou, score_photos
 from infer.verdict import photo_score
 
 SENSITIVITY_TARGET = 0.95
+SENSITIVITY_SCOPES = ("seated", "all")  # which positives t* must keep (see the docstring)
+SENSITIVITY_SCOPE = "seated"
 
 
 # ------------------------------------------------------------------ helpers
@@ -80,10 +88,19 @@ def pscore(p: dict) -> float:
     return photo_score(p["scores"])
 
 
-def threshold_for_sensitivity(photos: list[dict], target: float = SENSITIVITY_TARGET):
-    """Highest t with photo sensitivity >= target (fewest false calls at that
-    sensitivity — Neyman-Pearson). None if there are no positives."""
-    pos = sorted((pscore(p) for p in photos if is_positive(p)), reverse=True)
+def in_scope(p: dict, scope: str) -> bool:
+    if scope not in SENSITIVITY_SCOPES:
+        raise ValueError(f"sensitivity scope {scope!r} not in {SENSITIVITY_SCOPES}")
+    return scope == "all" or p.get("pose") == scope
+
+
+def threshold_for_sensitivity(photos: list[dict], target: float = SENSITIVITY_TARGET,
+                              scope: str = SENSITIVITY_SCOPE):
+    """Highest t with photo sensitivity >= target on the positives in `scope`
+    (fewest false calls at that sensitivity — Neyman-Pearson). None if there
+    are no positives in scope."""
+    pos = sorted((pscore(p) for p in photos if is_positive(p) and in_scope(p, scope)),
+                 reverse=True)
     if not pos:
         return None
     k = math.ceil(target * len(pos))  # need >= k positives with score >= t
@@ -115,6 +132,8 @@ def level1_verdict(photos: list[dict], t: float | None) -> dict:
         return out
     esc = sum(1 for p in pos if pscore(p) < t)
     out["escape"] = rate(esc, len(pos))
+    sp = [p for p in pos if p["pose"] == "seated"]  # the population t* is fitted on
+    out["escape_seated"] = rate(sum(1 for p in sp if pscore(p) < t), len(sp))
     for pose in ("seated", "handheld"):
         ns = [p for p in neg if p["pose"] == pose]
         out[f"false_call_{pose}"] = rate(sum(1 for p in ns if pscore(p) >= t), len(ns))
@@ -285,7 +304,8 @@ def score_all(photos: list[dict], class_names: list[str], threshold: float | Non
               threshold_source: str, probe: list[dict] | None = None) -> dict:
     if threshold is None:
         threshold = threshold_for_sensitivity(photos)
-        threshold_source = "self-tuned on this bucket (diagnostic only)"
+        threshold_source = (f"self-tuned on this bucket, {SENSITIVITY_SCOPE} positives "
+                            "(diagnostic only)")
     result = {
         "class_names": class_names,
         "threshold": threshold,

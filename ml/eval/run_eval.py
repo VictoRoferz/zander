@@ -77,7 +77,10 @@ from dataprep.ingest import load_manifest, photo_path, usable
 from dataprep.remap import SHORT, project, schema_classes
 from dataprep.split import bucket_of, load_split
 from eval.gallery import write_gallery
-from eval.photo_scorer import match_indices, score_all, threshold_for_sensitivity
+from eval.photo_scorer import (
+    SENSITIVITY_SCOPE, SENSITIVITY_SCOPES, in_scope, is_positive, match_indices, score_all,
+    threshold_for_sensitivity,
+)
 from eval.scorer import FPPI_OPERATING, IOU_OPERATING, iou
 from infer.pipeline import TiledDetector
 
@@ -196,7 +199,7 @@ def valid_threshold(t) -> bool:
 
 
 # choose-op provenance a test-bucket operating point must carry (CONTRACTS §8.3)
-OP_PROVENANCE_KEYS = ("family", "sources", "target_sensitivity")
+OP_PROVENANCE_KEYS = ("family", "sources", "target_sensitivity", "sensitivity_scope")
 
 
 def _load_op(path: Path, schema: str, *, bucket: str | None = None) -> dict:
@@ -956,9 +959,12 @@ def _archive(paths: list[Path], archive_dir: Path) -> None:
 def choose_operating_point(
     runs: list[str], target_sensitivity: float = 0.95, out: Path | None = None,
     *, family: str | None = None, force: bool = False, allow_smoke: bool = False,
+    scope: str = SENSITIVITY_SCOPE,
 ) -> Path:
     """Pool out-of-fold predictions of a family's fold runs and freeze t*.
 
+    t* keeps `target_sensitivity` of the pooled positives in `scope` (seated =
+    the production pose, the protocol since 2026-10-27; all = every positive).
     Guards (CONTRACTS §8.3): one run per fold, k DISTINCT fold models, each
     scored on its own validation fold, no smoke runs (unless allow_smoke), one
     family with equivalent training configs. Writes
@@ -966,6 +972,8 @@ def choose_operating_point(
     file is frozen — `force` archives it to ml_data/eval/archive/ first."""
     if not valid_threshold(target_sensitivity):
         raise EvalGuardError(f"--target-sensitivity {target_sensitivity!r} must be a number in (0, 1]")
+    if scope not in SENSITIVITY_SCOPES:
+        raise EvalGuardError(f"--scope {scope!r} must be one of {SENSITIVITY_SCOPES}")
     split = load_split()
     k = len(split["folds"])
     runs = list(runs or [])
@@ -1043,9 +1051,11 @@ def choose_operating_point(
     ids = [p["capture_id"] for p in photos]
     if len(set(ids)) != len(ids):
         raise EvalGuardError("the fold runs overlap (a capture appears twice) — not a partition")
-    t = threshold_for_sensitivity(photos, target_sensitivity)
+    t = threshold_for_sensitivity(photos, target_sensitivity, scope)
     if t is None:
-        raise RuntimeError("no positive photos with a detection — cannot set t*")
+        raise RuntimeError(f"no {scope} positive photos with a detection — cannot set t*")
+    n_pos = sum(1 for p in photos if is_positive(p))
+    n_scope = sum(1 for p in photos if is_positive(p) and in_scope(p, scope))
     cut = [f"{r} (conf_floor {s['conf_floor']})" for r, s in zip(runs, sources)
            if isinstance(s.get("conf_floor"), (int, float)) and s["conf_floor"] > t]
     if cut:  # scores between t* and their floor were never stored: t* is not reproducible
@@ -1063,7 +1073,8 @@ def choose_operating_point(
         "schema": schema,
         "class_names": docs[0]["class_names"],
         "threshold": t,
-        "rule": f"highest t with pooled out-of-fold photo sensitivity >= {target_sensitivity}",
+        "rule": (f"highest t with pooled out-of-fold photo sensitivity >= {target_sensitivity}"
+                 + ("" if scope == "all" else f" on the {scope} positives")),
         "runs": runs,
         "models": [d["model"] for d in docs],
         "split_id": split["split_id"],
@@ -1071,6 +1082,8 @@ def choose_operating_point(
         "oof_level1": metrics["level1_verdict"],
         "family": fam,
         "target_sensitivity": target_sensitivity,
+        "sensitivity_scope": scope,
+        "n_positive_in_scope": n_scope,
         "allow_smoke": bool(smoke),  # frozen from smoke runs under --allow-smoke: plumbing only
         "sources": [
             {"eval_run": r, "bundle_run": i["run_name"], "fold": i["fold"],
@@ -1094,7 +1107,8 @@ def choose_operating_point(
               "bucket": "oof_dev", "n_photos": len(photos), "model": "(pooled fold models)"}
     report = format_report(pooled)
     header = [f"_Operating point `{out.name}` — family `{fam}`, target sensitivity "
-              f"{target_sensitivity}, t* = {t!r}._", ""]
+              f"{target_sensitivity} on the {scope} positives ({n_scope} of {n_pos}), "
+              f"t* = {t!r}._", ""]
     header += [f"- {s['eval_run']}: bundle `{s['bundle_run']}` ({s['fold']}), model "
                f"`{s['model_sha256'][:12]}`" for s in op["sources"]]
     if smoke:
@@ -1148,7 +1162,8 @@ def format_report(m: dict) -> str:
         f"- positives {l1['n_positive']} · negatives (iO) {l1['n_negative']} · "
         f"other-class-only (not scored) {l1['n_other_only']}",
         f"- photo AUROC {l1['photo_auroc']} (seated only: {l1['photo_auroc_seated']})",
-        f"- **escape rate** {_fmt_rate(l1.get('escape'))}",
+        f"- **escape rate** {_fmt_rate(l1.get('escape'))} "
+        f"(seated only: {_fmt_rate(l1.get('escape_seated'))})",
         f"- **false-call rate, seated iO** {_fmt_rate(l1.get('false_call_seated'))}",
         f"- false-call rate, handheld iO {_fmt_rate(l1.get('false_call_handheld'))}",
         f"- share of flagged photos that are iO {_fmt_rate(l1.get('false_call_share_of_flagged'))}",

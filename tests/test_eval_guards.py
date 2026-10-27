@@ -125,7 +125,7 @@ def _family_op(family: str, name: str | None = None, **over) -> Path:
     op = {"schema": "def3", "class_names": NAMES, "threshold": 0.3, "split_id": SPLIT["split_id"],
           "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
           "runs": [s["eval_run"] for s in sources], "family": family, "target_sensitivity": 0.95,
-          "sources": sources}
+          "sensitivity_scope": "seated", "sources": sources}
     op.update(over)
     p = TMP / (name or f"op_{family}.json")
     p.write_text(json.dumps(op), encoding="utf-8")
@@ -395,7 +395,8 @@ def test_choose_op_freezes_a_v2_operating_point():
     assert out == settings.eval_dir / "operating_point_def3_cf_def3.json" and out.with_suffix(".md").is_file()
     op = json.loads(out.read_text(encoding="utf-8"))
     for key in ("schema", "class_names", "threshold", "rule", "runs", "models", "split_id",
-                "created", "oof_level1", "family", "target_sensitivity", "sources"):
+                "created", "oof_level1", "family", "target_sensitivity", "sensitivity_scope",
+                "n_positive_in_scope", "sources"):
         assert key in op, key
     assert op["threshold"] == 0.4 and op["family"] == "cf_def3" and op["target_sensitivity"] == 0.95
     assert op["runs"] == ["cf_def3_fold0", "cf_def3_fold1", "cf_def3_fold2"]
@@ -407,6 +408,34 @@ def test_choose_op_freezes_a_v2_operating_point():
     run_eval.choose_operating_point(["cf_def3"], force=True)
     archived = sorted(p.name for p in (settings.eval_dir / "archive").iterdir())
     assert len(archived) == 2 and all(n.startswith("operating_point_def3_cf_def3__") for n in archived)
+
+
+def test_choose_op_fits_t_on_the_seated_positives_by_default():
+    """2026-10-27: the handheld session's NiO photos score ~0 and dragged the pooled t*
+    to the conf floor. t* keeps 95 % of the SEATED positives; handheld ones are still scored."""
+    for fam in ("scope_def3", "scopeall_def3"):
+        _fold_family(fam)
+        for k in range(3):
+            path = settings.eval_dir / f"{fam}_fold{k}" / "predictions.json"
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc["photos"].append({"capture_id": f"{fam}_hh{k}", "group": f"g{k}h", "board": "A",
+                                  "pose": "handheld", "gt_verdict": "NiO", "gt": [[0, [10, 10, 40, 40]]],
+                                  "other_gt": [], "boxes": [[10, 10, 40, 40]], "scores": [0.002],
+                                  "labels": [0]})
+            path.write_text(json.dumps(doc), encoding="utf-8")
+    out = run_eval.choose_operating_point([], family="scope_def3")
+    op = json.loads(out.read_text(encoding="utf-8"))
+    assert op["sensitivity_scope"] == "seated" and op["n_positive_in_scope"] == 3
+    assert op["threshold"] == 0.4 and op["rule"].endswith("on the seated positives")
+    l1 = op["oof_level1"]
+    assert l1["n_positive"] == 6 and l1["escape"]["k"] == 3 and l1["escape_seated"]["k"] == 0
+    assert "on the seated positives (3 of 6)" in out.with_suffix(".md").read_text(encoding="utf-8")
+    op = json.loads(run_eval.choose_operating_point([], family="scopeall_def3", scope="all")
+                    .read_text(encoding="utf-8"))
+    assert op["sensitivity_scope"] == "all" and op["threshold"] == 0.002
+    assert op["n_positive_in_scope"] == 6 and "seated" not in op["rule"]
+    _raises(lambda: run_eval.choose_operating_point([], family="scope_def3", scope="handheld", force=True),
+            EvalGuardError, "--scope")
 
 
 def test_choose_op_refuses_non_oof_or_mixed_recipes():
@@ -485,6 +514,10 @@ def test_operating_point_threshold_is_validated():
                                  operating_point=_op("op_v1.json", threshold=1.0)), Reached)
     _raises(lambda: run_eval.run(model, "ultralytics", "def3", "test", operating_point=_op("op_v1.json")),
             EvalGuardError, "choose-op provenance", "family")
+    _raises(lambda: run_eval.run(model, "ultralytics", "def3", "test",
+                                 operating_point=_family_op("opv_def3", "op_noscope.json",
+                                                            sensitivity_scope=None)),
+            EvalGuardError, "choose-op provenance", "sensitivity_scope")
     # --conf above the frozen threshold would cut detections off
     _raises(lambda: run_eval.run(model, "ultralytics", "def3", "probe_xprod",
                                  operating_point=_op("op_lo.json", threshold=0.3), conf_floor=0.5),

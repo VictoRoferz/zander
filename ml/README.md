@@ -82,7 +82,12 @@ matrix goes on. Galleries are off (`--gallery` to turn on).
 python cli.py choose-op --family yolo26n_def3   # -> ml_data/eval/operating_point_def3_yolo26n_def3.json (+ .md)
 ```
 
-t* = the highest threshold with pooled out-of-fold photo sensitivity ≥ 0.95.
+t* = the highest threshold with pooled out-of-fold photo sensitivity ≥ 0.95 on the
+**seated** (production-pose) positives (`--scope seated`, the default since
+2026-10-27; `--scope all` = every positive). The handheld session is 9 NiO /
+170 iO, so its NiO photos score ≈ 0 and dragged the pooled t* to the conf floor
+(every seated iO flagged). Handheld photos are still scored and reported
+(`escape` vs `escape_seated`). The scope is recorded in the op file and the card.
 Refused unless the three runs are three **distinct** fold models, each scored
 on its own fold, trained under the run policy (last epoch, no early stopping,
 every epoch completed), with equivalent training configs (arch, dataset_id, epochs,
@@ -266,7 +271,7 @@ Ablations (`cli.py tile` flags `--no-d4`, `--ct-p`, `--no-handheld-cap`,
    (IoU 0.3) with **board-group** cluster-bootstrap CIs; box-level confusion; AP50
    for literature comparison only.
 
-Operating point: highest t with pooled out-of-fold photo sensitivity ≥ 0.95
+Operating point: highest t with pooled out-of-fold photo sensitivity ≥ 0.95 on the seated positives
 (`choose-op`), frozen into `operating_point_<schema>_<family>.json`; `export`
 writes it into `detector.json`, which the inspector reads (no manual
 `CONFIDENCE_THRESHOLD`). Selection: rank by pooled NAL recall @ 0.5 FPPI

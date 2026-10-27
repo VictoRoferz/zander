@@ -44,7 +44,7 @@ import numpy as np
 
 from config.settings import settings
 from dataprep.split import load_split
-from eval.photo_scorer import threshold_for_sensitivity
+from eval.photo_scorer import SENSITIVITY_SCOPES, threshold_for_sensitivity
 from infer.verifier import candidate_features, final_scores, stack_proba
 from verifier.cascade_eval import write_run
 from verifier.common import (
@@ -160,9 +160,15 @@ def load_operating_point(path: Optional[Path], cand: dict,
     t = float(op["threshold"])
     if not (0.0 < t < 1.0):
         raise ValueError(f"operating point threshold {t} not in (0, 1)")
+    # the inner thresholds t_k follow the anchor's rule, scope included (PREREGISTRATION
+    # amendment 2026-10-27); an op frozen before then has no key and used every positive
+    scope = op.get("sensitivity_scope") or "all"
+    if scope not in SENSITIVITY_SCOPES:
+        raise ValueError(f"operating point sensitivity_scope {scope!r} not in {SENSITIVITY_SCOPES}")
     return t, {"file": str(path.resolve()), "sha256": sha256_file(path), "threshold": t,
                "family": op.get("family"), "runs": op.get("runs"), "rule": op.get("rule"),
-               "target_sensitivity": ts, "source_model_sha256s": op_shas}
+               "target_sensitivity": ts, "sensitivity_scope": scope,
+               "source_model_sha256s": op_shas}
 
 
 def _photo_index(cand: dict) -> dict:
@@ -198,11 +204,11 @@ def _tau_photos(photo_ids, cands, photos, p_of: dict, hi: dict, stack: list[int]
     return list(per.values())
 
 
-def detector_threshold(photo_ids, photos, target: float) -> Optional[float]:
-    """The choose-op rule on the detector's own photo scores."""
-    recs = [{"gt": photos[cid]["gt"], "scores": [photos[cid]["det_photo_score"]]}
-            for cid in photo_ids]
-    return threshold_for_sensitivity(recs, target)
+def detector_threshold(photo_ids, photos, target: float, scope: str) -> Optional[float]:
+    """The choose-op rule (target + positives scope) on the detector's own photo scores."""
+    recs = [{"gt": photos[cid]["gt"], "pose": photos[cid].get("pose"),
+             "scores": [photos[cid]["det_photo_score"]]} for cid in photo_ids]
+    return threshold_for_sensitivity(recs, target, scope)
 
 
 # ------------------------------------------------------------------ run
@@ -305,7 +311,8 @@ def run(
             ver_inner.setdefault(r, {})[k] = z
         x_in = _features(inner_rows, ver_in, cands, photos)
         inner_photos = [cid for cid, p in photos.items() if p["fold"] in o["inner"]]
-        t_k = detector_threshold(inner_photos, photos, cfg.exit.target_sensitivity)
+        t_k = detector_threshold(inner_photos, photos, cfg.exit.target_sensitivity,
+                                 op_info["sensitivity_scope"])
         if t_k is None:
             raise RuntimeError(f"outer {k}: no positive photo with a detection on {o['inner']}")
         params, fits, his, p_in = {}, {}, {}, np.zeros(len(inner_rows))

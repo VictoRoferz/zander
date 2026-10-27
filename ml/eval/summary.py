@@ -97,8 +97,8 @@ def _family_entry(family: str, runs: dict[int, str], k: int) -> tuple[dict | Non
         t = op["threshold"]
         t_src = f"frozen: {op_path.name}"
     else:
-        t = threshold_for_sensitivity(photos)
-        t_src = "SELF-TUNED on the pooled OOF (no choose-op yet: optimistic)"
+        t = threshold_for_sensitivity(photos)  # choose-op's default scope
+        t_src = "SELF-TUNED on the pooled OOF, seated positives (no choose-op yet: optimistic)"
     split = load_split()
     ids = {p["capture_id"] for p in photos}
     probe = [p for p in split["probe_boxes"] if p["class"] in class_names and p["capture_id"] in ids]

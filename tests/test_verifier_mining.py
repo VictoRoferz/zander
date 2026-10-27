@@ -273,6 +273,20 @@ def test_operating_point_must_be_the_preregistered_anchor():
 
     t, info = load_operating_point(op("good"), cand, 0.95)
     assert t == 0.31 and info["target_sensitivity"] == 0.95 and info["source_model_sha256s"] == shas
+    assert info["sensitivity_scope"] == "all"  # frozen before 2026-10-27: every positive
+    assert load_operating_point(op("seated", sensitivity_scope="seated"), cand, 0.95)[1][
+        "sensitivity_scope"] == "seated"
+    try:
+        load_operating_point(op("badscope", sensitivity_scope="handheld"), cand, 0.95)
+        raise AssertionError("an unknown scope must be refused")
+    except ValueError:
+        pass
+    from verifier.crossfit import detector_threshold
+    ph = {"s1": {"gt": [[0, [0, 0, 9, 9]]], "pose": "seated", "det_photo_score": 0.6},
+          "s2": {"gt": [[0, [0, 0, 9, 9]]], "pose": "seated", "det_photo_score": 0.5},
+          "h1": {"gt": [[0, [0, 0, 9, 9]]], "pose": "handheld", "det_photo_score": 0.01}}
+    assert detector_threshold(list(ph), ph, 0.95, "seated") == 0.5
+    assert detector_threshold(list(ph), ph, 0.95, "all") == 0.01
     bad = {
         "other_target": op("t90", target_sensitivity=0.9),
         "no_target": op("t_none", target_sensitivity=None),
@@ -523,6 +537,7 @@ def test_cascade_test_look_has_the_detector_evals_ledger_key():
         doc = {"schema": "def3", "class_names": NAMES, "threshold": t, "split_id": split["split_id"],
                "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
                "runs": [f"{fam}_fold{k}" for k in range(3)], "family": fam, "target_sensitivity": 0.95,
+               "sensitivity_scope": "seated",
                "sources": [{"eval_run": f"{fam}_fold{k}", "bundle_run": f"{fam}_fold{k}", "fold": f"fold{k}",
                             "model_sha256": registry.file_sha256(m)} for k, m in enumerate(folds)]}
         doc.update(over)

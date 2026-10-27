@@ -172,6 +172,23 @@ PROBE = [{"capture_id": "P2", "index": 0, "class": "Brücke", "box": BR_BOX,
           "board": "A", "pose": "seated"}]
 
 
+def test_threshold_scope_is_the_seated_positives():
+    hh = _p("H1", "A", "handheld", "NiO", [(0, NAL_BOX)], [NAL_BOX], [0.05], [0])
+    assert threshold_for_sensitivity(MC + [hh]) == 0.7  # default scope: seated only
+    assert threshold_for_sensitivity(MC + [hh], scope="all") == 0.05
+    assert threshold_for_sensitivity([hh]) is None  # no seated positive -> no t
+    try:
+        threshold_for_sensitivity(MC, scope="handheld")
+        raise AssertionError("an unknown scope must be refused")
+    except ValueError:
+        pass
+    m = score_all(MC + [hh], NAMES, None, "")
+    assert m["threshold"] == 0.7 and "seated positives" in m["threshold_source"]
+    l1 = m["level1_verdict"]
+    assert (l1["escape"]["k"], l1["escape"]["n"]) == (1, 4)
+    assert (l1["escape_seated"]["k"], l1["escape_seated"]["n"]) == (0, 3)
+
+
 def test_mc_threshold_and_verdict_level():
     assert threshold_for_sensitivity(MC) == 0.7
     m = score_all(MC, NAMES, None, "", probe=PROBE)

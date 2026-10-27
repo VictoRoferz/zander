@@ -112,7 +112,7 @@ def _op(name="operating_point_def3_tiny_def3.json", **over) -> Path:
           "rule": "highest t with pooled out-of-fold photo sensitivity >= 0.95",
           "runs": [f"tiny_def3_fold{i}" for i in range(3)], "models": [], "split_id": SPLIT_ID,
           "created": "2026-09-28T00:00:00Z", "oof_level1": {"n_positive": 3},
-          "family": "tiny_def3", "target_sensitivity": 0.95,
+          "family": "tiny_def3", "target_sensitivity": 0.95, "sensitivity_scope": "seated",
           "sources": [{"eval_run": f"tiny_def3_fold{i}", "bundle_run": f"tiny_def3_fold{i}",
                        "fold": f"fold{i}", "model_sha256": _fold_model_sha(i), "config_sha256": None,
                        "dataset_fingerprint": "f" * 64} for i in range(3)]}
@@ -202,6 +202,7 @@ def test_export_writes_a_valid_card():
     assert raw["model_sha256"] == registry.file_sha256(DEVALL / "model.onnx")
     assert raw["source"]["bundle_run"] == "tiny_def3_devall" and raw["source"]["fold"] == "dev_all"
     assert raw["operating_point"]["family"] == "tiny_def3"
+    assert raw["operating_point"]["sensitivity_scope"] == "seated"
     assert raw["operating_point"]["sha256"] == registry.file_sha256(OP)
     val = raw["validation"]
     assert val["test_eval_run"] == "tiny_def3_devall__test" and val["overrides"] == []

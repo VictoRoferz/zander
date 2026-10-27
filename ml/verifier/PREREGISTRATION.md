@@ -141,3 +141,18 @@ makes the code do what the text says.
   backbone was checked; a random-init fallback in any U_fold* / V_fold* model
   passed. Every model in `train_log.json` is checked now (a missing log or
   model is invalid too).
+
+## Amendment 2026-10-27: the anchor's positives scope (before any real run)
+
+Recorded **before any real (non-smoke) verifier run**; no verifier result
+existed. The anchor is unchanged in principle — "t* = the family's frozen
+operating point (`choose-op`)" — but `choose-op`'s rule changed by user
+decision after the first out-of-fold detector evals (yolo26n_def3 fold0–2):
+t* now keeps ≥ 0.95 of the pooled **seated** positives (`sensitivity_scope`
+in the operating point), not of all positives. Reason: the handheld capture
+session is 9 NiO / 170 iO, its NiO photos score ≈ 0, and the pooled rule put
+t* at the confidence floor (every seated iO flagged). So that the cross-fit
+mirrors the anchor, the inner thresholds t_k use the operating point's scope
+(an operating point without the key means `all`, the earlier rule). The
+target sensitivity (0.95), metrics, endpoints, gates and the decision rule
+above are unchanged; the exit report records this file's sha256 as before.

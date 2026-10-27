@@ -175,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--family", default=None, help="family name, e.g. yolo26n_def3")
     p.add_argument("--target-sensitivity", type=float, default=0.95,
                    help="pooled out-of-fold photo sensitivity t* must reach, 0 < x <= 1")
+    p.add_argument("--scope", choices=("seated", "all"), default=None,
+                   help="positives t* must keep: seated = production pose (default since "
+                        "2026-10-27), all = every positive incl. handheld")
     p.add_argument("--out", default=None,
                    help="default: ml_data/eval/operating_point_<schema>_<family>.json")
     p.add_argument("--force", action="store_true",
@@ -312,12 +315,13 @@ def _dispatch(args) -> int:
         missing = [r for r in args.eval_runs if registry.log_eval(r) is None]
         return 1 if missing else 0
     elif args.cmd == "choose-op":
-        from eval import run_eval
+        from eval import photo_scorer, run_eval
 
         run_eval.choose_operating_point(
             args.runs, target_sensitivity=args.target_sensitivity,
             out=Path(args.out) if args.out else None,
             family=args.family, force=args.force, allow_smoke=args.allow_smoke,
+            scope=args.scope or photo_scorer.SENSITIVITY_SCOPE,
         )
     elif args.cmd == "compare":
         from eval import compare
