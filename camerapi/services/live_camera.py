@@ -354,6 +354,7 @@ class BaslerSource:
                     except Exception:
                         pass
             self._raise_if_removed()
+        CameraService.log_stream_statistics(camera, "Live grab failed")
         raise GrabFailed(
             f"Basler grab failed after {attempts} attempts: {last_error}", timed_out=not incomplete
         )

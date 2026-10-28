@@ -284,16 +284,20 @@ class InstantCamera:
             "GevSCPSPacketSize": Node(self, "GevSCPSPacketSize", 1500, vmax=9000),
             "GevSCPD": Node(self, "GevSCPD", 0),
             "DeviceLinkThroughputLimit": Node(self, "DeviceLinkThroughputLimit", 125_000_000, vmax=125_000_000),
+            "DeviceLinkThroughputLimitMode": Node(self, "DeviceLinkThroughputLimitMode", "Off"),
             "AcquisitionFrameRateEnable": Node(self, "AcquisitionFrameRateEnable", False),
         }
         rate_node = CONFIG.get("frame_rate_node", "AcquisitionFrameRate")
         if rate_node:
             nodes[rate_node] = Node(self, rate_node, 10.0, vmin=0.1, vmax=100.0)
         d["_nodes"] = nodes
-        d["_stream_nodes"] = NodeMap({
+        stream_nodes = {
             name: Node(self, name, None)
             for name in ("EnableResend", "PacketTimeout", "FrameRetention", "MaxNumResendsPerBuffer")
-        })
+        }
+        for name, value in (("Statistic_Failed_Packet_Count", 7), ("Statistic_Resend_Request_Count", 3)):
+            stream_nodes[name] = Node(self, name, value)
+        d["_stream_nodes"] = NodeMap(stream_nodes)
         CAMERAS.append(self)
 
     # pypylon resolves unknown attributes as GenICam nodes and raises for a

@@ -152,6 +152,8 @@ Otherwise the answer is 401 (token missing or wrong) or 403 (not local and no to
 | `LIVE_GRAB_TIMEOUT_MS` | `5000` |
 | `LIVE_CAPTURE_TIMEOUT_S` | `20` |
 
+**GigE network settings (camerapi 3.4.0, both capture paths):** the ethernet profile is packet size 1500, inter-packet delay 0, `DeviceLinkThroughputLimit` 100 MB/s (= 800 Mbit/s; pylon takes **bytes/s**, and ace 2 cameras need `DeviceLinkThroughputLimitMode=On`), stream grabber `EnableResend`, `PacketTimeout` 40, `FrameRetention` 1000 (pylon takes **ms**), `MaxNumResendsPerBuffer` 25. Empty/unset = the profile's value; set in camerapi's `.env` to tune on site: `CAMERA_PACKET_TIMEOUT_MS` (1–10000), `CAMERA_FRAME_RETENTION_MS` (10–10000), `CAMERA_THROUGHPUT_LIMIT_MBPS` (Mbit/s, capped at the camera's max), `CAMERA_INTER_PACKET_DELAY` (ticks), `CAMERA_PACKET_SIZE` (576–16404). Each stream grabber value is logged when set (or why not), and every failed grab logs the stream statistics (`Failed_Packet_Count`, `Resend_Request_Count`, `Buffer_Underrun_Count`, ...) when the driver has them.
+
 Log strings stay ASCII (Windows cp1252 consoles).
 
 ## 5. Dashboard API (`:8003`, all endpoints need a logged-in session)

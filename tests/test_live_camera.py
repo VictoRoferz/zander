@@ -1143,6 +1143,61 @@ def test_live_mode_switch_waits_for_a_capture_and_survives_a_failed_save():
         assert mode.set(False) is False and not mode.enabled  # applies anyway
 
 
+# ---- GigE network settings (profile + CAMERA_* overrides) -----------------------------
+
+
+def _set_values(camera):
+    return {c[2][0]: c[2][1] for c in fake.calls(camera, "SetValue")}
+
+
+def test_ethernet_profile_resends_in_time_and_throttles_below_line_rate():
+    fake.reset(devices=1)
+    svc = _legacy()
+    svc.capture_frame()
+    values = _set_values(fake.last_camera())
+    # PacketTimeout far below FrameRetention, both in ms: a lost packet is re-sent in time.
+    assert values["PacketTimeout"] == 40 and values["FrameRetention"] == 1000, values
+    assert values["DeviceLinkThroughputLimit"] == 100_000_000, values  # bytes/s = 800 Mbit/s
+    assert values["DeviceLinkThroughputLimitMode"] == "On", values  # else ace 2 ignores the limit
+
+
+def test_env_overrides_the_network_settings():
+    fake.reset(devices=1)
+    with setting("camera_packet_timeout_ms", 80), setting("camera_frame_retention_ms", 2000), \
+            setting("camera_throughput_limit_mbps", 400.0), setting("camera_inter_packet_delay", 1000), \
+            setting("camera_packet_size", 8192):
+        svc = _legacy()
+        svc.capture_frame()
+    values = _set_values(fake.last_camera())
+    assert values["PacketTimeout"] == 80 and values["FrameRetention"] == 2000, values
+    assert values["DeviceLinkThroughputLimit"] == 50_000_000, values  # 400 Mbit/s in bytes/s
+    assert values["GevSCPD"] == 1000 and values["GevSCPSPacketSize"] == 8192, values
+    from services.camera_service import ETHERNET_PROFILE
+    assert ETHERNET_PROFILE["stream_grabber"]["PacketTimeout"] == 40, "overrides never edit the profile"
+
+
+def test_limit_at_the_camera_max_leaves_the_mode_alone():
+    fake.reset(devices=1)
+    with setting("camera_throughput_limit_mbps", 5000.0):  # above the 1000 Mbit/s max
+        _legacy().capture_frame()
+    values = _set_values(fake.last_camera())
+    assert values["DeviceLinkThroughputLimit"] == 125_000_000, values
+    assert "DeviceLinkThroughputLimitMode" not in values, values
+
+
+def test_stream_statistics_are_read_best_effort():
+    fake.reset(devices=1)
+    svc = _legacy()
+    svc.capture_frame()
+    stats = CameraService.stream_statistics(fake.last_camera())
+    assert stats == {"Failed_Packet_Count": 7, "Resend_Request_Count": 3}, stats
+
+    class NoNodeMap:
+        def GetStreamGrabberNodeMap(self):
+            raise RuntimeError("not open")
+    assert CameraService.stream_statistics(NoNodeMap()) == {}
+
+
 if __name__ == "__main__":
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

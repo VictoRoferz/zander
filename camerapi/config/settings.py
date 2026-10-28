@@ -19,7 +19,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "camera-service"
-    service_version: str = "3.3.0"
+    service_version: str = "3.4.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"
@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     # on Linux it checks the route to the camera's IP (eth* vs wl*).
     # Override to "ethernet" or "wifi" to force a profile (debugging / odd networks).
     camera_transport: str = "auto"
+    # GigE network tuning, applied on top of the transport profile (empty or
+    # unset = the profile's value; CONTRACTS section 4). Tune them on site in
+    # .env and restart camerapi: "The buffer was incompletely grabbed" in the
+    # log means packets were lost on the way from the camera.
+    camera_packet_timeout_ms: Optional[int] = Field(default=None, ge=1, le=10000)
+    camera_frame_retention_ms: Optional[int] = Field(default=None, ge=10, le=10000)
+    camera_throughput_limit_mbps: Optional[float] = Field(default=None, gt=0, le=10000)
+    camera_inter_packet_delay: Optional[int] = Field(default=None, ge=0)
+    camera_packet_size: Optional[int] = Field(default=None, ge=576, le=16404)
 
     # ---- Live preview (docs/CONTRACTS.md section 4) ----
     # Off by default: every capture then uses the one-shot GrabOne path exactly
@@ -98,6 +107,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # "CAMERA_PACKET_TIMEOUT_MS=" in a .env means "unset", not a parse error
+        # (a parse error would stop camerapi, and with it the camera stack).
+        env_ignore_empty=True,
     )
 
     def __init__(self, **kwargs):

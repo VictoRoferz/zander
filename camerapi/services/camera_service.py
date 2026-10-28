@@ -49,32 +49,39 @@ except ImportError:
 ONE_SHOT_GRAB_TIMEOUT_MS = 30000
 
 # Transport profiles: pylon node values tuned per network medium.
-# Ethernet: full throughput, no spacing, small retransmit window.
+# Ethernet: throttled a little below line rate, no spacing, quick resends.
 # WiFi: throttled, large inter-packet delay, generous resends.
-# The GigE stream grabber takes PacketTimeout and FrameRetention in
-# MILLISECONDS (Basler defaults 40 / 200). The values below were once written
-# as if they were microseconds, so most are 1000x what their name suggests.
+# Units (pylon): PacketTimeout and FrameRetention in MILLISECONDS (Basler
+# defaults 40 / 200); DeviceLinkThroughputLimit in BYTES per second. The old
+# values were written as if they were microseconds / bits.
+# CAMERA_* settings in .env override these per site (_with_overrides).
 ETHERNET_PROFILE: dict[str, Any] = {
     "label": "ethernet",
     "packet_size": 1500,           # standard MTU; raise to 9000 with jumbo frames
-    "inter_packet_delay": 0,       # GigE link is fast enough
-    "throughput_limit_bps": None,  # None = use camera max
+    "inter_packet_delay": 0,       # ticks between packets (camera-side spacing)
+    # 100 MB/s = 800 Mbit/s: a little below the GigE line rate, so a switch or
+    # router between camera and PC has room (the camera bursts a whole frame).
+    "throughput_limit_bytes_s": 100_000_000,
     "max_num_buffer": 16,
     "stream_grabber": {
         "EnableResend": True,
-        "PacketTimeout": 20000,    # 20 s: meant as 20 ms; untested on site, left as is
-        # 1 s: the value set and used on the station (Oct 2026). The old
-        # 200000 (200 s) never failed an incomplete frame within the 30 s
-        # GrabOne budget.
+        # The driver asks the camera to re-send a missing packet after this
+        # long. It was 20000 (20 s), so a lost packet was never re-sent
+        # within FrameRetention: every loss became an incomplete frame
+        # (on site, 2026-10-28). 40 ms = Basler's default.
+        "PacketTimeout": 40,
+        # 1 s for all packets of a frame, resends included (the station's
+        # value since Oct 2026; the old 200000 = 200 s outlived the 30 s
+        # GrabOne budget).
         "FrameRetention": 1000,
-        "MaxNumResendsPerBuffer": 5,
+        "MaxNumResendsPerBuffer": 25,
     },
 }
 WIFI_PROFILE: dict[str, Any] = {
     "label": "wifi",
     "packet_size": 1400,
     "inter_packet_delay": 250000,
-    "throughput_limit_bps": 2_000_000,  # 2 Mbit/s
+    "throughput_limit_bytes_s": 2_000_000,  # 2 MB/s (16 Mbit/s)
     "max_num_buffer": 64,
     "stream_grabber": {
         "EnableResend": True,
@@ -249,7 +256,7 @@ class CameraService:
 
         # Pick transport profile BEFORE opening the camera so we can log it
         # alongside the rest of the settings.
-        profile = self._select_profile(device)
+        profile = self._with_overrides(self._select_profile(device))
         logger.info(f"Transport profile: {profile['label']}")
 
         self._camera = pylon.InstantCamera(self._tl_factory.CreateDevice(device))
@@ -372,6 +379,66 @@ class CameraService:
                 return parts[idx]
         return None
 
+    @staticmethod
+    def _with_overrides(profile: dict[str, Any]) -> dict[str, Any]:
+        """The profile with the CAMERA_* network settings from .env applied."""
+        p = {**profile, "stream_grabber": dict(profile["stream_grabber"])}
+        changed = []
+        if settings.camera_packet_size is not None:
+            p["packet_size"] = settings.camera_packet_size
+            changed.append(f"packet_size={p['packet_size']}")
+        if settings.camera_inter_packet_delay is not None:
+            p["inter_packet_delay"] = settings.camera_inter_packet_delay
+            changed.append(f"inter_packet_delay={p['inter_packet_delay']}")
+        if settings.camera_throughput_limit_mbps is not None:
+            p["throughput_limit_bytes_s"] = int(settings.camera_throughput_limit_mbps * 125_000)
+            changed.append(f"throughput={settings.camera_throughput_limit_mbps:g} Mbit/s")
+        if settings.camera_packet_timeout_ms is not None:
+            p["stream_grabber"]["PacketTimeout"] = settings.camera_packet_timeout_ms
+            changed.append(f"PacketTimeout={settings.camera_packet_timeout_ms} ms")
+        if settings.camera_frame_retention_ms is not None:
+            p["stream_grabber"]["FrameRetention"] = settings.camera_frame_retention_ms
+            changed.append(f"FrameRetention={settings.camera_frame_retention_ms} ms")
+        if changed:
+            logger.info(f"Network settings from .env: {', '.join(changed)}")
+        return p
+
+    @staticmethod
+    def stream_statistics(camera: Any) -> dict[str, Any]:
+        """
+        The GigE stream grabber's counters (packets lost, resends, underruns),
+        best effort: {} when the driver has none. Logged after a failed grab,
+        so the log says WHY a frame came back incomplete.
+        """
+        names = (
+            "Statistic_Total_Buffer_Count", "Statistic_Failed_Buffer_Count",
+            "Statistic_Buffer_Underrun_Count", "Statistic_Total_Packet_Count",
+            "Statistic_Failed_Packet_Count", "Statistic_Resend_Request_Count",
+            "Statistic_Resend_Packet_Count",
+        )
+        stats: dict[str, Any] = {}
+        try:
+            nodemap = camera.GetStreamGrabberNodeMap()
+        except Exception:
+            return stats
+        for name in names:
+            try:
+                node = nodemap.GetNode(name)
+                if node is not None:
+                    stats[name.replace("Statistic_", "")] = node.GetValue()
+            except Exception:
+                pass
+        return stats
+
+    @classmethod
+    def log_stream_statistics(cls, camera: Any, where: str) -> None:
+        stats = cls.stream_statistics(camera)
+        if stats:
+            logger.warning(
+                f"{where}: stream statistics "
+                + ", ".join(f"{k}={v}" for k, v in stats.items())
+            )
+
     def _apply_profile(self, profile: dict[str, Any]) -> None:
         """Push profile values into the camera's GenICam nodes."""
         # Packet size + inter-packet delay (camera-side).
@@ -384,15 +451,21 @@ class CameraService:
             f"GevSCPD={profile['inter_packet_delay']}",
         )
 
-        # Throughput cap.
+        # Throughput cap (bytes per second). On ace 2 cameras the limit only
+        # applies with DeviceLinkThroughputLimitMode = On.
         try:
             max_limit = self._camera.DeviceLinkThroughputLimit.GetMax()
-            target = profile["throughput_limit_bps"]
+            target = profile["throughput_limit_bytes_s"]
             limit = max_limit if target is None else min(max_limit, target)
+            if limit < max_limit:
+                self._try_set(
+                    lambda: self._camera.DeviceLinkThroughputLimitMode.SetValue("On"),
+                    "DeviceLinkThroughputLimitMode=On",
+                )
             self._camera.DeviceLinkThroughputLimit.SetValue(limit)
             logger.info(
-                f"DeviceLinkThroughputLimit = {limit / 1_000_000:.1f} Mbit/s "
-                f"(max {max_limit / 1_000_000:.1f})"
+                f"DeviceLinkThroughputLimit = {limit / 1e6:.1f} MB/s = {limit * 8 / 1e6:.0f} Mbit/s "
+                f"(max {max_limit / 1e6:.1f} MB/s)"
             )
         except Exception as e:
             logger.warning(f"Could not set DeviceLinkThroughputLimit: {e}")
@@ -404,16 +477,23 @@ class CameraService:
         except Exception as e:
             logger.warning(f"Could not set MaxNumBuffer: {e}")
 
-        # Stream-grabber knobs (host-side resend behavior).
+        # Stream-grabber knobs (host-side resend behavior). Logged one by one:
+        # a value the driver refuses used to vanish without a trace.
         try:
             sn = self._camera.GetStreamGrabberNodeMap()
+            applied = []
             for name, val in profile["stream_grabber"].items():
                 try:
                     node = sn.GetNode(name)
-                    if node is not None:
-                        node.SetValue(val)
-                except Exception:
-                    pass
+                    if node is None:
+                        logger.warning(f"Stream grabber has no {name} node; left as is")
+                        continue
+                    node.SetValue(val)
+                    applied.append(f"{name}={val}")
+                except Exception as e:
+                    logger.warning(f"Could not set stream grabber {name}={val}: {e}")
+            if applied:
+                logger.info(f"Stream grabber: {', '.join(applied)} (times in ms)")
         except Exception as e:
             logger.warning(f"Could not access stream grabber nodemap: {e}")
 
@@ -478,6 +558,8 @@ class CameraService:
                 if grab_result is not None:
                     grab_result.Release()
 
+        if self._camera is not None:
+            self.log_stream_statistics(self._camera, "One-shot grab failed")
         self._reset_if_removed()
         raise RuntimeError(f"Basler grab failed after {max_attempts} attempts: {last_error}")
 

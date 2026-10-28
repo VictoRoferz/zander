@@ -222,7 +222,7 @@ def test_flag_off_capture_is_202_and_spools():
         assert _spooled(r.json()["capture_id"])[1]["triggered_by"] == "anna@example.com"
 
         status = client.get("/api/v1/status").json()
-        assert status["version"] == "3.3.0"
+        assert status["version"] == "3.4.0"
         assert status["live_mode"]["enabled"] is False
         assert status["live"]["enabled"] is False and set(status["live"]) == STATUS_KEYS
         assert status["camera"]["use_camera"] is False and "owner" not in status["camera"]
