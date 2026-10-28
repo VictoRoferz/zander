@@ -74,7 +74,9 @@ discover a GigE camera on a host NIC nor hook USB keyboard input.
   shows up as "No model loaded" / an error on the dashboard.
 - **The model travels with its card.** `detector.json` next to `detector.onnx` holds
   the classes, the frozen threshold and provenance; in production the inspector
-  refuses a model without a valid card (`REQUIRE_CARD=true`).
+  refuses a model without a valid card (`REQUIRE_CARD=true`). Several models can sit
+  in the models folder (`<name>.onnx` + `<name>.json`); the dashboard's Model chooser
+  picks the active one, and every prediction records the model that made it.
 - **The live preview is opt-in and owns the camera.** With `LIVE_PREVIEW_ENABLED`
   off (default) captures work exactly as before. With it on, one thread owns the
   camera; a capture stops the stream and grabs the first frame after the key press.
@@ -238,7 +240,7 @@ Defined in [`deploy/docker-compose.yml`](deploy/docker-compose.yml):
 | `zander-labelstudio` | `heartexlabs/label-studio` | 8081 → 8080 | Annotation UI; serves images from `/data` (`LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true`, document root `/data`); legacy API tokens enabled |
 | `zander-receiver` | built from `receiver/` (`python:3.11-slim`) | 8002 | Ingest + LS task creation + labeled export |
 | `zander-dashboard` | built from `dashboard/` (`python:3.11-slim`) | 8003 | Review UI + login + capture proxy + live/result panels |
-| `zander-inspector` | built from the repo root (`inspector/Dockerfile` + `ml/infer`) | 127.0.0.1:8004 | Defect detector; reads `/data` read-only; `REQUIRE_CARD=true` |
+| `zander-inspector` | built from the repo root (`inspector/Dockerfile` + `ml/infer`) | 127.0.0.1:8004 | Defect detector; reads `/data` read-only (writes only `models/active_model.json`); `REQUIRE_CARD=true` |
 
 Key invariants:
 
@@ -263,8 +265,8 @@ All settings are env-driven, one `.env` per service (gitignored):
 | camerapi | pydantic `Settings` | `INGEST_URL`, `DASHBOARD_URL`, `DATA_ROOT`, `USE_CAMERA`, `CAMERA_TRANSPORT`, `LIVE_PREVIEW_ENABLED`, `PREVIEW_TOKEN`, `PREVIEW_FPS` (+ preview tuning, see `.env.example`) |
 | USB listener | `os.environ` + python-dotenv (reads `camerapi/.env`) | `CAMERAPI_URL`, `BUTTON_MODE`, `BUTTON_CAPTURE_KEY`, `BUTTON_SECONDARY_KEY`, `BUTTON_COOLDOWN` |
 | receiver | pydantic `Settings` | `DATA_ROOT`, `LABELSTUDIO_URL`, `LABELSTUDIO_API_KEY`, `LABELSTUDIO_PROJECT_NAME`, `INSPECTOR_URL` (empty = no predictions), `INSPECTOR_TIMEOUT` |
-| dashboard | `os.environ` + python-dotenv | `DATA_ROOT`, `LABELSTUDIO_URL`, `LABELSTUDIO_PUBLIC_URL`, `LABELSTUDIO_API_KEY`, `CAMERAPI_URL`, `PREVIEW_TOKEN`, `PREDICTION_PENDING_TIMEOUT_S` |
-| inspector | pydantic `Settings` | `MODEL_PATH` (card = same name `.json`), `REQUIRE_CARD`, `DATA_ROOT`, `ORT_THREADS`; legacy `CONFIDENCE_THRESHOLD`/`ADAPTER`/`CLASS_NAMES` only without a card |
+| dashboard | `os.environ` + python-dotenv | `DATA_ROOT`, `LABELSTUDIO_URL`, `LABELSTUDIO_PUBLIC_URL`, `LABELSTUDIO_API_KEY`, `CAMERAPI_URL`, `PREVIEW_TOKEN`, `PREDICTION_PENDING_TIMEOUT_S`, `INSPECTOR_URL` + `RECEIVER_URL` (model chooser) |
+| inspector | pydantic `Settings` | `MODEL_PATH` (card = same name `.json`; the default model), `MODELS_DIR` (every `*.onnx` there loads; default the folder of `MODEL_PATH`), `REQUIRE_CARD`, `DATA_ROOT`, `ORT_THREADS`; legacy `CONFIDENCE_THRESHOLD`/`ADAPTER`/`CLASS_NAMES` only without a card |
 | Docker (all) | `deploy/.env` | `DATA_DIR`, `LAPTOP_HOST`, `LABELSTUDIO_API_KEY`, LS admin credentials, `PREVIEW_TOKEN`, `INSPECTOR_REQUIRE_CARD`, `INSPECTOR_ORT_THREADS` |
 
 `.env` files are read **once at startup** — restart the service after any change.

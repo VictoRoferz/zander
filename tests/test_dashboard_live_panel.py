@@ -2,7 +2,8 @@
 Dashboard live panel logic (dashboard/static/app.js), run under node with a
 stub DOM: the status chip and the overlay for camerapi's preview states, in
 particular "streaming" while no frame ever arrived (the Windows-firewall
-case, where the chip used to say LIVE).
+case, where the chip used to say LIVE). Also the model chooser: the options,
+the unavailable states, and when "Re-check with <model>" is offered.
 
 Run from the repo root (no pytest needed):
     ../venv/bin/python -B tests/test_dashboard_live_panel.py
@@ -72,13 +73,22 @@ sandbox.fireConnectTimer = () => {
 };
 for (const step of JSON.parse(scenarioJson)) {
   vm.runInContext(step, ctx);
-  const chip = byId["live-status"];
-  const overlay = byId["live-overlay"];
-  const img = byId["live-img"];
+  const chip = sandbox.document.getElementById("live-status");
+  const overlay = sandbox.document.getElementById("live-overlay");
+  const img = sandbox.document.getElementById("live-img");
+  const sel = sandbox.document.getElementById("model-select");
+  const btn = sandbox.document.getElementById("recheck-btn");
   console.log(JSON.stringify({
     chip: chip.textContent, chipClass: chip.className,
     overlay: overlay.hidden ? null : overlay.textContent,
     attached: img.src.includes("/api/live.mjpg"),
+    options: sel.children.map((o) => ({
+      text: o.textContent, value: o.attrs.value,
+      disabled: "disabled" in o.attrs, selected: "selected" in o.attrs,
+    })),
+    selectDisabled: Boolean(sel.disabled),
+    recheck: btn.hidden ? null : btn.textContent,
+    note: sandbox.document.getElementById("model-note").textContent,
   }));
 }
 """
@@ -165,6 +175,73 @@ def test_a_stall_after_frames_still_detaches():
 def test_unavailable_wifi_profile_is_unchanged():
     (step,) = run(status(state="unavailable", profile="wifi", stream_age_s=None))
     assert not step["attached"] and step["overlay"].startswith("Live preview unavailable"), step
+
+
+# ---- model chooser ------------------------------------------------------------------
+
+def model(name, active=False, loaded=True, version=None, run_name=None, error=None):
+    return {"name": name, "active": active, "loaded": loaded, "error": error,
+            "model_version": version or (f"{name}.onnx@0000000a" if loaded else None),
+            "run_name": run_name, "threshold": 0.0575 if loaded else None}
+
+
+LISTING = {"enabled": True, "reachable": True, "error": None, "active": "detector",
+           "model_loaded": True, "models": [
+               model("detector", active=True, run_name="yolo26n_def3_fold0"),
+               model("yolo26n_def3_fold1", run_name="yolo26n_def3_fold1"),
+               model("broken", loaded=False, error="REQUIRE_CARD=true but there is no card"),
+           ]}
+
+
+def latest(state="ok", version="detector.onnx@0000000a", capture_id="c1"):
+    pred = {"schema_version": 1, "status": state, "model_version": version} if state != "pending" else None
+    return {"capture": {"capture_id": capture_id}, "state": state, "prediction": pred}
+
+
+def test_model_chooser_lists_the_models_and_marks_the_active_one():
+    (step,) = run(f"applyModels({json.dumps(LISTING)})")
+    assert [o["text"] for o in step["options"]] == [
+        "detector (yolo26n_def3_fold0)", "yolo26n_def3_fold1", "broken (cannot load)"], step
+    assert [o["selected"] for o in step["options"]] == [True, False, False]
+    assert [o["disabled"] for o in step["options"]] == [False, False, True]
+    assert step["selectDisabled"] is False
+    assert step["recheck"] is None, "no capture yet: nothing to re-check"
+
+
+def test_model_chooser_says_why_it_is_empty():
+    off, down, empty = run(
+        'applyModels({"enabled": false, "reachable": false, "error": "predictions are off", "models": []})',
+        'applyModels({"enabled": true, "reachable": false, "error": "inspector unreachable", "models": []})',
+        'applyModels({"enabled": true, "reachable": true, "error": null, "models": []})',
+    )
+    assert [o["text"] for o in off["options"]] == ["predictions off"] and off["selectDisabled"]
+    assert [o["text"] for o in down["options"]] == ["inspector unreachable"] and down["selectDisabled"]
+    assert [o["text"] for o in empty["options"]] == ["no model"] and empty["selectDisabled"]
+
+
+def test_recheck_is_offered_only_without_a_result_from_the_active_model():
+    def show(data):
+        return f"latestData = {json.dumps(data)}; renderRecheck()"
+    same, other, pending, error = run(
+        f"applyModels({json.dumps(LISTING)})" + "; " + show(latest()),
+        show(latest(version="yolo26n_def3_fold1.onnx@0000000a")),
+        show(latest(state="pending")),
+        show(latest(state="error", version=None)),
+    )
+    assert same["recheck"] is None, same
+    assert other["recheck"] == "Re-check with detector", other
+    assert pending["recheck"] is None, pending
+    assert error["recheck"] == "Re-check with detector", error
+
+
+def test_recheck_waits_for_the_active_model_and_then_says_so():
+    waiting, done = run(
+        "rechecking = {id: 'c1', version: 'detector.onnx@0000000a', name: 'detector', since: Date.now()};"
+        f" updateRechecking({json.dumps(latest(version='old.onnx@1'))})",
+        f"updateRechecking({json.dumps(latest())})",
+    )
+    assert waiting["note"] == "", waiting
+    assert done["note"] == "Re-checked with detector.", done
 
 
 if __name__ == "__main__":
