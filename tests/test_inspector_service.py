@@ -1,7 +1,8 @@
 """
 Inspector service (inspector/): detector.json loading, the legacy env
-fallback, the refusal rules, the /inspect response shape and the HTTP
-contract (docs/CONTRACTS.md sections 1 and 3).
+fallback, the refusal rules, the /inspect response shape, the models folder
+(several models, the active one, the saved choice) and the HTTP contract
+(docs/CONTRACTS.md sections 1 and 3).
 
 Run: ml/.venv/bin/python -B tests/test_inspector_service.py
 Skips (exit 0) when onnxruntime / Pillow / fastapi are missing.
@@ -72,9 +73,16 @@ INSPECT_KEYS = {
     "adapter", "class_names", "threshold_source",
 }
 STATUS_KEYS = {
-    "service", "version", "model_loaded", "model_path", "meta_path", "model_version",
+    "service", "version", "model_loaded", "active_model", "model_path", "meta_path", "model_version",
     "model_sha256", "adapter", "schema", "class_names", "confidence_threshold",
     "threshold_source", "tiler_version", "load_error", "meta",
+}
+MODELS_KEYS = {
+    "active", "model_loaded", "load_error", "selected_by", "selected_at", "models_dir", "models",
+}
+MODEL_ENTRY_KEYS = {
+    "name", "loaded", "active", "error", "model_version", "model_sha256", "adapter", "schema",
+    "class_names", "threshold", "threshold_source", "run_name", "created",
 }
 
 
@@ -152,6 +160,7 @@ def _reset(**settings_over):
     FakeTiledDetector.instances.clear()
     FakeTiledDetector.max_active = 0
     settings.model_path = MODEL
+    settings.models_dir = None
     settings.require_card = False
     settings.adapter = None
     settings.confidence_threshold = None
@@ -168,12 +177,12 @@ def _model(content: bytes = b"fake onnx bytes") -> Path:
     return MODEL
 
 
-def _card(**over) -> Path:
+def _card(model: Path = MODEL, **over) -> Path:
     doc = {
         "contract_version": 1,
         "kind": "zander-detector",
-        "model_file": MODEL.name,
-        "model_sha256": sha256_file(MODEL),
+        "model_file": model.name,
+        "model_sha256": sha256_file(model),
         "adapter": "ultralytics",
         "schema": "def3",
         "class_names": list(NAMES),
@@ -192,7 +201,16 @@ def _card(**over) -> Path:
         "exported_at": "2026-09-28T10:00:00Z",
     }
     doc.update(over)
-    return write_detector_card(card_path_for(MODEL), doc)
+    return write_detector_card(card_path_for(model), doc)
+
+
+def _named_model(name: str, card: bool = True, folder: Path = None, **card_over) -> Path:
+    """Another model in the models folder (distinct bytes = distinct sha)."""
+    path = (folder or MODEL.parent) / f"{name}.onnx"
+    path.write_bytes(f"fake onnx {name}".encode())
+    if card:
+        _card(path, **card_over)
+    return path
 
 
 def _jpeg(width: int = 700, height: int = 500) -> bytes:
@@ -219,11 +237,13 @@ def _encode_multipart(fields=None, files=None):
     return body, [(b"content-type", f"multipart/form-data; boundary={boundary}".encode())]
 
 
-async def _asgi(method: str, path: str, fields=None, files=None):
+async def _asgi(method: str, path: str, fields=None, files=None, json_body=None):
     """Minimal in-process ASGI client -> (status, json body)."""
     body, headers = (b"", [])
     if fields or files:
         body, headers = _encode_multipart(fields, files)
+    elif json_body is not None:
+        body, headers = json.dumps(json_body).encode(), [(b"content-type", b"application/json")]
     headers = headers + [(b"host", b"testserver"), (b"content-length", str(len(body)).encode())]
     scope = {
         "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -702,6 +722,201 @@ def test_real_onnx_model_end_to_end():
         assert "class count mismatch" in detector_service.load_error
     finally:
         ds.TiledDetector = FakeTiledDetector
+
+
+# ---- Several models: the models folder and the active one (CONTRACTS section 3) ----
+def _put_active(name=None, **extra):
+    body = dict(extra) if name is None else {"name": name, **extra}
+    return _request("PUT", "/api/v1/models/active", json_body=body)
+
+
+def test_models_folder_loads_every_model_and_model_path_is_active():
+    _reset(require_card=True)
+    _model()
+    _card()
+    _named_model("fold1")
+    _named_model("fold2")
+    detector_service.load()
+    assert detector_service.ready, detector_service.load_error
+    listing = detector_service.models()
+    assert set(listing) == MODELS_KEYS, set(listing) ^ MODELS_KEYS
+    assert [m["name"] for m in listing["models"]] == ["detector", "fold1", "fold2"]
+    assert [m["active"] for m in listing["models"]] == [True, False, False]
+    assert all(m["loaded"] and m["error"] is None for m in listing["models"])
+    assert listing["active"] == "detector" and listing["selected_by"] is None
+    assert listing["models_dir"] == str(MODEL.parent)
+    assert detector_service.status()["active_model"] == "detector"
+    assert len(FakeTiledDetector.instances) == 3  # one session per model
+    assert not settings.active_model_file.exists()  # loading never writes
+
+
+def test_missing_model_path_falls_back_to_the_first_model_by_name():
+    _reset(require_card=True)
+    _named_model("zeta")
+    _named_model("alpha")
+    detector_service.load()
+    assert detector_service.ready, detector_service.load_error
+    assert detector_service.models()["active"] == "alpha"
+    assert any("MODEL_PATH" in m and "alpha" in m for m in LOGS.messages), LOGS.messages
+
+
+def test_a_refused_model_does_not_stop_the_others():
+    _reset(require_card=True)
+    _model()
+    _card()
+    _named_model("nocard", card=False)
+    detector_service.load()
+    assert detector_service.ready, detector_service.load_error
+    entry = {m["name"]: m for m in detector_service.models()["models"]}["nocard"]
+    assert entry["loaded"] is False and entry["active"] is False
+    assert "REQUIRE_CARD" in entry["error"] and entry["model_version"] is None
+
+
+def test_a_refused_active_model_is_never_replaced_by_another():
+    _reset(require_card=True)
+    _model()  # MODEL_PATH without a card: refused
+    _named_model("fold1")
+    detector_service.load()
+    assert not detector_service.ready
+    assert "REQUIRE_CARD" in detector_service.load_error
+    assert detector_service.models()["active"] == "detector"
+    code, body = _post_file(_jpeg())
+    assert code == 503 and "REQUIRE_CARD" in body["detail"], body
+
+
+def test_switch_changes_inspect_and_survives_a_restart():
+    _reset(require_card=True)
+    _model()
+    _card()
+    fold1 = _named_model("fold1", threshold=0.6, conf_floor=0.6)
+    detector_service.load()
+    code, body = _post_file(_jpeg())
+    assert code == 200 and body["model_version"].startswith("detector.onnx@"), body
+    assert body["classes"] == ["Nicht ausreichend Lot", "Brücke"]  # t 0.34
+    code, out = _put_active("fold1", selected_by="op@example.com")
+    assert code == 200, out
+    assert set(out) == MODELS_KEYS | {"saved"} and out["saved"] is True
+    assert out["active"] == "fold1" and out["selected_by"] == "op@example.com"
+    assert out["selected_at"].endswith("Z")
+    code, body = _post_file(_jpeg())
+    assert body["model_version"] == f"fold1.onnx@{sha256_file(fold1)[:8]}", body
+    assert body["confidence_threshold"] == 0.6 and body["classes"] == ["Brücke"]  # t 0.6
+    saved = json.loads(settings.active_model_file.read_text(encoding="utf-8"))
+    assert saved["name"] == "fold1" and saved["model_version"] == body["model_version"]
+    assert saved["selected_by"] == "op@example.com"
+    detector_service.load()  # a restart keeps the choice
+    listing = detector_service.models()
+    assert listing["active"] == "fold1" and listing["selected_by"] == "op@example.com"
+    assert detector_service.status()["model_version"].startswith("fold1.onnx@")
+
+
+def test_switch_errors_leave_the_active_model_alone():
+    _reset(require_card=True)
+    _model()
+    _card()
+    _named_model("nocard", card=False)
+    detector_service.load()
+    code, body = _put_active("missing")
+    assert code == 404 and "unknown model" in body["detail"], body
+    code, body = _put_active("nocard")
+    assert code == 409 and "REQUIRE_CARD" in body["detail"], body
+    for bad in ({"name": ""}, {}, {"name": 5}):
+        code, _ = _request("PUT", "/api/v1/models/active", json_body=bad)
+        assert code == 422, bad
+    assert detector_service.ready and detector_service.models()["active"] == "detector"
+    assert not settings.active_model_file.exists()
+
+
+def test_a_gone_or_corrupt_saved_choice_falls_back_to_model_path():
+    _reset(require_card=True)
+    _model()
+    _card()
+    settings.active_model_file.write_text(json.dumps({"name": "removed"}), encoding="utf-8")
+    detector_service.load()
+    assert detector_service.ready and detector_service.models()["active"] == "detector"
+    assert detector_service.models()["selected_by"] is None
+    assert any("saved model choice" in m for m in LOGS.messages), LOGS.messages
+    for raw in ("{not json", "[]", '{"name": 5}', '{"name": ""}'):
+        settings.active_model_file.write_text(raw, encoding="utf-8")
+        detector_service.load()
+        assert detector_service.ready, raw
+        assert detector_service.models()["active"] == "detector", raw
+
+
+def test_a_refused_saved_choice_is_loud_and_a_switch_recovers():
+    _reset(require_card=True)
+    _model()
+    _card()
+    fold1 = _named_model("fold1")
+    detector_service.load()
+    assert detector_service.set_active("fold1") is True
+    card_path_for(fold1).unlink()  # the chosen model loses its card
+    detector_service.load()
+    assert not detector_service.ready and "REQUIRE_CARD" in detector_service.load_error
+    assert detector_service.models()["active"] == "fold1"
+    assert detector_service.set_active("detector") is True  # no restart needed
+    assert detector_service.ready and detector_service.load_error is None
+
+
+def test_an_unsaved_switch_still_applies():
+    _reset(require_card=True)
+    _model()
+    _card()
+    _named_model("fold1")
+    detector_service.load()
+    settings.active_model_file.mkdir()  # os.replace onto a directory fails
+    try:
+        assert detector_service.set_active("fold1") is False
+        assert detector_service.ready and detector_service.models()["active"] == "fold1"
+        assert any("not saved" in m for m in LOGS.messages), LOGS.messages
+        assert not [p for p in MODEL.parent.iterdir() if p.name.endswith(".tmp")]
+    finally:
+        settings.active_model_file.rmdir()
+
+
+def test_the_saved_choice_name_is_reserved():
+    _reset()
+    _model()
+    _card()
+    (MODEL.parent / "active_model.onnx").write_bytes(b"fake onnx active_model")
+    detector_service.load()
+    assert detector_service.ready, detector_service.load_error
+    entry = {m["name"]: m for m in detector_service.models()["models"]}["active_model"]
+    assert entry["loaded"] is False and "reserved" in entry["error"], entry
+
+
+def test_models_dir_setting_and_model_path_outside_it():
+    other = TMP / "elsewhere"
+    shutil.rmtree(other, ignore_errors=True)
+    other.mkdir()
+    _reset(require_card=True, models_dir=other)
+    _model()
+    _card()
+    _named_model("fold9", folder=other)
+    _named_model("detector", folder=other)  # same name as MODEL_PATH: skipped
+    detector_service.load()
+    assert detector_service.ready, detector_service.load_error
+    listing = detector_service.models()
+    assert [m["name"] for m in listing["models"]] == ["detector", "fold9"]
+    assert listing["active"] == "detector" and listing["models_dir"] == str(other)
+    assert detector_service.status()["model_path"] == str(MODEL)
+    assert settings.active_model_file.parent == other
+    assert any("already loaded" in m for m in LOGS.messages), LOGS.messages
+
+
+def test_http_models_listing():
+    _reset(require_card=True)
+    _model()
+    _card()
+    _named_model("fold1")
+    detector_service.load()
+    code, body = _request("GET", "/api/v1/models")
+    assert code == 200 and set(body) == MODELS_KEYS, body
+    first = body["models"][0]
+    assert set(first) == MODEL_ENTRY_KEYS, set(first) ^ MODEL_ENTRY_KEYS
+    assert first["name"] == "detector" and first["active"] is True
+    assert first["run_name"] == "yolo26n_def3_devall" and first["threshold"] == 0.34
+    assert first["class_names"] == NAMES and first["threshold_source"] == "detector.json"
 
 
 if __name__ == "__main__":

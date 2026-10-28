@@ -10,6 +10,10 @@ labeled-cache lock (docs/CONTRACTS.md sections 2, 4 and 5).
   error mapping, and the upstream is closed when the browser disconnects
   (real uvicorn server, raw socket).
 - The Label Studio cache makes one LS call for concurrent pollers.
+- The model chooser against a mocked inspector + receiver: /api/models
+  (listing, unreachable, too old, predictions off), PUT /api/models/active
+  (forwards the user, maps 404/409/502, validates the body) and
+  POST /api/captures/{id}/recheck (forwards to the receiver's /predict).
 
 Run from the repo root (no pytest needed):
     ../venv/bin/python -B tests/test_dashboard_latest.py
@@ -34,6 +38,8 @@ TMP = Path(tempfile.mkdtemp(prefix="zander-dash-latest-"))
 os.environ["DATA_ROOT"] = str(TMP)
 os.environ["PREDICTIONS_DIR"] = str(TMP / "predictions")
 os.environ["CAMERAPI_URL"] = "http://127.0.0.1:9"   # discard port: nothing listens
+os.environ["INSPECTOR_URL"] = "http://inspector.test:8004"   # always mocked below
+os.environ["RECEIVER_URL"] = "http://receiver.test:8002"
 os.environ["PREDICTION_PENDING_TIMEOUT_S"] = "5"
 os.environ["PREVIEW_TOKEN"] = ""
 os.environ["LABELSTUDIO_API_KEY"] = ""
@@ -543,7 +549,7 @@ def test_home_page_panels_outside_the_grids():
         html = r.text
         for element_id in ("live-img", "live-overlay", "live-status", "result-verdict",
                            "result-figure", "result-crops", "result-meta", "result-message",
-                           "capture-btn"):
+                           "capture-btn", "model-select", "recheck-btn", "model-note"):
             assert f'id="{element_id}"' in html, element_id
         assert html.index('class="live-row"') < html.index('id="grid-unlabeled"')
         assert '<div class="grid" id="grid-unlabeled"></div>' in html
@@ -689,6 +695,127 @@ def test_relay_closes_upstream_when_browser_disconnects():
             thread.join(10)
 
 
+# ---- model chooser (inspector + receiver mocked) ------------------------------
+
+MODELS_LISTING = {
+    "active": "detector", "model_loaded": True, "load_error": None,
+    "selected_by": None, "selected_at": None, "models_dir": "/data/models",
+    "models": [
+        {"name": "detector", "loaded": True, "active": True, "error": None,
+         "model_version": "detector.onnx@a68b57d9", "threshold": 0.0575},
+        {"name": "fold1", "loaded": True, "active": False, "error": None,
+         "model_version": "fold1.onnx@cdb12d97", "threshold": 0.0575},
+    ],
+}
+
+
+class FakeUpstreams:
+    """The inspector's /models endpoints and the receiver's /predict behind MockTransport."""
+
+    def __init__(self):
+        self.requests = []
+        self.down = set()          # hosts that refuse connections
+        self.models_code = 200
+        self.switch_code = 200
+        self.switch_body = None
+        self.predict_code = 202
+
+    async def handler(self, request):
+        self.requests.append(request)
+        if request.url.host in self.down:
+            raise httpx.ConnectError("connection refused", request=request)
+        path = request.url.path
+        if request.url.host == "inspector.test" and path == "/api/v1/models":
+            return httpx.Response(self.models_code, json=MODELS_LISTING)
+        if request.url.host == "inspector.test" and path == "/api/v1/models/active":
+            name = json.loads(request.content)["name"]
+            if self.switch_code != 200:
+                return httpx.Response(self.switch_code, json={"detail": f"model {name!r}: nope"})
+            body = self.switch_body or {**MODELS_LISTING, "active": name, "saved": True}
+            return httpx.Response(200, json=body)
+        if request.url.host == "receiver.test" and path.startswith("/api/v1/predict/"):
+            if self.predict_code == 404:
+                return httpx.Response(404, json={"detail": "unknown capture"})
+            return httpx.Response(self.predict_code, json={"queued": True})
+        return httpx.Response(404)
+
+
+def test_http_models_listing_and_unavailable_cases():
+    fake = FakeUpstreams()
+    with client(fake) as c:
+        assert c.get("/api/models").status_code == 401
+        body = c.get("/api/models", headers=AUTH).json()
+        assert body["enabled"] is True and body["reachable"] is True and body["error"] is None
+        assert [m["name"] for m in body["models"]] == ["detector", "fold1"]
+        assert body["active"] == "detector"
+        fake.down.add("inspector.test")
+        body = c.get("/api/models", headers=AUTH).json()
+        assert body["reachable"] is False and body["models"] == [], body
+        assert "inspector unreachable" in body["error"]
+        fake.down.clear()
+        fake.models_code = 404   # an inspector before v0.3.0
+        body = c.get("/api/models", headers=AUTH).json()
+        assert body["reachable"] is False and "too old" in body["error"], body
+        fake.models_code = 500
+        body = c.get("/api/models", headers=AUTH).json()
+        assert body["reachable"] is False and "HTTP 500" in body["error"], body
+        original = dash.INSPECTOR_URL
+        dash.INSPECTOR_URL = ""  # predictions off
+        try:
+            n = len(fake.requests)
+            body = c.get("/api/models", headers=AUTH).json()
+            assert body["enabled"] is False and "predictions are off" in body["error"], body
+            r = c.put("/api/models/active", json={"name": "fold1"}, headers=AUTH)
+            assert r.status_code == 409, r.text
+            assert len(fake.requests) == n, "no upstream call while predictions are off"
+        finally:
+            dash.INSPECTOR_URL = original
+
+
+def test_http_switch_model_forwards_the_user_and_maps_errors():
+    fake = FakeUpstreams()
+    with client(fake) as c:
+        assert c.put("/api/models/active", json={"name": "fold1"}).status_code == 401
+        r = c.put("/api/models/active", json={"name": "fold1"}, headers=AUTH)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["active"] == "fold1" and body["saved"] is True and body["reachable"] is True
+        sent = fake.requests[-1]
+        assert sent.method == "PUT" and sent.url.path == "/api/v1/models/active"
+        assert json.loads(sent.content) == {"name": "fold1", "selected_by": "tester@example.com"}
+        for code in (404, 409):
+            fake.switch_code = code
+            r = c.put("/api/models/active", json={"name": "fold1"}, headers=AUTH)
+            assert r.status_code == code and "nope" in r.json()["detail"], (code, r.text)
+        n = len(fake.requests)
+        for bad in ({"name": ""}, {}, {"name": "x" * 201}):
+            r = c.put("/api/models/active", json=bad, headers=AUTH)
+            assert r.status_code == 422, (bad, r.status_code)
+        assert len(fake.requests) == n, "an invalid body never reaches the inspector"
+        fake.down.add("inspector.test")
+        r = c.put("/api/models/active", json={"name": "fold1"}, headers=AUTH)
+        assert r.status_code == 502 and "inspector unreachable" in r.json()["detail"], r.text
+
+
+def test_http_recheck_forwards_to_the_receiver():
+    fake = FakeUpstreams()
+    with client(fake) as c:
+        assert c.post("/api/captures/abc123/recheck").status_code == 401
+        r = c.post("/api/captures/abc123/recheck", headers=AUTH)
+        assert r.status_code == 202 and r.json() == {"queued": True}, r.text
+        sent = fake.requests[-1]
+        assert sent.method == "POST" and sent.url.host == "receiver.test"
+        assert sent.url.path == "/api/v1/predict/abc123" and not sent.url.query, sent.url
+        n = len(fake.requests)
+        assert c.post("/api/captures/bad.id/recheck", headers=AUTH).status_code == 400
+        assert len(fake.requests) == n
+        fake.predict_code = 404
+        assert c.post("/api/captures/abc123/recheck", headers=AUTH).status_code == 404
+        fake.down.add("receiver.test")
+        r = c.post("/api/captures/abc123/recheck", headers=AUTH)
+        assert r.status_code == 502 and "receiver unreachable" in r.json()["detail"], r.text
+
+
 TESTS = [
     test_newest_capture_by_mtime,
     test_newest_capture_is_cached_on_directory_mtime,
@@ -719,6 +846,9 @@ TESTS = [
     test_http_live_stream_relay,
     test_relay_response_closes_upstream_when_never_started,
     test_relay_closes_upstream_when_browser_disconnects,
+    test_http_models_listing_and_unavailable_cases,
+    test_http_switch_model_forwards_the_user_and_maps_errors,
+    test_http_recheck_forwards_to_the_receiver,
 ]
 
 

@@ -299,6 +299,23 @@ section.live-row {
 .cls-other { --c: var(--cls-other); }
 
 /* Result photo with the SVG overlay (viewBox = photo pixels) */
+.result-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.model-select {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #d0d5db;
+  background: white;
+  color: #1c1f23;
+  font: inherit;
+  font-size: 13px;
+  max-width: 100%;
+}
+.model-select:disabled { opacity: 0.6; }
 .result-message { margin: 0; min-height: 1.4em; font-size: 14px; color: var(--text-muted); }
 .result-message.is-error { color: var(--fail-fg); }
 .result-figure {

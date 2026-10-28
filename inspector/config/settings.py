@@ -15,6 +15,13 @@ turns the fallback off: without a card the inspector refuses to load a model.
 
 The threshold is the frozen t* from `cli.py choose-op`, carried into the card
 by `cli.py export`; it is never tuned on the test split.
+
+Several models (since v0.3.0): every <name>.onnx in the models folder (the
+folder of MODEL_PATH unless MODELS_DIR says otherwise) is loaded at startup,
+each with its own card. One of them is ACTIVE and serves /inspect; the
+dashboard switches it (PUT /api/v1/models/active) and the choice is saved in
+the models folder as active_model.json. Without a saved choice the active
+model is MODEL_PATH (docs/CONTRACTS.md section 3).
 """
 from pathlib import Path
 from typing import Optional
@@ -32,11 +39,15 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.25
 # Class order of the exported model (the training schema, ml/dataprep/remap.py).
 DEFAULT_CLASS_NAMES = ("Nicht ausreichend Lot", "Brücke", "Fahne")
 
+# The saved model choice, in the models folder. Not a card: a model named
+# "active_model" is refused, because its card would be this file.
+ACTIVE_MODEL_FILE = "active_model.json"
+
 
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "zander-inspector"
-    service_version: str = "0.2.1"
+    service_version: str = "0.3.0"
 
     # ---- Server ----
     # Loopback by default: nothing outside this PC needs the inspector (the
@@ -50,6 +61,9 @@ class Settings(BaseSettings):
     # MODEL_PATH=/data/models/detector.onnx on the shared DATA_ROOT, with
     # detector.json next to it.
     model_path: Path = REPO_ROOT / "ml_data" / "exports" / "detector.onnx"
+    # Every <name>.onnx in this folder is loaded too (None = MODEL_PATH's folder).
+    # MODEL_PATH is the default active model.
+    models_dir: Optional[Path] = None
     # true = refuse to load a model that has no detector.json card.
     require_card: bool = False
     # Legacy fallbacks (None = unset). Ignored whenever a card exists.
@@ -77,7 +91,17 @@ class Settings(BaseSettings):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.model_path = self.model_path.expanduser()
+        if self.models_dir is not None:
+            self.models_dir = self.models_dir.expanduser()
         self.data_root = self.data_root.expanduser()
+
+    @property
+    def models_folder(self) -> Path:
+        return self.models_dir if self.models_dir is not None else self.model_path.parent
+
+    @property
+    def active_model_file(self) -> Path:
+        return self.models_folder / ACTIVE_MODEL_FILE
 
     @property
     def unlabeled_dir(self) -> Path:

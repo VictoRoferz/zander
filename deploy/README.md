@@ -98,7 +98,15 @@ camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ─
     ```
     `model_loaded: true` and `threshold_source: detector.json` mean it is live. Without
     a valid card the inspector refuses the model (`REQUIRE_CARD=true`) and the dashboard
-    shows "No model loaded". Then classify the captures taken while no model was loaded
+    shows "No model loaded".
+
+    **Several models:** every `<name>.onnx` + `<name>.json` pair in `deploy\data\models\`
+    is loaded (export each with `--name <name>`, e.g. `yolo26n_def3_fold1`). The
+    dashboard's **Model** chooser (in the "Latest result" panel) switches the active one
+    for every following photo, for everyone using the station; the choice survives a
+    restart (`models\active_model.json`). Without a saved choice `detector.onnx` is
+    active. "Re-check with <model>" re-runs the shown photo with the active model.
+    `curl http://localhost:8004/api/v1/models` lists the models and why any was refused. Then classify the captures taken while no model was loaded
     (they say "No model loaded"):
     ```
     curl -X POST http://localhost:8002/api/v1/predict/rescan

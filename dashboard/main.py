@@ -10,6 +10,10 @@ Standalone UI for the camera pipeline:
     (GET /api/live.mjpg, GET /api/live/status)
   - "Latest result" panel: the newest capture with its prediction
     (GET /api/latest, GET /api/captures/{id}; docs/CONTRACTS.md section 5)
+  - Model chooser: lists the inspector's models and switches the active one
+    (GET /api/models, PUT /api/models/active); "Re-check with this model"
+    asks the receiver to classify a capture again
+    (POST /api/captures/{id}/recheck)
 
 The "labeled" view is read LIVE from the Label Studio REST API (LS is the
 single source of truth), so the dashboard always matches LS. "unlabeled" =
@@ -64,12 +68,13 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 import auth
 import db
 from ls_client import LabelStudioUnavailable, LsClient
 
-SERVICE_VERSION = "2.2.0"
+SERVICE_VERSION = "2.3.0"
 
 # ---- Setup ----------------------------------------------------------------
 
@@ -146,6 +151,11 @@ LABELSTUDIO_URL = os.environ.get("LABELSTUDIO_URL", "http://localhost:8081")
 # (http://localhost:8081). Defaults to LABELSTUDIO_URL for the native setup.
 LABELSTUDIO_PUBLIC_URL = os.environ.get("LABELSTUDIO_PUBLIC_URL", LABELSTUDIO_URL)
 CAMERAPI_URL = os.environ.get("CAMERAPI_URL", "http://localhost:8001")
+# The model chooser talks to the inspector (list + switch) and to the receiver
+# (re-check one capture). Compose: http://inspector:8004 / http://receiver:8002.
+# INSPECTOR_URL set but EMPTY = predictions are off: the chooser says so.
+INSPECTOR_URL = os.environ.get("INSPECTOR_URL", "http://localhost:8004").strip()
+RECEIVER_URL = os.environ.get("RECEIVER_URL", "http://localhost:8002").strip()
 # Shared secret for camerapi's live preview (sent as X-Preview-Token). Must be
 # the same value as camerapi's PREVIEW_TOKEN. Empty = rely on camerapi's
 # loopback rule, which only works when the dashboard runs natively on the
@@ -174,6 +184,7 @@ TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 CAPTURE_TIMEOUT = httpx.Timeout(60.0, connect=3.0)      # a cold Basler grab is slow
 LIVE_STATUS_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
+MODELS_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 # camerapi re-sends a frame (or a placeholder) at least every 2 s, so 15 s of
 # silence means the upstream is stuck and the relay ends.
 LIVE_STREAM_TIMEOUT = httpx.Timeout(15.0, connect=3.0)
@@ -232,6 +243,7 @@ async def lifespan(app: FastAPI):
     LOG.info(
         f"dashboard v{SERVICE_VERSION} ready: data_root={DATA_ROOT} "
         f"predictions={PREDICTIONS_DIR} ls={LABELSTUDIO_URL} camerapi={CAMERAPI_URL} "
+        f"inspector={INSPECTOR_URL or 'off'} receiver={RECEIVER_URL} "
         f"preview_token={'set' if PREVIEW_TOKEN else 'unset'}"
     )
     try:
@@ -521,6 +533,82 @@ async def capture_proxy(
     if resp.status_code >= 400:
         return JSONResponse(status_code=resp.status_code, content=_safe_json(resp))
     return JSONResponse(content=_safe_json(resp))
+
+
+# ---- Model chooser (inspector models + receiver re-check) ------------------
+
+class _ModelChoice(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+def _models_unavailable(error: str, enabled: bool = True) -> dict:
+    return {"enabled": enabled, "reachable": False, "error": error,
+            "active": None, "model_loaded": False, "models": []}
+
+
+@app.get("/api/models")
+async def api_models(request: Request, _: str = Depends(auth.current_user_email)) -> dict:
+    """The inspector's models and the active one; always 200 so the page can say why not."""
+    if not INSPECTOR_URL:
+        return _models_unavailable("predictions are off (INSPECTOR_URL is empty)", enabled=False)
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        resp = await client.get(_inspector_url("/api/v1/models"), timeout=MODELS_TIMEOUT)
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
+        return _models_unavailable(f"inspector unreachable at {INSPECTOR_URL} ({type(e).__name__})")
+    if resp.status_code == 404:
+        return _models_unavailable("the inspector is too old for the model chooser (needs v0.3.0)")
+    data = _safe_json(resp)
+    if resp.status_code >= 400 or not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        return _models_unavailable(f"inspector answered HTTP {resp.status_code}")
+    return {"enabled": True, "reachable": True, "error": None, **data}
+
+
+@app.put("/api/models/active")
+async def api_set_model(
+    choice: _ModelChoice,
+    request: Request,
+    email: str = Depends(auth.current_user_email),
+) -> Any:
+    """Switch the inspector's active model for every following photo; records who did it."""
+    if not INSPECTOR_URL:
+        raise HTTPException(status_code=409, detail="predictions are off (INSPECTOR_URL is empty)")
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        resp = await client.put(
+            _inspector_url("/api/v1/models/active"),
+            json={"name": choice.name, "selected_by": email},
+            timeout=MODELS_TIMEOUT,
+        )
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
+        raise HTTPException(status_code=502, detail=f"inspector unreachable: {type(e).__name__}")
+    if resp.status_code >= 400:
+        return JSONResponse(status_code=resp.status_code, content=_safe_json(resp))
+    LOG.info(f"active model -> {choice.name!a} (by {email!a})")
+    return JSONResponse(content={"enabled": True, "reachable": True, "error": None, **_safe_json(resp)})
+
+
+@app.post("/api/captures/{capture_id}/recheck")
+async def api_recheck(
+    capture_id: str,
+    request: Request,
+    _: str = Depends(auth.current_user_email),
+) -> Any:
+    """
+    Ask the receiver to classify this capture again. It re-runs only when the
+    stored result comes from another model than the active one (CONTRACTS
+    section 6), so a double click never runs the same model twice.
+    """
+    if not _is_valid_capture_id(capture_id):
+        raise HTTPException(status_code=400, detail="invalid capture_id")
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        resp = await client.post(
+            f"{RECEIVER_URL.rstrip('/')}/api/v1/predict/{capture_id}", timeout=MODELS_TIMEOUT
+        )
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
+        raise HTTPException(status_code=502, detail=f"receiver unreachable: {type(e).__name__}")
+    return JSONResponse(status_code=resp.status_code, content=_safe_json(resp))
 
 
 # ---- Label Studio → dashboard data ---------------------------------------
@@ -905,6 +993,10 @@ class _RelayResponse(StreamingResponse):
 
 def _camerapi_url(path: str) -> str:
     return f"{CAMERAPI_URL.rstrip('/')}{path}"
+
+
+def _inspector_url(path: str) -> str:
+    return f"{INSPECTOR_URL.rstrip('/')}{path}"
 
 
 def _preview_headers() -> dict[str, str]:

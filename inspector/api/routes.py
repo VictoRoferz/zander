@@ -10,6 +10,12 @@ photo-coordinate detections plus the verdict.
 Errors: 503 no model loaded, 422 missing/empty/undecodable image or invalid
 capture_id, 404 unknown capture_id, 500 inference failed.
 
+GET /api/v1/models: every model in the models folder and the active one.
+PUT /api/v1/models/active {"name", "selected_by"?}: switch the model /inspect
+uses (saved across restarts). 404 unknown model, 409 model refused at load.
+The dashboard calls these for its model chooser; like /inspect they are only
+reachable from this PC (loopback / the compose network).
+
 Blocking work (file read, decode, ONNX inference) runs in the threadpool so
 the event loop keeps answering /status and /health during a slow photo.
 """
@@ -19,11 +25,14 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
 from config.settings import settings
 from services.detector_service import (
     ImageDecodeError,
     ModelNotLoadedError,
+    ModelUnavailableError,
+    UnknownModelError,
     detector_service,
 )
 
@@ -89,3 +98,25 @@ async def inspect(
         f"in {result['latency_ms']} ms"
     )
     return {"status": "ok", "source": source, **result}
+
+
+class ActiveModelRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    selected_by: Optional[str] = Field(default=None, max_length=320)  # the dashboard user
+
+
+@router.get("/models")
+def list_models() -> dict:
+    return detector_service.models()
+
+
+@router.put("/models/active")
+async def set_active_model(body: ActiveModelRequest) -> dict:
+    try:
+        # The save is a small fsync'd write: keep it off the event loop.
+        saved = await run_in_threadpool(detector_service.set_active, body.name, body.selected_by)
+    except UnknownModelError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {**detector_service.models(), "saved": saved}

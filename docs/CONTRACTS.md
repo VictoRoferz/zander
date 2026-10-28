@@ -101,6 +101,15 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 
 `GET /api/v1/health` returns `{"status":"ok"}` even when no model is loaded, so the container stays healthy.
 
+**Several models (inspector v0.3.0):**
+- **Folder:** every `<name>.onnx` in the models folder (`MODELS_DIR`, default the folder of `MODEL_PATH`) is loaded at startup with the section 1 rules, each with its own `<name>.json` card. A refused model never stops the others. `MODEL_PATH` is loaded even when it lies outside the folder; a second file with the same stem is skipped. The name `active_model` is reserved (refused).
+- **The active model** serves `/inspect` and `/status`: the saved choice (`<models folder>/active_model.json`), else `MODEL_PATH`, else (`MODEL_PATH` missing) the first model by name. A wanted model that is refused is **never** replaced by another: no model is served (503) and `load_error` says why. A saved choice whose file is gone, or an unreadable choice file, is ignored with a WARNING.
+- `active_model.json` (written atomically by the inspector only): `{"name", "model_version", "selected_by", "selected_at"}`.
+- `GET /api/v1/models` → `{"active": str|null, "model_loaded": bool, "load_error", "selected_by", "selected_at", "models_dir", "models": [{"name", "loaded", "active", "error", "model_version", "model_sha256", "adapter", "schema", "class_names", "threshold", "threshold_source", "run_name", "created"}]}`, models sorted by name.
+- `PUT /api/v1/models/active` with JSON `{"name": str (1–200), "selected_by": str|null}` → 200 = the listing plus `"saved": bool` (false = the folder is read-only: the switch applies until the next restart). 404 unknown model, 409 refused model, 422 invalid body. A switch changes the model for the next request; a request in flight finishes with the model it started with.
+- `/status` adds `active_model` (the active name, also when it cannot be served); `model_path` is the active model's file.
+- Switching models never rewrites a `pred.json`: each one records the `model_version` that made it.
+
 ## 4. camerapi live preview (`:8001`)
 
 The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by default**. When it is false, everything behaves exactly as today (one-shot `GrabOne` capture).
@@ -158,7 +167,12 @@ Log strings stay ASCII (Windows cp1252 consoles).
   - A `schema_version > 1` gives `state:"error"` ("unsupported").
 - `GET /api/live.mjpg` relays camerapi's stream and adds `X-Preview-Token`. Errors: 401, 404 (preview disabled), 502 (camerapi unreachable or token rejected; logged), 503 (too many viewers).
 - `GET /api/live/status` returns `{"reachable": bool, "error": str|null, ...camerapi preview status}`. camerapi 401/403 maps to `state:"auth_error"`; a 404 from an old camerapi maps to `state:"unsupported"`.
-- **Env:** `PREVIEW_TOKEN` (`""`), `PREDICTION_PENDING_TIMEOUT_S` (`60`), `PREDICTIONS_DIR` (default `DATA_ROOT/predictions`, read-only).
+- **Model chooser (dashboard v2.3.0):**
+  - `GET /api/models` always answers 200: the inspector's `GET /api/v1/models` plus `{"enabled": bool, "reachable": bool, "error": str|null}`. Unreachable, too old (404) or a bad answer → `reachable:false`, `models: []`, `error` says why; `INSPECTOR_URL` empty → `enabled:false` ("predictions are off").
+  - `PUT /api/models/active` with `{"name"}` forwards to the inspector with `selected_by` = the logged-in user's email; passes 404/409 through, 502 when the inspector is unreachable, 409 when predictions are off, 422 for an invalid body.
+  - `POST /api/captures/{id}/recheck` forwards to the receiver's `POST /api/v1/predict/{id}` (no `force`: section 6 skips a capture whose `ok` already comes from the active model) and passes its status through (202 `{"queued"}`, 404); 400 invalid id, 502 receiver unreachable.
+  - The page offers "Re-check with <model>" only when the latest capture's result is not an `ok` from the active model's `model_version`.
+- **Env:** `PREVIEW_TOKEN` (`""`), `PREDICTION_PENDING_TIMEOUT_S` (`60`), `PREDICTIONS_DIR` (default `DATA_ROOT/predictions`, read-only), `INSPECTOR_URL` (`http://localhost:8004`; empty = predictions off), `RECEIVER_URL` (`http://localhost:8002`).
 
 ## 6. Receiver prediction hook (`:8002`)
 
@@ -192,12 +206,12 @@ Log strings stay ASCII (Windows cp1252 consoles).
 
 **`deploy/docker-compose.yml`:**
 - `receiver` gets `INSPECTOR_URL: ${INSPECTOR_URL-http://inspector:8004}`. Use `-`, not `:-`, so that an empty value disables it. Also `INSPECTOR_TIMEOUT`. There is **no** `depends_on` for the inspector.
-- `dashboard` gets `PREVIEW_TOKEN: ${PREVIEW_TOKEN:-}` and `PREDICTION_PENDING_TIMEOUT_S`.
+- `dashboard` gets `PREVIEW_TOKEN: ${PREVIEW_TOKEN:-}`, `PREDICTION_PENDING_TIMEOUT_S`, `INSPECTOR_URL: ${INSPECTOR_URL-http://inspector:8004}` (same `-` rule) and `RECEIVER_URL: http://receiver:8002`.
 - New `inspector` service:
   - `build: {context: .., dockerfile: inspector/Dockerfile}`, `container_name: zander-inspector`
   - ports `127.0.0.1:8004:8004`
   - env `DATA_ROOT=/data`, `MODEL_PATH=/data/models/detector.onnx`, `REQUIRE_CARD=${INSPECTOR_REQUIRE_CARD:-true}` (production fails closed without a card), `ORT_THREADS=${INSPECTOR_ORT_THREADS:-0}`
-  - volume `${DATA_DIR:-./data}:/data:ro`
+  - volumes `${DATA_DIR:-./data}:/data:ro` and `${DATA_DIR:-./data}/models:/data/models` (read-write, only for `active_model.json`)
   - `restart: unless-stopped`
   - healthcheck: curl `/api/v1/health`
 

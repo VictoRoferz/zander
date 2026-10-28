@@ -11,9 +11,14 @@
 //             only once camerapi has a frame; "streaming" without one after
 //             NO_FRAME_GRACE_S shows "no frames" (the Windows-firewall case).
 //   * latest: /api/latest every 3 s (10 s hidden), every 750 ms while the
-//             prediction is pending or our own capture is on its way. The
-//             result panel is re-rendered only when capture/state/prediction
-//             change.
+//             prediction is pending, our own capture is on its way or a
+//             re-check runs. The result panel is re-rendered only when
+//             capture/state/prediction change.
+//   * models: /api/models every 10 s (10 s hidden). The chooser switches the
+//             inspector's active model for every following photo (PUT
+//             /api/models/active); "Re-check with <model>" asks the receiver
+//             to classify the shown capture again (POST .../recheck) and shows
+//             up only when that capture's result comes from another model.
 // The live and result panels live outside the grids, so the grid refresh
 // never touches the stream or the result.
 //
@@ -27,6 +32,8 @@ const LIVE_STATUS_MS = 5000;
 const LATEST_FAST_MS = 750;
 const LATEST_SLOW_MS = 3000;
 const AWAIT_MAX_MS = 90000;             // fast-poll for our own capture at most this long
+const MODELS_POLL_MS = 10000;
+const RECHECK_MAX_MS = 60000;           // fast-poll for a re-check result at most this long
 const MAX_CROPS = 12;
 const CROP_MIN_SIDE = 96;               // photo px
 const CROP_BOX_FACTOR = 3;              // crop side = max(96, 3 x the box's longer side)
@@ -790,7 +797,7 @@ function renderCrops(url, frame, dets) {
 function renderMeta(pred) {
   const parts = [];
   if (pred && pred.schema_version === 1) {
-    if (pred.model_version) parts.push(String(pred.model_version));
+    if (pred.model_version) parts.push(`model ${pred.model_version}`);
     if (isNum(pred.threshold)) {
       parts.push(`t=${pred.threshold.toFixed(3)}${pred.threshold_source ? ` (${pred.threshold_source})` : ""}`);
     }
@@ -826,12 +833,15 @@ function renderAwaitingNote(data) {
 
 async function pollLatest() {
   const data = await apiGet("/api/latest");
+  latestData = data;
   const key = latestKeyOf(data);
   if (key !== latestKey) {
     latestKey = key;
     renderResult(data);
   }
   renderAwaitingNote(data);
+  updateRechecking(data);
+  renderRecheck();
   return data;
 }
 
@@ -842,8 +852,176 @@ function latestDelay(data) {
     if (done || Date.now() - awaiting.since > AWAIT_MAX_MS) awaiting = null;
   }
   if (document.hidden) return HIDDEN_POLL_MS;
-  if (awaiting || (data && data.state === "pending")) return LATEST_FAST_MS;
+  if (awaiting || rechecking || (data && data.state === "pending")) return LATEST_FAST_MS;
   return LATEST_SLOW_MS;
+}
+
+// ---- Model chooser -----------------------------------------------------------------
+
+let models = null;        // the last /api/models answer
+let modelsKey = null;
+let latestData = null;    // the last /api/latest answer (the re-check button needs it)
+let rechecking = null;    // { id, version, name, since } after a Re-check click
+let modelNoteTimer = null;
+
+function modelList(data) {
+  return data && Array.isArray(data.models)
+    ? data.models.filter((m) => m && typeof m.name === "string")
+    : [];
+}
+
+function activeModel() {
+  return modelList(models).find((m) => m.active && m.loaded) || null;
+}
+
+function modelLabel(m) {
+  return m.run_name && m.run_name !== m.name ? `${m.name} (${m.run_name})` : m.name;
+}
+
+function setModelNote(text, clearAfterMs) {
+  $("model-note").textContent = text;
+  clearTimeout(modelNoteTimer);
+  if (clearAfterMs) modelNoteTimer = setTimeout(() => { $("model-note").textContent = ""; }, clearAfterMs);
+}
+
+function renderModels(data) {
+  const list = modelList(data);
+  const options = [];
+  if (!list.length) {
+    let text = "no model";
+    if (data && data.enabled === false) text = "predictions off";
+    else if (data && data.reachable === false) text = "inspector unreachable";
+    options.push(el("option", { value: "" }, text));
+  }
+  for (const m of list) {
+    const tip = [];
+    if (m.model_version) tip.push(String(m.model_version));
+    if (isNum(m.threshold)) tip.push(`t=${m.threshold.toFixed(3)}`);
+    if (m.error) tip.push(truncate(m.error, 200));
+    options.push(el("option", {
+      value: m.name,
+      title: tip.join(" · "),
+      disabled: m.loaded ? null : "",
+      selected: m.active ? "" : null,
+    }, m.loaded ? modelLabel(m) : `${modelLabel(m)} (cannot load)`));
+  }
+  const select = $("model-select");
+  select.replaceChildren(...options);
+  select.disabled = !list.some((m) => m.loaded);
+  select.title = data && data.error
+    ? String(data.error)
+    : "The model that checks every new photo (for everyone using this station)";
+}
+
+function applyModels(data) {
+  models = data;
+  const key = JSON.stringify([
+    data && data.enabled, data && data.reachable, data && data.error,
+    modelList(data).map((m) => [m.name, m.loaded, m.active, m.model_version, m.error]),
+  ]);
+  if (key !== modelsKey) {
+    modelsKey = key;
+    renderModels(data);
+  }
+  renderRecheck();
+}
+
+async function pollModels() {
+  const data = await apiGet("/api/models");
+  applyModels(data);
+  return data;
+}
+
+// Shown when the latest capture has no result from the active model yet.
+function renderRecheck() {
+  const btn = $("recheck-btn");
+  const cap = latestData && latestData.capture;
+  const pred = latestData && latestData.prediction;
+  const state = latestData && latestData.state;
+  const active = activeModel();
+  const show = Boolean(cap && active && state !== "pending"
+    && !(state === "ok" && pred && pred.model_version === active.model_version));
+  btn.hidden = !show;
+  btn.disabled = Boolean(rechecking);
+  if (show) btn.textContent = `Re-check with ${active.name}`;
+}
+
+function updateRechecking(data) {
+  if (!rechecking) return;
+  const cap = data && data.capture;
+  const pred = data && data.prediction;
+  const name = rechecking.name;
+  if (!cap || cap.capture_id !== rechecking.id) {
+    rechecking = null;   // a newer capture took its place
+    setModelNote("");
+  } else if (pred && pred.model_version === rechecking.version) {
+    rechecking = null;
+    setModelNote(`Re-checked with ${name}.`, 5000);
+  } else if (Date.now() - rechecking.since > RECHECK_MAX_MS) {
+    rechecking = null;
+    setModelNote(`No result from ${name} yet (see the receiver log).`, 8000);
+  }
+}
+
+async function postJson(url, method, body) {
+  const resp = await fetch(url, {
+    method,
+    credentials: "same-origin",
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (resp.status === 401) {
+    redirectToLogin();
+    throw new AuthError("session expired");
+  }
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (_) {
+    data = null;
+  }
+  if (!resp.ok) throw new Error(errorDetail(data) || `HTTP ${resp.status}`);
+  return data;
+}
+
+async function onModelChange() {
+  const select = $("model-select");
+  const name = select.value;
+  if (!name) return;
+  select.disabled = true;
+  setModelNote(`Switching to ${name}…`);
+  try {
+    const data = await postJson("/api/models/active", "PUT", { name });
+    modelsKey = null;   // render the answer even if it looks unchanged
+    applyModels(data);
+    const unsaved = data && data.saved === false ? " Not saved: it resets when the inspector restarts." : "";
+    setModelNote(`New photos are checked by ${name}.${unsaved}`, 8000);
+  } catch (e) {
+    if (e instanceof AuthError) return;
+    setModelNote(`Switch failed: ${e.message}`, 8000);
+    modelsKey = null;   // put the real active model back into the chooser
+    applyModels(models);
+    modelsPoller.run();
+  }
+}
+
+async function onRecheck() {
+  const cap = latestData && latestData.capture;
+  const active = activeModel();
+  if (!cap || !active) return;
+  rechecking = { id: cap.capture_id, version: active.model_version, name: active.name, since: Date.now() };
+  renderRecheck();
+  try {
+    const data = await postJson(`/api/captures/${encodeURIComponent(cap.capture_id)}/recheck`, "POST");
+    setModelNote(data && data.queued === false
+      ? `Already queued, or predictions are off (waiting for ${active.name}…)`
+      : `Re-checking with ${active.name}…`);
+    latestPoller.run();
+  } catch (e) {
+    rechecking = null;
+    if (!(e instanceof AuthError)) setModelNote(`Re-check failed: ${e.message}`, 8000);
+    renderRecheck();
+  }
 }
 
 // ---- Capture button --------------------------------------------------------------------
@@ -899,6 +1077,7 @@ async function triggerCapture() {
 const gridPoller = makePoller(refreshGrids, () => (document.hidden ? HIDDEN_POLL_MS : GRID_POLL_MS));
 const livePoller = makePoller(pollLiveStatus, () => (document.hidden ? HIDDEN_POLL_MS : LIVE_STATUS_MS));
 const latestPoller = makePoller(pollLatest, latestDelay);
+const modelsPoller = makePoller(pollModels, () => (document.hidden ? HIDDEN_POLL_MS : MODELS_POLL_MS));
 
 function onVisibilityChange() {
   if (document.hidden) {
@@ -909,6 +1088,7 @@ function onVisibilityChange() {
   livePoller.run();
   latestPoller.run();
   gridPoller.run();
+  modelsPoller.run();
 }
 
 function init() {
@@ -920,9 +1100,12 @@ function init() {
   img.addEventListener("error", onLiveError);
   document.addEventListener("visibilitychange", onVisibilityChange);
   window.addEventListener("pagehide", detachStream);
+  $("model-select").addEventListener("change", onModelChange);
+  $("recheck-btn").addEventListener("click", onRecheck);
   gridPoller.run();
   livePoller.run();
   latestPoller.run();
+  modelsPoller.run();
 }
 
 init();

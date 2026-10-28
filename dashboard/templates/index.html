@@ -56,6 +56,14 @@
         <span id="result-capture" class="muted small"></span>
         <span id="result-note" class="muted small"></span>
       </div>
+      <div class="result-tools">
+        <label class="small" for="model-select">Model</label>
+        <select id="model-select" class="model-select" disabled>
+          <option value="">checking…</option>
+        </select>
+        <button id="recheck-btn" class="button" type="button" hidden>Re-check with this model</button>
+        <span id="model-note" class="muted small" aria-live="polite"></span>
+      </div>
       <p id="result-message" class="result-message" aria-live="polite"></p>
       <div id="result-figure" class="result-figure"></div>
       <div id="result-crops" class="crops"></div>
