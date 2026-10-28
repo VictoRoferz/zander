@@ -119,7 +119,7 @@ class LiveMode:
             self.changed_by, self.changed_at = changed_by, _utc_now()
             logger.info(
                 f"Live preview switched {'ON' if enabled else 'off'} "
-                f"(by {changed_by or 'unknown'})"
+                f"(by {changed_by!a})"  # ASCII: Windows cp1252 consoles
             )
             return self._save()
 
