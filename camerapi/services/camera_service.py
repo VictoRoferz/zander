@@ -50,6 +50,9 @@ ONE_SHOT_GRAB_TIMEOUT_MS = 30000
 # Transport profiles: pylon node values tuned per network medium.
 # Ethernet: full throughput, no spacing, small retransmit window.
 # WiFi: throttled, large inter-packet delay, generous resends.
+# The GigE stream grabber takes PacketTimeout and FrameRetention in
+# MILLISECONDS (Basler defaults 40 / 200). The values below were once written
+# as if they were microseconds, so most are 1000x what their name suggests.
 ETHERNET_PROFILE: dict[str, Any] = {
     "label": "ethernet",
     "packet_size": 1500,           # standard MTU; raise to 9000 with jumbo frames
@@ -58,8 +61,11 @@ ETHERNET_PROFILE: dict[str, Any] = {
     "max_num_buffer": 16,
     "stream_grabber": {
         "EnableResend": True,
-        "PacketTimeout": 20000,    # 20 ms
-        "FrameRetention": 200000,  # 200 ms
+        "PacketTimeout": 20000,    # 20 s: meant as 20 ms; untested on site, left as is
+        # 1 s: the value set and used on the station (Oct 2026). The old
+        # 200000 (200 s) never failed an incomplete frame within the 30 s
+        # GrabOne budget.
+        "FrameRetention": 1000,
         "MaxNumResendsPerBuffer": 5,
     },
 }
@@ -71,8 +77,8 @@ WIFI_PROFILE: dict[str, Any] = {
     "max_num_buffer": 64,
     "stream_grabber": {
         "EnableResend": True,
-        "PacketTimeout": 100000,    # 100 ms
-        "FrameRetention": 5000000,  # 5 s
+        "PacketTimeout": 100000,    # 100 s (meant as 100 ms); Pi-era profile
+        "FrameRetention": 5000000,  # 83 min (meant as 5 s); Pi-era profile
         "MaxNumResendsPerBuffer": 500,
     },
 }
