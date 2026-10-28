@@ -10,6 +10,8 @@ labeled-cache lock (docs/CONTRACTS.md sections 2, 4 and 5).
   error mapping, and the upstream is closed when the browser disconnects
   (real uvicorn server, raw socket).
 - The Label Studio cache makes one LS call for concurrent pollers.
+- The live view switch (POST /api/live/mode) against the mocked camerapi:
+  token + user forwarded, body validated, 401/404/unreachable -> 502.
 - The model chooser against a mocked inspector + receiver: /api/models
   (listing, unreachable, too old, predictions off), PUT /api/models/active
   (forwards the user, maps 404/409/502, validates the body) and
@@ -180,11 +182,19 @@ class FakeCamerapi:
         self.forever = False
         self.requests = []
         self.streams = []
+        self.mode_code = 200
 
     async def handler(self, request):
         self.requests.append(request)
         if request.url.path == "/api/v1/preview/status":
             return httpx.Response(self.status_code, json=self.status_body)
+        if request.url.path == "/api/v1/preview/mode" and request.method == "POST":
+            if self.mode_code != 200:
+                return httpx.Response(self.mode_code, json={"detail": "nope"})
+            enabled = json.loads(request.content)["enabled"]
+            body = {**self.status_body, "enabled": enabled,
+                    "state": "idle" if enabled else "disabled", "saved": True}
+            return httpx.Response(200, json=body)
         if request.url.path == "/api/v1/preview/stream.mjpg":
             if self.stream_code != 200:
                 return httpx.Response(self.stream_code, json={"detail": "nope"})
@@ -549,7 +559,8 @@ def test_home_page_panels_outside_the_grids():
         html = r.text
         for element_id in ("live-img", "live-overlay", "live-status", "result-verdict",
                            "result-figure", "result-crops", "result-meta", "result-message",
-                           "capture-btn", "model-select", "recheck-btn", "model-note"):
+                           "capture-btn", "model-select", "recheck-btn", "model-note",
+                           "live-toggle"):
             assert f'id="{element_id}"' in html, element_id
         assert html.index('class="live-row"') < html.index('id="grid-unlabeled"')
         assert '<div class="grid" id="grid-unlabeled"></div>' in html
@@ -816,6 +827,37 @@ def test_http_recheck_forwards_to_the_receiver():
         assert r.status_code == 502 and "receiver unreachable" in r.json()["detail"], r.text
 
 
+def test_http_live_mode_switch_forwards_the_token_and_the_user():
+    fake = FakeCamerapi()
+    original = dash.PREVIEW_TOKEN
+    try:
+        with client(fake) as c:
+            dash.PREVIEW_TOKEN = "s3cret"
+            assert c.post("/api/live/mode", json={"enabled": False}).status_code == 401
+            n = len(fake.requests)
+            for bad in ({"enabled": "yes"}, {}, {"enabled": 1}):
+                assert c.post("/api/live/mode", json=bad, headers=AUTH).status_code == 422, bad
+            assert len(fake.requests) == n, "an invalid body never reaches camerapi"
+            r = c.post("/api/live/mode", json={"enabled": False}, headers=AUTH)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["enabled"] is False and body["state"] == "disabled" and body["saved"] is True
+            assert body["reachable"] is True and body["error"] is None
+            sent = fake.requests[-1]
+            assert sent.method == "POST" and sent.url.path == "/api/v1/preview/mode"
+            assert sent.headers["x-preview-token"] == "s3cret"
+            assert json.loads(sent.content) == {"enabled": False, "changed_by": "tester@example.com"}
+            for code, words in ((401, "PREVIEW_TOKEN"), (403, "PREVIEW_TOKEN"), (404, "3.3.0"), (500, "HTTP 500")):
+                fake.mode_code = code
+                r = c.post("/api/live/mode", json={"enabled": True}, headers=AUTH)
+                assert r.status_code == 502 and words in r.json()["detail"], (code, r.text)
+        with client() as c:  # camerapi unreachable
+            r = c.post("/api/live/mode", json={"enabled": True}, headers=AUTH)
+            assert r.status_code == 502 and "unreachable" in r.json()["detail"], r.text
+    finally:
+        dash.PREVIEW_TOKEN = original
+
+
 TESTS = [
     test_newest_capture_by_mtime,
     test_newest_capture_is_cached_on_directory_mtime,
@@ -849,6 +891,7 @@ TESTS = [
     test_http_models_listing_and_unavailable_cases,
     test_http_switch_model_forwards_the_user_and_maps_errors,
     test_http_recheck_forwards_to_the_receiver,
+    test_http_live_mode_switch_forwards_the_token_and_the_user,
 ]
 
 

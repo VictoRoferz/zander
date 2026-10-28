@@ -4,10 +4,13 @@ Live preview endpoints (docs/CONTRACTS.md section 4).
   GET /api/v1/preview/stream.mjpg   multipart/x-mixed-replace MJPEG stream
   GET /api/v1/preview/frame.jpg     one fresh preview JPEG
   GET /api/v1/preview/status        live camera state (200 even when disabled)
+  POST /api/v1/preview/mode         switch the preview on/off at runtime
+                                    ({"enabled": bool, "changed_by"?}; saved)
 
-All three sit behind require_preview_access. Production sets PREVIEW_TOKEN
+All of them sit behind require_preview_access. Production sets PREVIEW_TOKEN
 and the dashboard relays the stream with X-Preview-Token, so the browser never
-sees the token. Stream and frame answer 404 while LIVE_PREVIEW_ENABLED=false.
+sees the token. Stream and frame answer 404 while the preview is off
+(services/live_mode.py: LIVE_PREVIEW_ENABLED is only the startup default).
 
 The handlers only read what the camera-owner thread published (one JPEG per
 frame, shared by all viewers); they never touch the camera.
@@ -23,6 +26,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field, StrictBool
 
 from config.settings import settings
 from services.live_camera import (
@@ -33,6 +37,7 @@ from services.live_camera import (
     live_camera,
     placeholder_jpeg,
 )
+from services.live_mode import live_mode
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__, level=settings.log_level)
@@ -119,9 +124,9 @@ router = APIRouter(
 
 
 def _require_enabled() -> None:
-    if not settings.live_preview_enabled:
+    if not live_mode.enabled:
         raise HTTPException(
-            status_code=404, detail="live preview disabled (LIVE_PREVIEW_ENABLED=false)"
+            status_code=404, detail="live preview is off (switch it on in the dashboard)"
         )
 
 
@@ -249,6 +254,26 @@ async def preview_frame() -> Response:
 
 @router.get("/status")
 def preview_status() -> dict:
-    if not settings.live_preview_enabled:
+    if not live_mode.enabled:
         return live_camera.disabled_status()
     return live_camera.status()
+
+
+# ---- Runtime switch ---------------------------------------------------------------
+
+
+class ModeRequest(BaseModel):
+    enabled: StrictBool
+    changed_by: Optional[str] = Field(default=None, max_length=320)
+
+
+@router.post("/mode")
+def set_mode(body: ModeRequest) -> dict:
+    """
+    Turn the live preview on or off now (and keep it after a restart).
+    Plain `def`: it waits for a capture in progress and for the owner
+    thread to stop, so it runs in the threadpool. Answers the new
+    preview status plus "saved" (false = the choice lasts until restart).
+    """
+    saved = live_mode.set(body.enabled, body.changed_by)
+    return {**preview_status(), "saved": saved}

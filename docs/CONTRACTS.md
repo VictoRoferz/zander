@@ -112,7 +112,7 @@ Written by `cli.py export`, read by the inspector. Both go through **`ml/infer/d
 
 ## 4. camerapi live preview (`:8001`)
 
-The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by default**. When it is false, everything behaves exactly as today (one-shot `GrabOne` capture).
+`LIVE_PREVIEW_ENABLED` (**false by default**) is the preview's state at the first start. Since camerapi 3.3.0 the dashboard switches it at runtime (`POST /api/v1/preview/mode`), and the choice is saved in camerapi's `DATA_ROOT/live_preview.json` (`{"enabled", "changed_by", "changed_at"}`, atomic write), which wins over `LIVE_PREVIEW_ENABLED` at the next start; a missing or unreadable file means `LIVE_PREVIEW_ENABLED`. While the preview is off, everything behaves as before the preview existed (one-shot `GrabOne` capture).
 
 **Endpoints (all behind the access rule below):**
 - `GET /api/v1/preview/stream.mjpg`
@@ -120,12 +120,14 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
   - Each part: `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: N\r\n\r\n<jpeg>\r\n`.
   - The last frame, or a placeholder, is re-sent at least every 2 s.
 - `GET /api/v1/preview/frame.jpg`: one fresh preview JPEG. Waits up to 3 s and starts the stream if it is idle. `Cache-Control: no-store`.
-- `GET /api/v1/preview/status`: returns `enabled, state, source, camera_model, camera_serial, profile, fps_target, fps_measured, clients, frame_seq, last_frame_age_s, stream_age_s, frames_incomplete, reconnects, last_error, preview_width, preview_height, boot_id`.
+- `GET /api/v1/preview/status`: returns `enabled, state, source, camera_model, camera_serial, profile, fps_target, fps_measured, clients, frame_seq, last_frame_age_s, stream_age_s, frames_incomplete, reconnects, one_shot_captures, last_error, preview_width, preview_height, boot_id`.
+  - `one_shot_captures`: photos the one-shot path took after the live grabs came back incomplete (see Capture semantics).
   - `state` is one of `disabled`, `starting`, `idle`, `streaming`, `reconnecting`, `unavailable` (Wi-Fi profile), `stopped`.
   - `stream_age_s`: seconds since the running stream started; null unless `state` is `streaming`. `streaming` with `last_frame_age_s: null` and a growing `stream_age_s` = no frame ever arrived (e.g. the Windows firewall drops the camera's UDP stream); the dashboard shows "no frames" after 5 s instead of LIVE.
   - When disabled it returns 200 with `enabled:false`.
 - Stream and frame return 404 when the preview is disabled, and 503 when `PREVIEW_MAX_CLIENTS` is reached.
-- `GET /api/v1/status` gains a `live` block with the same fields as preview status.
+- `POST /api/v1/preview/mode` with JSON `{"enabled": bool (strict), "changed_by": str|null}` turns the preview on or off now and saves the choice. It waits for a capture in progress. Answers 200 = the new preview status plus `"saved": bool` (false = the file could not be written: the switch applies until camerapi restarts); 422 invalid body.
+- `GET /api/v1/status` gains a `live` block with the same fields as preview status, and `live_mode`: `{"enabled", "default" (LIVE_PREVIEW_ENABLED), "origin": "env"|"saved"|"switch", "changed_by", "changed_at"}`.
 
 **Access rule.** A request is allowed if:
 - `PREVIEW_TOKEN` is set and the `X-Preview-Token` header equals it (`hmac.compare_digest`); or
@@ -133,13 +135,13 @@ The preview is switched on with `LIVE_PREVIEW_ENABLED`, which is **false by defa
 
 Otherwise the answer is 401 (token missing or wrong) or 403 (not local and no token configured). Additionally, with an empty token a request whose `Origin` names a non-local host gets 403 (camerapi allows CORS from `*`, so without this any web page open on the PC could read the camera with `fetch()`). Production uses the token, because Docker→host traffic is not guaranteed to arrive as loopback. The browser never sees the token: the dashboard proxies the stream.
 
-**Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`. On the Wi-Fi profile (state `unavailable`, a full frame takes ~8 s) a capture makes **one** `GrabOne` of 30 s, as the one-shot path does, instead of 3 × `LIVE_GRAB_TIMEOUT_MS`, and the caller waits at least 35 s instead of `LIVE_CAPTURE_TIMEOUT_S` (still below the keypad's 40 s request timeout).
+**Capture semantics.** `POST /api/v1/capture` keeps its contract (202, the same `CaptureResult`). With the preview on, the camera-owner thread stops the stream and does a `GrabOne`, so the capture is the **first frame after the trigger**. It then resumes streaming. **If the live grabs come back incomplete** (at least one image arrived, but not whole), the photo is retaken with the one-shot path: the owner thread stops and closes the camera, `camera_service` grabs exactly as with the preview off (3 × 30 s attempts), releases its handle, and the owner starts again; the preview has a gap of a few seconds. Live grabs that only **timed out** are not handed over (no image arrives at all; a 30 s one-shot grab on top would break the keypad's 40 s budget). Captures and switches are serialized (`live_mode.lock`), so the camera always has exactly one owner. During an outage the capture falls back to `sample.jpg`, as today, and the response reports `source:"fallback"`. On the Wi-Fi profile (state `unavailable`, a full frame takes ~8 s) a capture makes **one** `GrabOne` of 30 s, as the one-shot path does, instead of 3 × `LIVE_GRAB_TIMEOUT_MS`, and the caller waits at least 35 s instead of `LIVE_CAPTURE_TIMEOUT_S` (still below the keypad's 40 s request timeout).
 
 **Env vars:**
 
 | var | default |
 |---|---|
-| `LIVE_PREVIEW_ENABLED` | `false` |
+| `LIVE_PREVIEW_ENABLED` | `false` (the default until the dashboard switch saved a choice) |
 | `PREVIEW_TOKEN` | `""` |
 | `PREVIEW_FPS` | `5` |
 | `PREVIEW_MAX_WIDTH` | `1280` |
@@ -167,6 +169,7 @@ Log strings stay ASCII (Windows cp1252 consoles).
   - A `schema_version > 1` gives `state:"error"` ("unsupported").
 - `GET /api/live.mjpg` relays camerapi's stream and adds `X-Preview-Token`. Errors: 401, 404 (preview disabled), 502 (camerapi unreachable or token rejected; logged), 503 (too many viewers).
 - `GET /api/live/status` returns `{"reachable": bool, "error": str|null, ...camerapi preview status}`. camerapi 401/403 maps to `state:"auth_error"`; a 404 from an old camerapi maps to `state:"unsupported"`.
+- `POST /api/live/mode` with `{"enabled": bool (strict)}` (dashboard v2.4.0) forwards to camerapi's `POST /api/v1/preview/mode` with the token and `changed_by` = the logged-in user, timeout 60 s (camerapi waits for a capture in progress). 200 = camerapi's answer plus `reachable:true, error:null`; 502 when camerapi is unreachable, refuses the token (401/403), is too old (404) or fails; 422 invalid body. The page shows "Turn live view off/on" once the status says `enabled` true/false.
 - **Model chooser (dashboard v2.3.0):**
   - `GET /api/models` always answers 200: the inspector's `GET /api/v1/models` plus `{"enabled": bool, "reachable": bool, "error": str|null}`. Unreachable, too old (404) or a bad answer → `reachable:false`, `models: []`, `error` says why; `INSPECTOR_URL` empty → `enabled:false` ("predictions are off").
   - `PUT /api/models/active` with `{"name"}` forwards to the inspector with `selected_by` = the logged-in user's email; passes 404/409 through, 502 when the inspector is unreachable, 409 when predictions are off, 422 for an invalid body.

@@ -13,7 +13,8 @@ Triggers:
 The camera routes are plain `def` on purpose: FastAPI runs them in the
 threadpool, so a slow grab (up to 3 x 30 s) never blocks the event loop and
 the live preview stream keeps flowing. Who talks to the camera depends on
-LIVE_PREVIEW_ENABLED (see _provider).
+whether the live preview is on right now (services/live_mode.py, see
+_provider); a capture holds live_mode.lock, so a switch never happens mid-grab.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from config.settings import settings
 from models.schemas import CaptureResult, StepResult
 from services.camera_service import camera_service
 from services.live_camera import live_camera
+from services.live_mode import live_mode
 from services.spool_uploader import spool_uploader
 from services.storage_service import new_capture_id, storage_service
 from utils.logger import setup_logger
@@ -38,11 +40,18 @@ router = APIRouter(prefix="/api/v1", tags=["camera"])
 def _provider() -> Any:
     """
     The camera for this request. Preview on: the camera-owner thread (the
-    only code that may touch pylon then). Preview off: the one-shot GrabOne
-    path, exactly as before. Both return (frame, source_info) and fall back
-    to sample.jpg the same way.
+    only code that may touch pylon then; it hands incomplete grabs to the
+    one-shot path). Preview off: the one-shot GrabOne path. Both return
+    (frame, source_info) and fall back to sample.jpg the same way. Call it
+    with live_mode.lock held (see _grab).
     """
-    return live_camera if settings.live_preview_enabled else camera_service
+    return live_camera if live_mode.enabled else camera_service
+
+
+def _grab() -> tuple[Any, dict]:
+    """One photo from whoever owns the camera; no preview switch meanwhile."""
+    with live_mode.lock:
+        return _provider().capture_frame()
 
 
 def _ask_dashboard_for_current_user() -> Optional[str]:
@@ -91,7 +100,7 @@ def capture(
 
     # ---- Step 1: camera (fatal on failure) -----------------------------
     try:
-        frame, source_info = _provider().capture_frame()
+        frame, source_info = _grab()
     except Exception as e:
         logger.error(f"[{capture_id}] Camera capture failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"camera capture failed: {e}")
@@ -130,7 +139,7 @@ def capture(
 @router.get("/status")
 def get_status() -> dict:
     """Service status — camera, live preview, spool depth, and the ingest target."""
-    live_on = settings.live_preview_enabled
+    live_on = live_mode.enabled
     return {
         "service": settings.service_name,
         "version": settings.service_version,
@@ -138,6 +147,7 @@ def get_status() -> dict:
         # its view instead of enumerating devices here.
         "camera": live_camera.camera_status() if live_on else camera_service.get_status(),
         "live": live_camera.status() if live_on else live_camera.disabled_status(),
+        "live_mode": live_mode.info(),
         "ingest": {
             "url": settings.ingest_url,
             "endpoint": settings.ingest_endpoint,
@@ -166,7 +176,7 @@ def test_camera() -> dict:
     capture_id = new_capture_id()
     logger.info(f"Camera test: capture_id={capture_id}")
     try:
-        frame, source_info = _provider().capture_frame()
+        frame, source_info = _grab()
         image_path, size_bytes, width, height = storage_service.save_test(
             frame, capture_id
         )

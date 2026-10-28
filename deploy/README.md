@@ -123,9 +123,12 @@ camerapi live preview (opt-in) ──token──▶ dashboard /api/live.mjpg ─
     `camerapi\.env` → `PREVIEW_TOKEN=`. In `camerapi\.env` also set
     `LIVE_PREVIEW_ENABLED=true`. Then `docker compose up -d` and restart the camera
     stack (`stop-zander.bat`, `start-zander.bat`). The dashboard's live panel shows the
-    camera at ~5 fps (`PREVIEW_FPS`). With the flag off (default) captures work exactly
-    as before; with it on, a capture briefly stops the stream and grabs the first frame
-    after the key press.
+    camera at ~5 fps (`PREVIEW_FPS`). With the preview off captures work exactly as
+    before; with it on, a capture briefly stops the stream and grabs the first frame
+    after the key press, and a grab that comes back incomplete is retaken the one-shot
+    way. **Turn live view off/on** in the live panel switches it while running (no
+    restart, kept across restarts); it needs the same `PREVIEW_TOKEN` as the stream.
+    `LIVE_PREVIEW_ENABLED` then only matters until the button is first used.
 
 ---
 

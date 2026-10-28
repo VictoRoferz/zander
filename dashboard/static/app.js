@@ -5,7 +5,9 @@
 //             the tab is hidden). A grid is rebuilt only when its data changed.
 //   * live:   /api/live/status every 5 s (10 s hidden). #live-img shows the
 //             login-protected MJPEG relay /api/live.mjpg only while camerapi
-//             reports the preview enabled and reachable. The stream is dropped
+//             reports the preview enabled and reachable. #live-toggle turns
+//             the preview on/off at runtime (POST /api/live/mode); photos
+//             work either way. The stream is dropped
 //             while the tab is hidden: it holds one of the browser's ~6
 //             connections per host for as long as it runs. The chip says LIVE
 //             only once camerapi has a frame; "streaming" without one after
@@ -260,6 +262,8 @@ const live = {
   connectTimer: null,
   noFramesShown: false, // the overlay currently shows the no-frames message
   prevIncomplete: null, // {bootId, count} from the last status (old camerapi fallback)
+  lastStatus: null,     // the last /api/live/status answer (the toggle needs it)
+  switching: false,     // a live view switch is on its way
 };
 
 // Frames stopped after the stream had delivered some.
@@ -323,7 +327,7 @@ function blockerMessage(s, stalled) {
       break;
   }
   if (s.enabled !== true || s.state === "disabled") {
-    return { title: "Live preview is off", detail: "Enable it with LIVE_PREVIEW_ENABLED=true in camerapi's .env." };
+    return { title: "Live view is off", detail: "Photos still work. Turn it on with the button above." };
   }
   if (stalled) {
     return {
@@ -429,7 +433,44 @@ function onLiveError() {
   setTimeout(() => livePoller.run(), delay + 50);
 }
 
+// Shown once camerapi said whether the preview is on (not while it refuses us).
+function renderLiveToggle() {
+  const s = live.lastStatus;
+  const btn = $("live-toggle");
+  const known = Boolean(s && s.reachable) && typeof s.enabled === "boolean";
+  btn.hidden = !known;
+  btn.disabled = live.switching;
+  if (!known) return;
+  if (live.switching) btn.textContent = "Switching…";
+  else btn.textContent = s.enabled ? "Turn live view off" : "Turn live view on";
+}
+
+async function onLiveToggle() {
+  const s = live.lastStatus;
+  if (live.switching || !s || typeof s.enabled !== "boolean") return;
+  const want = !s.enabled;
+  live.switching = true;
+  renderLiveToggle();
+  try {
+    const answer = await postJson("/api/live/mode", "POST", { enabled: want });
+    live.lastStatus = { ...answer, reachable: true };
+  } catch (e) {
+    if (e instanceof AuthError) return;
+    // The status line, not the overlay: the next live poll redraws that at once.
+    const statusEl = $("capture-status");
+    statusEl.textContent = `Live view switch failed: ${e.message}`;
+    clearTimeout(captureStatusTimer);
+    captureStatusTimer = setTimeout(() => { statusEl.textContent = ""; }, 8000);
+  } finally {
+    live.switching = false;
+    renderLiveToggle();
+    livePoller.run();
+  }
+}
+
 function applyLiveStatus(s) {
+  live.lastStatus = s;
+  renderLiveToggle();
   const stalled = isStalled(s);
   const noFrames = noFramesYet(s);   // before prevIncomplete is updated
   live.prevIncomplete = isNum(s.frames_incomplete) && s.boot_id
@@ -1095,6 +1136,7 @@ function init() {
   $("capture-btn").addEventListener("click", triggerCapture);
   const liveCaptureBtn = $("live-capture-btn");
   if (liveCaptureBtn) liveCaptureBtn.addEventListener("click", triggerCapture);
+  $("live-toggle").addEventListener("click", onLiveToggle);
   const img = $("live-img");
   img.addEventListener("load", onLiveLoad);
   img.addEventListener("error", onLiveError);

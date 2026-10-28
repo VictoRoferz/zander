@@ -1,5 +1,6 @@
 """
-Live camera owner for camerapi (only used when LIVE_PREVIEW_ENABLED=true).
+Live camera owner for camerapi (only used while the live preview is on: see
+services/live_mode.py, which starts and stops it at runtime).
 
 With the preview on, ONE daemon thread ("camera-owner") is the only code that
 touches pylon. It:
@@ -11,13 +12,19 @@ touches pylon. It:
   - serves every capture by stopping the stream and calling GrabOne, so the
     capture is the first frame exposed after the trigger, never a buffered
     preview frame; the stream then resumes;
+  - hands a capture whose live grabs came back INCOMPLETE to the one-shot
+    path (the owner thread stops and closes the camera, camera_service grabs
+    the photo exactly as with the preview off, then the owner starts again),
+    so the preview never costs a photo. Timeouts are not handed over: the
+    stream is not arriving at all, and a 30 s one-shot grab on top would
+    break the keypad's 40 s request budget;
   - reconnects with exponential backoff when the camera goes away.
 
 Other threads use the thread-safe API: capture_frame() (same return shape and
 sample.jpg fallback semantics as CameraService.capture_frame), add_client() /
 remove_client(), latest_preview(), status(). The contract lives in
-docs/CONTRACTS.md section 4. With LIVE_PREVIEW_ENABLED=false nothing here
-runs; captures use the one-shot path in camera_service.py.
+docs/CONTRACTS.md section 4. With the preview off nothing here runs;
+captures use the one-shot path in camera_service.py.
 """
 from __future__ import annotations
 
@@ -65,7 +72,15 @@ class SourceLost(Exception):
 
 
 class GrabFailed(RuntimeError):
-    """A capture grab failed but the camera is still there (no reconnect)."""
+    """A capture grab failed but the camera is still there (no reconnect).
+
+    timed_out: every attempt timed out (no image arrived at all). False means
+    at least one image came back incomplete, which the one-shot path may still
+    grab cleanly (see LiveCamera._one_shot_capture)."""
+
+    def __init__(self, message: str, timed_out: bool = False) -> None:
+        super().__init__(message)
+        self.timed_out = timed_out
 
 
 class TooManyClients(Exception):
@@ -313,6 +328,7 @@ class BaslerSource:
         # the first frame after the trigger.
         self.stop_stream()
         last_error: Optional[str] = None
+        incomplete = False  # an image arrived, but not all of it
         for attempt in range(1, attempts + 1):
             result = None
             try:
@@ -322,6 +338,7 @@ class BaslerSource:
                     if attempt > 1:
                         logger.info(f"Live GrabOne succeeded on attempt {attempt}")
                     return frame, _source_info("basler", self.camera_serial, self.camera_model)
+                incomplete = True
                 last_error = str(result.ErrorDescription)
                 logger.warning(f"Live GrabOne attempt {attempt}/{attempts} failed: {last_error}")
             except pylon.TimeoutException:
@@ -337,7 +354,9 @@ class BaslerSource:
                     except Exception:
                         pass
             self._raise_if_removed()
-        raise GrabFailed(f"Basler grab failed after {attempts} attempts: {last_error}")
+        raise GrabFailed(
+            f"Basler grab failed after {attempts} attempts: {last_error}", timed_out=not incomplete
+        )
 
 
 def default_source_factory() -> Any:
@@ -425,7 +444,7 @@ def placeholder_jpeg(text: str) -> bytes:
 
 
 class _CaptureRequest:
-    __slots__ = ("done", "frame", "info", "error", "abandoned")
+    __slots__ = ("done", "frame", "info", "error", "abandoned", "one_shot")
 
     def __init__(self) -> None:
         self.done = threading.Event()
@@ -433,13 +452,21 @@ class _CaptureRequest:
         self.info: Optional[dict[str, Any]] = None
         self.error: Optional[str] = None
         self.abandoned = False
+        self.one_shot = False  # the error may be fixed by the one-shot path
 
 
 class LiveCamera:
     """Owns the camera while the live preview is enabled (see module doc)."""
 
-    def __init__(self, source_factory: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(
+        self,
+        source_factory: Optional[Callable[[], Any]] = None,
+        one_shot: Any = None,
+    ) -> None:
         self._source_factory = source_factory or default_source_factory
+        # Takes a photo the live grabs could not (capture_frame + release).
+        self._one_shot = one_shot if one_shot is not None else camera_service
+        self._one_shot_captures = 0
         self._lock = threading.Lock()   # guards _requests, _clients, _last_client_left
         self._wake = threading.Event()  # capture queued / viewer change / stop
         self._stop = threading.Event()
@@ -595,11 +622,36 @@ class LiveCamera:
                 )
                 return camera_service.load_fallback()
         if request.error is not None:
+            if request.one_shot:
+                return self._one_shot_capture(request.error)
             logger.warning(
                 f"Live camera capture failed ({request.error}); falling back to sample image"
             )
             return camera_service.load_fallback()
         return request.frame, request.info
+
+    def _one_shot_capture(self, reason: str) -> tuple[np.ndarray, dict[str, Any]]:
+        """
+        The live grabs came back incomplete: take this photo with the one-shot
+        path, exactly as with the preview off, then resume the owner. The
+        owner thread closes the camera before the one-shot path opens it, and
+        the one-shot handle is released before the owner opens it again (one
+        owner at a time). The caller holds live_mode.lock, so no switch and
+        no second capture runs meanwhile.
+        """
+        logger.warning(f"Live capture failed ({reason}); taking this photo with the one-shot path")
+        self.stop()
+        try:
+            frame, info = self._one_shot.capture_frame()  # its own retries + sample fallback
+        finally:
+            try:
+                self._one_shot.release()
+            finally:
+                self.start()
+        self._one_shot_captures += 1
+        self._last_error = f"live grab failed ({reason}); photo taken with the one-shot path"
+        logger.info(f"One-shot capture after a failed live grab: source={info.get('source')}")
+        return frame, info
 
     def _capture_wait_s(self) -> float:
         """How long a capture caller waits for the owner: LIVE_CAPTURE_TIMEOUT_S,
@@ -629,12 +681,14 @@ class LiveCamera:
         frame: Optional[np.ndarray] = None,
         info: Optional[dict[str, Any]] = None,
         error: Optional[str] = None,
+        one_shot: bool = False,
     ) -> None:
         with self._lock:
             if request.abandoned:
                 logger.warning("Capture finished after the caller gave up; result discarded")
                 return
             request.frame, request.info, request.error = frame, info, error
+            request.one_shot = one_shot
             request.done.set()
 
     def _fail_pending(self, reason: str) -> None:
@@ -670,6 +724,7 @@ class LiveCamera:
             "stream_age_s": round(now - started, 2) if streaming else None,
             "frames_incomplete": self._frames_incomplete,
             "reconnects": self._reconnects,
+            "one_shot_captures": self._one_shot_captures,
             "last_error": self._last_error,
             "preview_width": self._frame_w,
             "preview_height": self._frame_h,
@@ -677,7 +732,7 @@ class LiveCamera:
         }
 
     def disabled_status(self) -> dict[str, Any]:
-        """Same keys as status(), for LIVE_PREVIEW_ENABLED=false."""
+        """Same keys as status(), while the live preview is off."""
         return {
             "enabled": False,
             "state": "disabled",
@@ -693,6 +748,7 @@ class LiveCamera:
             "stream_age_s": None,
             "frames_incomplete": 0,
             "reconnects": 0,
+            "one_shot_captures": 0,
             "last_error": None,
             "preview_width": None,
             "preview_height": None,
@@ -881,7 +937,7 @@ class LiveCamera:
             frame, info = source.grab_fresh()
         except GrabFailed as e:
             self._last_error = f"capture failed: {e}"
-            self._finish(request, error=str(e))
+            self._finish(request, error=str(e), one_shot=not e.timed_out)
             return False
         except SourceLost as e:
             self._finish(request, error=f"camera lost: {e}")
@@ -941,6 +997,6 @@ class LiveCamera:
         self._publish(jpeg, w, h)
 
 
-# Global instance. Its thread only starts in main.lifespan, and only when
-# LIVE_PREVIEW_ENABLED=true.
+# Global instance. Its thread is started and stopped by services/live_mode.py
+# (at startup and by the dashboard's live view switch).
 live_camera = LiveCamera()

@@ -299,6 +299,7 @@ section.live-row {
 .cls-other { --c: var(--cls-other); }
 
 /* Result photo with the SVG overlay (viewBox = photo pixels) */
+.live-toggle { margin-left: auto; }
 .result-tools {
   display: flex;
   flex-wrap: wrap;

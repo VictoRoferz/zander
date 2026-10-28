@@ -272,6 +272,7 @@ class InstantCamera:
         d["destroyed"] = False
         d["fail_open"] = CONFIG.get("fail_open")
         d["grabone_timeouts"] = 0       # next N GrabOne calls raise TimeoutException
+        d["grabone_incomplete"] = 0     # next N GrabOne calls return an incomplete image
         d["grab_delay"] = 0.0           # seconds GrabOne takes
         d["retrieve_script"] = deque()  # "timeout" | "incomplete" entries for RetrieveResult
         d["MaxNumBuffer"] = 10
@@ -390,6 +391,9 @@ class InstantCamera:
         if self.grabone_timeouts > 0:
             self.__dict__["grabone_timeouts"] -= 1
             raise TimeoutException(f"GrabOne timed out after {timeout_ms} ms")
+        if self.grabone_incomplete > 0:
+            self.__dict__["grabone_incomplete"] -= 1
+            return GrabResult(frame=None, ok=False, error="The buffer was incompletely grabbed")
         if self.grab_delay:
             if self.grab_delay * 1000.0 > timeout_ms:
                 # The frame needs longer than the timeout (e.g. ~8 s over the

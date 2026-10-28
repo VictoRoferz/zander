@@ -19,7 +19,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # ---- Service identity ----
     service_name: str = "camera-service"
-    service_version: str = "3.2.0"
+    service_version: str = "3.3.0"
 
     # ---- Server ----
     host: str = "0.0.0.0"

@@ -21,7 +21,7 @@ from api.preview import close_streams
 from api.preview import router as preview_router
 from api.routes import router as camera_router
 from config.settings import settings
-from services.live_camera import live_camera
+from services.live_mode import live_mode
 from services.spool_uploader import spool_uploader
 from utils.logger import setup_logger
 
@@ -38,25 +38,14 @@ async def lifespan(app: FastAPI):
     # spool, so anything left over from a previous run is shipped on startup.
     spool_uploader.start()
 
-    if settings.live_preview_enabled:
-        logger.info(
-            "Live preview: ON (camera-owner thread; captures stop the stream "
-            "and grab a fresh frame)"
-        )
-        if not settings.preview_token:
-            logger.warning(
-                "PREVIEW_TOKEN is empty: the preview only answers loopback "
-                "requests to localhost (the Docker dashboard needs the token)"
-            )
-        live_camera.start()
-    else:
-        logger.info("Live preview: off (one-shot GrabOne per capture)")
+    # The saved dashboard choice, else LIVE_PREVIEW_ENABLED (services/live_mode.py).
+    live_mode.start()
 
     yield
 
     # Reverse order. (Open MJPEG streams were already ended by
     # _Server.shutdown below; they would otherwise hold the shutdown.)
-    live_camera.stop()  # no-op when it was never started
+    live_mode.stop()  # waits for a capture in progress; no-op when the preview is off
     spool_uploader.stop()
     logger.info(f"Shutting down {settings.service_name}")
 
@@ -87,7 +76,7 @@ async def root() -> dict:
     return {
         "service": settings.service_name,
         "version": settings.service_version,
-        "live_preview_enabled": settings.live_preview_enabled,
+        "live_preview_enabled": live_mode.enabled,
         "endpoints": {
             "capture": "POST /api/v1/capture",
             "test_camera": "POST /api/v1/test-camera",
@@ -96,6 +85,7 @@ async def root() -> dict:
             "preview_stream": "GET /api/v1/preview/stream.mjpg",
             "preview_frame": "GET /api/v1/preview/frame.jpg",
             "preview_status": "GET /api/v1/preview/status",
+            "preview_mode": "POST /api/v1/preview/mode",
             "docs": "GET /docs",
         },
     }

@@ -9,9 +9,10 @@ Priority order:
   2. OpenCV VideoCapture fallback (if pypylon missing / Basler fails)
   3. sample.jpg fallback (if camera disabled or everything fails)
 
-This is THE capture path while LIVE_PREVIEW_ENABLED=false (the default).
-With the live preview on, services/live_camera.py owns the camera instead and
-reuses this class only through a private instance (open_pylon / reset_pylon).
+This is THE capture path while the live preview is off. With the preview
+on, services/live_camera.py owns the camera instead and reuses this class
+through a private instance (open_pylon / reset_pylon); it also hands this
+singleton a capture its live grabs got back incomplete (then release()).
 
 Routes call capture_frame() from the threadpool, so the keypad and the
 dashboard can race: every camera access here is serialized by self._lock.
@@ -194,6 +195,15 @@ class CameraService:
         """
         self._init_pylon()
         return self._camera, self._converter
+
+    def release(self) -> None:
+        """
+        Close the one-shot handle so another owner may open the camera (the
+        live owner after a one-shot capture or when the preview is switched
+        on). Waits for a capture in progress; the next capture re-opens.
+        """
+        with self._lock:
+            self.reset_pylon()
 
     def reset_pylon(self) -> None:
         """

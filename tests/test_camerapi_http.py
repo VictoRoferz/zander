@@ -1,7 +1,8 @@
 """
 camerapi over HTTP (FastAPI TestClient, no camera, no network): the preview
-access rule, the 404/503 switches, and POST /api/v1/capture with the preview
-off (today's path) and on (camera-owner thread over sample.jpg).
+access rule, the 404/503 switches, POST /api/v1/capture with the preview
+off (today's path) and on (camera-owner thread over sample.jpg), and the
+runtime switch POST /api/v1/preview/mode.
 
 The TestClient is used WITHOUT `with`, so the lifespan (uploader + camera
 owner threads) does not start; tests start the owner themselves when needed.
@@ -57,12 +58,13 @@ sys.path.insert(0, str(CAMERAPI))
 import main  # noqa: E402
 from config.settings import settings  # noqa: E402
 from services.live_camera import live_camera  # noqa: E402
+from services.live_mode import live_mode  # noqa: E402
 
 AUTH = {"X-Preview-Token": TOKEN}
 STATUS_KEYS = {"enabled", "state", "source", "camera_model", "camera_serial", "profile",
                "fps_target", "fps_measured", "clients", "frame_seq", "last_frame_age_s",
-               "stream_age_s", "frames_incomplete", "reconnects", "last_error",
-               "preview_width", "preview_height", "boot_id"}
+               "stream_age_s", "frames_incomplete", "reconnects", "one_shot_captures",
+               "last_error", "preview_width", "preview_height", "boot_id"}
 
 client = TestClient(main.app)  # peer "testclient", Host "testserver"
 local = TestClient(main.app, base_url="http://localhost", client=("127.0.0.1", 50000))
@@ -70,14 +72,20 @@ local = TestClient(main.app, base_url="http://localhost", client=("127.0.0.1", 5
 
 @contextmanager
 def configured(**values):
+    """Settings for one test. live_preview_enabled also sets the runtime mode,
+    as live_mode.start() would at startup without a saved choice."""
     old = {k: getattr(settings, k) for k in values}
+    old_mode = live_mode._enabled
     for k, v in values.items():
         setattr(settings, k, v)
+    if "live_preview_enabled" in values:
+        live_mode._enabled = values["live_preview_enabled"]
     try:
         yield
     finally:
         for k, v in old.items():
             setattr(settings, k, v)
+        live_mode._enabled = old_mode
 
 
 @contextmanager
@@ -214,7 +222,8 @@ def test_flag_off_capture_is_202_and_spools():
         assert _spooled(r.json()["capture_id"])[1]["triggered_by"] == "anna@example.com"
 
         status = client.get("/api/v1/status").json()
-        assert status["version"] == "3.2.0"
+        assert status["version"] == "3.3.0"
+        assert status["live_mode"]["enabled"] is False
         assert status["live"]["enabled"] is False and set(status["live"]) == STATUS_KEYS
         assert status["camera"]["use_camera"] is False and "owner" not in status["camera"]
         assert status["spool"]["pending"] >= 2
@@ -285,6 +294,42 @@ def test_root_lists_the_preview_endpoints():
     assert body["endpoints"]["preview_stream"] == "GET /api/v1/preview/stream.mjpg"
     assert body["endpoints"]["preview_frame"] == "GET /api/v1/preview/frame.jpg"
     assert body["endpoints"]["preview_status"] == "GET /api/v1/preview/status"
+    assert body["endpoints"]["preview_mode"] == "POST /api/v1/preview/mode"
+
+
+# ---- Runtime switch ----------------------------------------------------------------
+
+
+def test_mode_switch_needs_the_token_and_switches_at_runtime():
+    state = DATA_ROOT / "live_preview.json"
+    with configured(preview_token=TOKEN, live_preview_enabled=False):
+        assert client.post("/api/v1/preview/mode", json={"enabled": True}).status_code == 401
+        assert client.post("/api/v1/preview/mode", json={"enabled": "yes"}, headers=AUTH).status_code == 422
+        assert client.post("/api/v1/preview/mode", json={}, headers=AUTH).status_code == 422
+        assert not live_camera.running
+        try:
+            r = client.post("/api/v1/preview/mode", headers=AUTH,
+                            json={"enabled": True, "changed_by": "anna@example.com"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert set(body) == STATUS_KEYS | {"saved"}, set(body) ^ (STATUS_KEYS | {"saved"})
+            assert body["enabled"] is True and body["saved"] is True
+            assert live_camera.running
+            mode = client.get("/api/v1/status").json()["live_mode"]
+            assert mode["enabled"] is True and mode["origin"] == "switch"
+            assert mode["changed_by"] == "anna@example.com" and mode["default"] is False
+            assert json.loads(state.read_text("utf-8"))["enabled"] is True
+            r = client.post("/api/v1/capture")  # now through the camera owner
+            assert r.status_code == 202 and r.json()["metadata"]["source"] == "fallback"
+        finally:
+            r = client.post("/api/v1/preview/mode", json={"enabled": False}, headers=AUTH)
+        assert r.status_code == 200, r.text
+        assert r.json()["enabled"] is False and r.json()["state"] == "disabled"
+        assert not live_camera.running
+        assert client.get("/api/v1/preview/stream.mjpg", headers=AUTH).status_code == 404
+        assert json.loads(state.read_text("utf-8"))["enabled"] is False
+        assert client.post("/api/v1/capture").status_code == 202  # the one-shot path again
+    state.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ Run from the repo root (no pytest needed):
 Skips (exit 0) if numpy/opencv are not installed.
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -432,10 +433,12 @@ def test_slow_capture_times_out_to_the_fallback_and_the_late_frame_is_dropped():
 
 
 def test_failed_grab_falls_back_without_reconnecting():
+    # Timeouts only (no image arrived): straight to sample.jpg, no one-shot
+    # retake on top (the keypad's 40 s budget), and no reconnect.
     src = ScriptedSource()
     with running(src) as cam:
         assert wait_until(lambda: cam.state == "idle")
-        src.grab_error = GrabFailed("3 timeouts")
+        src.grab_error = GrabFailed("3 timeouts", timed_out=True)
         frame, info = cam.capture_frame()
         assert info["source"] == "fallback"
         assert cam.status()["reconnects"] == 0 and "close" not in src.calls
@@ -577,7 +580,7 @@ def test_stop_is_fast_and_closes_the_source():
 def test_status_shapes_match_the_contract():
     keys = {"enabled", "state", "source", "camera_model", "camera_serial", "profile",
             "fps_target", "fps_measured", "clients", "frame_seq", "last_frame_age_s",
-            "stream_age_s", "frames_incomplete", "reconnects", "last_error",
+            "stream_age_s", "frames_incomplete", "reconnects", "one_shot_captures", "last_error",
             "preview_width", "preview_height", "boot_id"}
     cam = LiveCamera(source_factory=ScriptedSource)
     assert set(cam.status()) == keys
@@ -939,6 +942,205 @@ def test_legacy_removed_device_is_reopened_on_the_next_capture():
     assert info["source"] == "fallback" and svc._camera is None and camera.destroyed
     frame, info = svc.capture_frame()
     assert info["source"] == "basler" and fake.last_camera() is not camera
+
+
+# ---- The one-shot rescue and the runtime switch (services/live_mode.py) ----------------
+
+
+class FakeOneShot:
+    """camera_service's part in a rescue: capture_frame() + release()."""
+
+    def __init__(self, live_source=None, source="basler"):
+        self.live_source = live_source
+        self.source = source
+        self.events = []
+
+    def capture_frame(self):
+        # The live owner must have closed the camera before this opens it.
+        self.events.append(("capture", self.live_source.is_open if self.live_source else None))
+        frame, _ = fake.next_frame(640, 480)
+        return frame, {"source": self.source, "camera_serial": "F0001", "camera_model": "FakeCam"}
+
+    def release(self):
+        self.events.append(("release", None))
+
+
+def test_incomplete_live_grab_is_retaken_with_the_one_shot_path():
+    src = ScriptedSource()
+    one_shot = FakeOneShot(live_source=src)
+    cam = LiveCamera(source_factory=lambda: src, one_shot=one_shot)
+    cam.start()
+    try:
+        assert wait_until(lambda: cam.state == "idle")
+        src.grab_error = GrabFailed("incompletely grabbed", timed_out=False)
+        frame, info = cam.capture_frame()
+        assert info["source"] == "basler" and frame is not None, info
+        # owner closed its handle -> one-shot grabbed -> one-shot released -> owner back
+        assert one_shot.events == [("capture", False), ("release", None)], one_shot.events
+        assert "close" in src.calls
+        assert wait_until(lambda: cam.running and cam.state == "idle"), cam.state
+        st = cam.status()
+        assert st["one_shot_captures"] == 1 and "one-shot" in st["last_error"], st
+        src.grab_error = None
+        assert cam.capture_frame()[1]["source"] == "basler"
+        assert len(one_shot.events) == 2, "a good live grab needs no rescue"
+    finally:
+        cam.stop()
+
+
+def test_one_shot_rescue_can_still_end_in_the_sample_image():
+    src = ScriptedSource()
+    one_shot = FakeOneShot(live_source=src, source="fallback")
+    cam = LiveCamera(source_factory=lambda: src, one_shot=one_shot)
+    cam.start()
+    try:
+        assert wait_until(lambda: cam.state == "idle")
+        src.grab_error = GrabFailed("incompletely grabbed", timed_out=False)
+        assert cam.capture_frame()[1]["source"] == "fallback"
+        assert wait_until(lambda: cam.running and cam.state == "idle")  # preview resumes anyway
+    finally:
+        cam.stop()
+
+
+def test_basler_grab_failure_says_whether_an_image_arrived():
+    fake.reset(devices=1)
+    src = BaslerSource()
+    src.open()
+    try:
+        camera = fake.last_camera()
+        camera.grabone_timeouts = 3
+        try:
+            src.grab_fresh()
+            raise AssertionError("expected GrabFailed")
+        except GrabFailed as e:
+            assert e.timed_out is True, e
+        camera.grabone_incomplete = 1
+        camera.grabone_timeouts = 2
+        try:
+            src.grab_fresh()
+            raise AssertionError("expected GrabFailed")
+        except GrabFailed as e:
+            assert e.timed_out is False and "incompletely grabbed" in str(e), e
+        camera.grabone_incomplete = 1
+        frame, info = src.grab_fresh()  # the 2nd attempt is complete
+        assert info["source"] == "basler"
+    finally:
+        src.close()
+
+
+def test_owner_with_basler_source_rescues_incomplete_grabs_with_the_legacy_path():
+    fake.reset(devices=1)
+    legacy = _legacy()
+    cam = LiveCamera(source_factory=BaslerSource, one_shot=legacy)
+    cam.start()
+    try:
+        assert wait_until(lambda: cam.state == "idle"), cam.state
+        live_handle = fake.last_camera()
+        live_handle.grabone_incomplete = 3
+        frame, info = cam.capture_frame()
+        assert info["source"] == "basler" and frame.shape == (48, 64, 3), info
+        assert live_handle.destroyed, "the owner released the camera before the one-shot grab"
+        assert legacy._camera is None, "the one-shot handle was released afterwards"
+        assert wait_until(lambda: cam.state == "idle" and fake.last_camera() is not live_handle)
+        assert cam.status()["one_shot_captures"] == 1
+    finally:
+        cam.stop()
+
+
+class FakeOwner:
+    def __init__(self, events):
+        self.events = events
+
+    def start(self):
+        self.events.append("owner.start")
+
+    def stop(self):
+        self.events.append("owner.stop")
+
+
+class FakeRelease:
+    def __init__(self, events):
+        self.events = events
+
+    def release(self):
+        self.events.append("one_shot.release")
+
+
+def _mode(tmp, events):
+    from services.live_mode import LiveMode
+    return LiveMode(camera=FakeOwner(events), one_shot=FakeRelease(events),
+                    state_path=Path(tmp) / "live_preview.json")
+
+
+def test_live_mode_default_is_the_env_and_a_saved_choice_wins():
+    tmp = tempfile.mkdtemp(prefix="zander-livemode-")
+    events = []
+    with setting("live_preview_enabled", True):
+        mode = _mode(tmp, events)
+        mode.start()
+        assert mode.enabled and mode.origin == "env" and events == ["owner.start"]
+        (Path(tmp) / "live_preview.json").write_text('{"enabled": false, "changed_by": "op"}', encoding="utf-8")
+        events.clear()
+        mode = _mode(tmp, events)
+        mode.start()
+        assert not mode.enabled and mode.origin == "saved" and mode.changed_by == "op"
+        assert events == [], "a saved 'off' never starts the owner"
+        for raw in ("{broken", "[]", '{"enabled": "yes"}'):
+            (Path(tmp) / "live_preview.json").write_text(raw, encoding="utf-8")
+            events.clear()
+            mode = _mode(tmp, events)
+            mode.start()
+            assert mode.enabled and mode.origin == "env", raw
+
+
+def test_live_mode_switch_hands_the_camera_over_and_is_saved():
+    tmp = tempfile.mkdtemp(prefix="zander-livemode-")
+    events = []
+    with setting("live_preview_enabled", False):
+        mode = _mode(tmp, events)
+        mode.start()
+        assert not mode.enabled and events == []
+        assert mode.set(True, "anna@example.com") is True
+        assert events == ["one_shot.release", "owner.start"], events  # one owner at a time
+        assert mode.enabled and mode.origin == "switch" and mode.changed_by == "anna@example.com"
+        saved = json.loads((Path(tmp) / "live_preview.json").read_text(encoding="utf-8"))
+        assert saved["enabled"] is True and saved["changed_by"] == "anna@example.com"
+        events.clear()
+        assert mode.set(True) is True and events == [], "no-op when already on"
+        assert mode.set(False) is True and events == ["owner.stop"]
+        mode2 = _mode(tmp, [])
+        mode2.start()
+        assert not mode2.enabled and mode2.origin == "saved"
+
+
+def test_live_mode_switch_waits_for_a_capture_and_survives_a_failed_save():
+    tmp = tempfile.mkdtemp(prefix="zander-livemode-")
+    events = []
+    with setting("live_preview_enabled", False):
+        mode = _mode(tmp, events)
+        mode.start()
+        held = threading.Event()
+        release = threading.Event()
+
+        def capture():  # what api/routes.py does around a grab
+            with mode.lock:
+                held.set()
+                release.wait(2)
+
+        worker = threading.Thread(target=capture)
+        worker.start()
+        held.wait(2)
+        switcher = threading.Thread(target=lambda: mode.set(True))
+        switcher.start()
+        time.sleep(0.15)
+        assert events == [], "the switch must wait for the capture"
+        release.set()
+        worker.join()
+        switcher.join(2)
+        assert events == ["one_shot.release", "owner.start"] and mode.enabled
+        (Path(tmp) / "live_preview.json").unlink()
+        (Path(tmp) / "live_preview.json").mkdir()  # os.replace onto a directory fails
+        assert mode.set(False) is False and not mode.enabled  # applies anyway
 
 
 if __name__ == "__main__":

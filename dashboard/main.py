@@ -7,7 +7,8 @@ Standalone UI for the camera pipeline:
   - "Capture" button (proxies to camerapi with X-Triggered-By)
   - "Open Label Studio" button (link)
   - Live camera panel: login-protected relay of camerapi's MJPEG preview
-    (GET /api/live.mjpg, GET /api/live/status)
+    (GET /api/live.mjpg, GET /api/live/status) and the live view switch
+    (POST /api/live/mode; photos work with the preview on or off)
   - "Latest result" panel: the newest capture with its prediction
     (GET /api/latest, GET /api/captures/{id}; docs/CONTRACTS.md section 5)
   - Model chooser: lists the inspector's models and switches the active one
@@ -68,13 +69,13 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 import auth
 import db
 from ls_client import LabelStudioUnavailable, LsClient
 
-SERVICE_VERSION = "2.3.0"
+SERVICE_VERSION = "2.4.0"
 
 # ---- Setup ----------------------------------------------------------------
 
@@ -496,6 +497,47 @@ async def live_status(request: Request, _: str = Depends(auth.current_user_email
         error = f"camerapi preview status answered HTTP {code}"
     _note_live_problem(error)
     return {"reachable": True, "error": error, "state": "error"}
+
+
+class _LiveModeChoice(BaseModel):
+    enabled: StrictBool
+
+
+@app.post("/api/live/mode")
+async def live_mode_switch(
+    choice: _LiveModeChoice,
+    request: Request,
+    email: str = Depends(auth.current_user_email),
+) -> Any:
+    """
+    Turn camerapi's live preview on or off for everyone; camerapi keeps the
+    choice across restarts. Photos work either way. camerapi first waits for
+    a capture in progress, hence the capture-sized timeout.
+    """
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        resp = await client.post(
+            _camerapi_url("/api/v1/preview/mode"),
+            headers=_preview_headers(),
+            json={"enabled": choice.enabled, "changed_by": email},
+            timeout=CAPTURE_TIMEOUT,
+        )
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeEncodeError) as e:
+        raise HTTPException(status_code=502, detail=f"camerapi unreachable ({type(e).__name__})")
+    if resp.status_code in (401, 403):
+        raise HTTPException(
+            status_code=502,
+            detail="camerapi refused the switch: set the same PREVIEW_TOKEN for camerapi and the dashboard",
+        )
+    if resp.status_code == 404:
+        raise HTTPException(
+            status_code=502, detail="this camerapi has no live view switch (update camerapi to 3.3.0)"
+        )
+    body = _safe_json(resp)
+    if resp.status_code >= 400 or not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail=f"camerapi answered HTTP {resp.status_code}")
+    LOG.info(f"live view switched {'on' if choice.enabled else 'off'} (by {email!a})")
+    return {**body, "reachable": True, "error": None}
 
 
 # ---- Identity endpoint (used by camerapi for USB-button attribution) -----

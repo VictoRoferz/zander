@@ -88,6 +88,8 @@ for (const step of JSON.parse(scenarioJson)) {
     })),
     selectDisabled: Boolean(sel.disabled),
     recheck: btn.hidden ? null : btn.textContent,
+    toggle: sandbox.document.getElementById("live-toggle").hidden
+      ? null : sandbox.document.getElementById("live-toggle").textContent,
     note: sandbox.document.getElementById("model-note").textContent,
   }));
 }
@@ -242,6 +244,29 @@ def test_recheck_waits_for_the_active_model_and_then_says_so():
     )
     assert waiting["note"] == "", waiting
     assert done["note"] == "Re-checked with detector.", done
+
+
+# ---- live view switch ---------------------------------------------------------------
+
+def test_live_toggle_says_what_it_will_do_and_hides_without_an_answer():
+    on, off, refused, offline = run(
+        status(last_frame_age_s=0.2, fps_measured=4.9),
+        status(enabled=False, state="disabled"),
+        {"reachable": True, "error": "camerapi refused the preview (HTTP 401)", "state": "auth_error"},
+        {"reachable": False, "error": "camerapi unreachable", "state": "unreachable"},
+    )
+    assert on["toggle"] == "Turn live view off", on
+    assert off["toggle"] == "Turn live view on", off
+    assert off["overlay"].startswith("Live view is off") and "Photos still work" in off["overlay"], off
+    assert refused["toggle"] is None and offline["toggle"] is None
+
+
+def test_live_toggle_shows_switching_while_the_request_runs():
+    (step,) = run(
+        status(enabled=False, state="disabled"),
+        "onLiveToggle()",   # fetch never resolves in the harness: stays switching
+    )[1:]
+    assert step["toggle"] == "Switching…", step
 
 
 if __name__ == "__main__":

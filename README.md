@@ -77,9 +77,12 @@ discover a GigE camera on a host NIC nor hook USB keyboard input.
   refuses a model without a valid card (`REQUIRE_CARD=true`). Several models can sit
   in the models folder (`<name>.onnx` + `<name>.json`); the dashboard's Model chooser
   picks the active one, and every prediction records the model that made it.
-- **The live preview is opt-in and owns the camera.** With `LIVE_PREVIEW_ENABLED`
-  off (default) captures work exactly as before. With it on, one thread owns the
-  camera; a capture stops the stream and grabs the first frame after the key press.
+- **The live preview is opt-in and owns the camera.** With the preview off
+  (`LIVE_PREVIEW_ENABLED=false`, the default) captures work exactly as before. With it
+  on, one thread owns the camera; a capture stops the stream and grabs the first frame
+  after the key press, and a grab that comes back incomplete is retaken the one-shot
+  way. The dashboard's "Turn live view on/off" button switches it while running (the
+  choice is kept across restarts in camerapi's `DATA_ROOT/live_preview.json`).
 
 ---
 
@@ -93,7 +96,8 @@ Thin FastAPI app wired to the Basler camera (pypylon, with OpenCV-webcam and
 | Piece | Function |
 |---|---|
 | `api/routes.py` | `POST /api/v1/capture` (grab → spool → 202), `POST /api/v1/test-camera`, `GET /api/v1/status` (camera + spool depth + `live` block) |
-| `api/preview.py` | Live preview (only with `LIVE_PREVIEW_ENABLED=true`): `GET /api/v1/preview/stream.mjpg`, `/frame.jpg`, `/status`; access by `X-Preview-Token`, or local-only when the token is empty |
+| `api/preview.py` | Live preview (only while it is on): `GET /api/v1/preview/stream.mjpg`, `/frame.jpg`, `/status`, and the runtime switch `POST /api/v1/preview/mode`; access by `X-Preview-Token`, or local-only when the token is empty |
+| `services/live_mode.py` | Preview on/off at runtime: `LIVE_PREVIEW_ENABLED` is the first-start default, the dashboard switch is saved in `live_preview.json`; one camera owner at a time (switches and captures share a lock) |
 | `services/camera_service.py` | Camera access (one-shot `GrabOne` path, serialized by a lock); picks a GigE transport profile: ethernet by default on Windows/macOS (direct-attach), route-detected on Linux, forced with `CAMERA_TRANSPORT` |
 | `services/live_camera.py` | The camera-owner thread for the live preview: continuous grabbing at `PREVIEW_FPS`, one JPEG encode per frame shared by all viewers, captures = stop stream + `GrabOne`, reconnect with backoff |
 | `services/storage_service.py` | The local spool: atomic writes under `DATA_ROOT/spool/` |
